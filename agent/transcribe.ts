@@ -3,8 +3,9 @@
 // Тело запроса — сырые байты, ответ → results.channels[0].alternatives[0].transcript.
 export async function transcribe(audio: ArrayBuffer): Promise<string> {
   const language = process.env.DEEPGRAM_LANGUAGE || "multi";
+  const baseUrl = process.env.DEEPGRAM_BASE_URL ?? "https://api.deepgram.com";
   const url =
-    `https://api.deepgram.com/v1/listen?model=nova-3&language=${language}` +
+    `${baseUrl}/v1/listen?model=nova-3&language=${language}` +
     `&punctuate=true&smart_format=true`;
   const res = await fetch(url, {
     method: "POST",
