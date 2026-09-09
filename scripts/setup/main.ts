@@ -444,7 +444,7 @@ async function openrouterModelCheck(
 }
 async function deepgramCheck(key: string): Promise<string | null> {
   try {
-    const res = await fetch("https://api.deepgram.com/v1/projects", {
+    const res = await fetch(`${process.env.DEEPGRAM_BASE_URL ?? "https://api.deepgram.com"}/v1/projects`, {
       headers: { Authorization: `Token ${key}` },
     });
     if (res.status === 401 || res.status === 403) {
