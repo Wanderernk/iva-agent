@@ -10,6 +10,7 @@ import fc from "fast-check";
 import { generateText, wrapLanguageModel } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import type {
+  LanguageModelV4FunctionTool,
   LanguageModelV4StreamPart,
   LanguageModelV4StreamResult,
 } from "@ai-sdk/provider";
@@ -896,4 +897,180 @@ await test(`ID сессии уходит как есть, пустой заме�
     { seed: SESSION_HEADER_SEED, numRuns: 50 },
   );
   assert.match(processId, /^iva-[0-9a-f-]{36}$/u);
+});
+
+// --- Провайдер отверг схему инструмента: повтор без lookaround-паттернов -----------------------
+const { toolSchemaRetryMiddleware, withoutLookaroundPatterns } =
+  await import("./provider.ts");
+const { APICallError } = await import("ai");
+
+const SCHEMA_REJECTION = new APICallError({
+  message:
+    "Invalid JSON schema: regex lookaround is not supported. Found at $.properties.attendees.items.pattern.",
+  url: "https://chatgpt.com/backend-api/codex/responses",
+  requestBodyValues: {},
+  statusCode: 400,
+  responseBody: '{"error":{"code":"invalid_json_schema","param":"tools"}}',
+});
+
+function calendarTools(): LanguageModelV4FunctionTool[] {
+  return [
+    {
+      type: "function" as const,
+      name: "create_event",
+      inputSchema: {
+        type: "object",
+        properties: {
+          attendees: {
+            type: "array",
+            items: {
+              type: "string",
+              pattern: "^(?=.*@).+$",
+              description: "email",
+            },
+          },
+          title: { type: "string", pattern: "^[^\\n]+$" },
+        },
+      },
+    },
+  ];
+}
+
+function modelRejectingSchemaOnce(rejections: Error[]) {
+  const calls: unknown[][] = [];
+  const model = wrapLanguageModel({
+    model: new MockLanguageModelV4({
+      doStream: (options) => {
+        calls.push(options.tools ?? []);
+        const next = rejections.shift();
+        if (next) return Promise.reject(next);
+        return Promise.resolve({
+          stream: new ReadableStream<LanguageModelV4StreamPart>({
+            start(controller) {
+              controller.enqueue(streamPart("text-start"));
+              controller.enqueue(streamPart("text-delta"));
+              controller.close();
+            },
+          }),
+        } satisfies LanguageModelV4StreamResult);
+      },
+    }),
+    middleware: toolSchemaRetryMiddleware,
+  });
+  return { model, calls };
+}
+
+void test("a 400 for a tool schema is retried once with the lookaround patterns gone, everything else kept", async () => {
+  const { model, calls } = modelRejectingSchemaOnce([SCHEMA_REJECTION]);
+  const { stream } = await model.doStream({
+    prompt: [],
+    tools: calendarTools(),
+  });
+  await stream.pipeTo(new WritableStream());
+  assert.equal(calls.length, 2);
+  const retried = calls[1][0] as {
+    inputSchema: {
+      properties: Record<
+        string,
+        { items?: Record<string, unknown>; pattern?: string }
+      >;
+    };
+  };
+  assert.deepEqual(retried.inputSchema.properties.attendees.items, {
+    type: "string",
+    description: "email",
+  });
+  assert.equal(retried.inputSchema.properties.title.pattern, "^[^\\n]+$");
+  // Исходные инструменты первого вызова не тронуты: копия, не мутация.
+  const first = calls[0][0] as typeof retried;
+  assert.equal(
+    first.inputSchema.properties.attendees.items?.pattern,
+    "^(?=.*@).+$",
+  );
+});
+
+void test("any other 400, or a schema with nothing to drop, fails fast without a retry", async () => {
+  const other = new APICallError({
+    message: "Invalid 'input[0].role': expected one of user, assistant",
+    url: "https://x",
+    requestBodyValues: {},
+    statusCode: 400,
+  });
+  const a = modelRejectingSchemaOnce([other]);
+  await assert.rejects(
+    () =>
+      Promise.resolve(a.model.doStream({ prompt: [], tools: calendarTools() })),
+    other,
+  );
+  assert.equal(a.calls.length, 1);
+
+  const b = modelRejectingSchemaOnce([SCHEMA_REJECTION]);
+  const plain: LanguageModelV4FunctionTool[] = [
+    {
+      ...calendarTools()[0],
+      inputSchema: {
+        type: "object",
+        properties: { title: { type: "string" } },
+      },
+    },
+  ];
+  await assert.rejects(
+    () => Promise.resolve(b.model.doStream({ prompt: [], tools: plain })),
+    SCHEMA_REJECTION,
+  );
+  assert.equal(b.calls.length, 1);
+});
+
+// Инвариант вырезания: lookaround-паттернов нет, всё остальное на месте, мусор не роняет.
+// Seed печатает fast-check при провале.
+void test("property: withoutLookaroundPatterns drops exactly the lookaround patterns and never throws", () => {
+  const lookaround = /\(\?<?[=!]/u;
+  const pattern = fc.oneof(
+    fc.constant("^(?=.*@).+$"),
+    fc.constant("(?!x)y"),
+    fc.constant("(?<=a)b"),
+    fc.constant("(?<!a)b"),
+    fc.constant("^[a-z]+$"),
+    fc.string({ maxLength: 12 }),
+  );
+  const schema = fc.letrec((tie) => ({
+    node: fc.record(
+      {
+        type: fc.constantFrom("string", "object", "array"),
+        pattern,
+        description: fc.string({ maxLength: 8 }),
+        items: tie("node"),
+        properties: fc.dictionary(fc.string({ maxLength: 5 }), tie("node"), {
+          maxKeys: 3,
+        }),
+      },
+      { requiredKeys: [] },
+    ),
+  })).node;
+  const scrub = (value: unknown) =>
+    JSON.parse(
+      JSON.stringify(value, (key, v: unknown) =>
+        key === "pattern" && typeof v === "string" && lookaround.test(v)
+          ? undefined
+          : v,
+      ),
+    ) as unknown;
+  fc.assert(
+    fc.property(schema, (input) => {
+      const dropped = { count: 0 };
+      const out = withoutLookaroundPatterns(input, dropped);
+      assert.deepEqual(JSON.parse(JSON.stringify(out)), scrub(input));
+      assert.equal(
+        dropped.count > 0,
+        JSON.stringify(input) !== JSON.stringify(scrub(input)),
+      );
+    }),
+    { numRuns: 300 },
+  );
+  fc.assert(
+    fc.property(fc.jsonValue({ maxDepth: 4 }), (garbage) => {
+      withoutLookaroundPatterns(garbage);
+    }),
+    { numRuns: 300 },
+  );
 });

@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { wrapLanguageModel, type LanguageModelMiddleware } from "ai";
+import {
+  APICallError,
+  wrapLanguageModel,
+  type LanguageModelMiddleware,
+} from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import {
@@ -624,6 +628,74 @@ export const modelFirstChunkDeadlineMiddleware: LanguageModelMiddleware = {
   },
 };
 
+// --- Схема инструмента, которую провайдер не принимает --------------------------------------
+// OpenAI (codex) отвергает ВЕСЬ запрос, если у любого инструмента в `pattern` стоит lookaround:
+// «Invalid JSON schema: regex lookaround is not supported. Found at $.properties.….pattern»,
+// 400, `param: tools` (пакет пользователя 13.09.2026: инструмент календаря из подключения,
+// ход умирал до первого слова модели). Инструменты приходят откуда угодно - плагины,
+// подключения eve, свои - а граница с провайдером одна, эта. Как у Hermes (issue #42631):
+// отказ по схеме = вырезать такие `pattern` из инструментов ЭТОГО запроса и повторить один раз.
+// Остальная схема, включая описание поля, остаётся: модель по-прежнему видит, что от неё ждут.
+const LOOKAROUND_PATTERN = /\(\?<?[=!]/u;
+
+/** Копия схемы без `pattern` с lookaround на любой глубине; `dropped` считает вырезанные. */
+export function withoutLookaroundPatterns(
+  schema: unknown,
+  dropped = { count: 0 },
+): unknown {
+  if (Array.isArray(schema))
+    return schema.map((item) => withoutLookaroundPatterns(item, dropped));
+  if (!isRecord(schema)) return schema;
+  const copy: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (
+      key === "pattern" &&
+      typeof value === "string" &&
+      LOOKAROUND_PATTERN.test(value)
+    ) {
+      dropped.count++;
+      continue;
+    }
+    copy[key] = withoutLookaroundPatterns(value, dropped);
+  }
+  return copy;
+}
+
+export function isToolSchemaRejection(error: unknown): boolean {
+  return (
+    APICallError.isInstance(error) &&
+    error.statusCode === 400 &&
+    /invalid[ _-]?json[ _-]?schema/iu.test(error.message)
+  );
+}
+
+export const toolSchemaRetryMiddleware: LanguageModelMiddleware = {
+  async wrapStream({ doStream, model, params }) {
+    try {
+      return await doStream();
+    } catch (error) {
+      if (!isToolSchemaRejection(error) || !params.tools?.length) throw error;
+      const dropped = { count: 0 };
+      const tools = params.tools.map((tool) =>
+        tool.type === "function"
+          ? {
+              ...tool,
+              inputSchema: withoutLookaroundPatterns(
+                tool.inputSchema,
+                dropped,
+              ) as typeof tool.inputSchema,
+            }
+          : tool,
+      );
+      if (dropped.count === 0) throw error; // не та схема: чинить нечего, ошибка наружу
+      console.error(
+        `[provider] the provider rejected a tool schema; retrying without ${dropped.count} regex pattern(s) with lookaround`,
+      );
+      return model.doStream({ ...params, tools });
+    }
+  },
+};
+
 /**
  * Текстовая модель активного провайдера. Общая для КАЖДОГО узла графа: корень и субагенты
  * обязаны говорить с одним провайдером, свои createOpenAICompatible/env в субагентах не заводим.
@@ -636,6 +708,7 @@ export function makeTextModel(options: {
     model: makeBareTextModel(options.sessionId),
     middleware: [
       attachImagesMiddleware(options.chatModelSeesImages),
+      toolSchemaRetryMiddleware,
       modelFirstChunkDeadlineMiddleware,
     ],
   });

@@ -34,7 +34,6 @@ import {
   type JSONRPCMessage,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readPluginEnv } from "#lib/plugin-config.ts";
-import { withProviderSafeSchemas } from "./tool-schema.ts";
 import { expandPluginPlaceholders, readPlugin } from "#lib/plugin-reader.ts";
 import { pluginDataDir, pluginRoot } from "#lib/plugin-store.ts";
 
@@ -250,9 +249,7 @@ export async function startMcpProxy(spec: ProxySpec): Promise<RunningProxy> {
   }
 
   child.onmessage = (message: JSONRPCMessage) => {
-    void session
-      ?.send(withProviderSafeSchemas(message, log))
-      .catch(complain("the agent took no reply"));
+    void session?.send(message).catch(complain("the agent took no reply"));
   };
   child.onerror = (error) => log(`stdio transport: ${error.message}`);
   child.onclose = () => gone(`the MCP server ${spec.server} exited`);
