@@ -219,18 +219,15 @@ function scratch(t: TestContext): string {
 /** Every message the update UI would send to Telegram, with the API answering ok. */
 function chat(t: TestContext): string[] {
   const sent: string[] = [];
-  t.mock.method(
-    globalThis,
-    "fetch",
-    async (_url: string, init: { body: string }) => {
-      sent.push(String(JSON.parse(init.body).text ?? ""));
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ ok: true, result: { message_id: 100 } }),
-      };
-    },
-  );
+  t.mock.method(globalThis, "fetch", (_url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { text?: string };
+    sent.push(body.text ?? "");
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true, result: { message_id: 100 } }),
+    });
+  });
   return sent;
 }
 
