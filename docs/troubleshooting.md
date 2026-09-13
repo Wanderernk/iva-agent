@@ -2,6 +2,16 @@
 
 Every entry below is a real failure someone hit, and the fix that shipped. Find your symptom, run the command. Env-var details live in [configuration.md](configuration.md); the full command reference in [cli.md](cli.md).
 
+## Send the maintainer a log package
+
+One line on the server, nothing else to type:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/diagnose.sh | bash
+```
+
+It runs `iva diagnose` (on Iva older than 0.4.1 it collects the service journal instead), cuts the secrets, and sends the package as a file into your chat with the bot. Forward that file to whoever is helping you.
+
 ## Common issues
 
 ### Build killed / exit 137
