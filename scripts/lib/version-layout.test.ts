@@ -92,6 +92,43 @@ test("a shim reads active state from the canonical custom data directory", (t) =
   );
 });
 
+/**
+ * Сквозная проверка HIGH-4: после перевода чекаута на версии команда `iva` обязана
+ * работать. Дано - старый прямой шим с чужим node, ведущий в `bin/iva.mjs` чекаута,
+ * который конверсия удаляет. Проверяется не текст файла, а запуск: шим исполняется и
+ * печатает версию.
+ */
+test("after the conversion the shim on PATH still runs Iva", (t) => {
+  const home = installation(t);
+  const shim = join(home, ".local/bin/iva");
+  const data = join(home, "data");
+  // Чекаут, из которого установка жила до перевода, и шим, написанный под другой node.
+  mkdirSync(join(home, "bin"), { recursive: true });
+  writeFileSync(
+    join(home, "bin/iva.mjs"),
+    'process.stdout.write("checkout");\n',
+  );
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  writeFileSync(
+    shim,
+    `#!/usr/bin/env bash\nexec "/opt/node/bin/node" "${home}/bin/iva.mjs" "$@"\n`,
+  );
+  chmodSync(shim, 0o755);
+
+  // Перевод: шим переписывается обновлятором, `bin/iva.mjs` чекаута уходит вместе с ним.
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), true);
+  rmSync(join(home, "bin"), { recursive: true, force: true });
+  writeFileSync(
+    join(data, "active.json"),
+    '{"version":"0.3.14-aaaaaaaaaaaa"}\n',
+  );
+
+  assert.equal(
+    execFileSync(shim, { encoding: "utf8" }).trim(),
+    "0.3.14-aaaaaaaaaaaa",
+  );
+});
+
 test("an owned shim refreshes its data snapshot without replacing a foreign command", (t) => {
   const home = installation(t);
   const shim = join(home, ".local/bin/iva");
@@ -378,6 +415,9 @@ const ROUTE_SEED = 43_017;
  * developer's checkout and never updated again.
  */
 test("property: the layout and `.iva-dev` decide the route, git and the shim never do", (t) => {
+  // Seed печатается и в зелёном прогоне: fast-check называет его только при провале,
+  // а воспроизвести нужно и тот прогон, который ничего не нашёл.
+  console.log(`property seed: ${ROUTE_SEED}`);
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "iva-route-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (cwd: string, ...args: string[]): string =>
