@@ -454,10 +454,10 @@ on_err() {
 # put the checkout back.
 finalize_install() {
   local rc=$?
-  # The undo runs commands that fail as a matter of course — `git rebase --abort` with no
-  # rebase in progress is the usual one — and the ERR trap does not care that `set +e` is
-  # on. Left armed it prints a second "Install aborted" over the real cause, which is how
-  # the reason for a failure gets lost.
+  # The undo runs commands that fail as a matter of course — putting the previous build
+  # back onto a read-only or full disk is the usual one — and the ERR trap does not care
+  # that `set +e` is on. Left armed it prints a second "Install aborted" over the real
+  # cause, which is how the reason for a failure gets lost.
   trap - ERR
   # Nothing in here may end the handler early: this is the only path that puts the
   # checkout back, and it runs while something has already gone wrong.
