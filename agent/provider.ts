@@ -310,10 +310,18 @@ export const codexFetch: typeof fetch = async (input, init) => {
 // reasoningSummary:null гасит побочный эффект SDK: при заданном reasoningEffort он сам
 // добавляет summary:"detailed" в reasoning-блок. Summary нам не нужен (reasoning всё равно
 // вырезается withReasoningStripped), а лишний параметр — лишний шанс на 400 от бэкенда.
-const codexProviderOptions: LanguageModelMiddleware = {
+// strict:false на каждом инструменте - явно, как Hermes в своём Codex-адаптере. AI SDK поле
+// не шлёт, а Responses API без него включает строгий режим сам: тогда все поля схемы
+// обязательны, и модель забивает необязательные мусором (живой прогон 13.09.2026:
+// luna слала в remind `cron: ":"`, `id: ":? "`, получала «give exactly one of at or cron»
+// и повторяла это 33 раза, пока висело «Работаю»).
+export const codexProviderOptions: LanguageModelMiddleware = {
   transformParams({ params }) {
     return Promise.resolve({
       ...params,
+      tools: params.tools?.map((tool) =>
+        tool.type === "function" ? { ...tool, strict: false } : tool,
+      ),
       providerOptions: {
         ...params.providerOptions,
         openai: {
@@ -631,7 +639,7 @@ export const modelFirstChunkDeadlineMiddleware: LanguageModelMiddleware = {
 // --- Схема инструмента, которую провайдер не принимает --------------------------------------
 // OpenAI (codex) отвергает ВЕСЬ запрос, если у любого инструмента в `pattern` стоит lookaround:
 // «Invalid JSON schema: regex lookaround is not supported. Found at $.properties.….pattern»,
-// 400, `param: tools` (пакет пользователя 13.09.2026: инструмент календаря из подключения,
+// 400, `param: tools` (пакет пользователя 13.09.2026: календарный инструмент с полем attendees, источник в пакете не различим - личный слой data/custom или подключение;
 // ход умирал до первого слова модели). Инструменты приходят откуда угодно - плагины,
 // подключения eve, свои - а граница с провайдером одна, эта. Как у Hermes (issue #42631):
 // отказ по схеме = вырезать такие `pattern` из инструментов ЭТОГО запроса и повторить один раз.
