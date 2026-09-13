@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { createCliMain, dispatchCli, type CliCommand } from "./main.ts";
 
@@ -210,6 +216,24 @@ function scratch(t: TestContext): string {
   return dir;
 }
 
+/** Every message the update UI would send to Telegram, with the API answering ok. */
+function chat(t: TestContext): string[] {
+  const sent: string[] = [];
+  t.mock.method(
+    globalThis,
+    "fetch",
+    async (_url: string, init: { body: string }) => {
+      sent.push(String(JSON.parse(init.body).text ?? ""));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, result: { message_id: 100 } }),
+      };
+    },
+  );
+  return sent;
+}
+
 void test("a checkout no shim of ours runs is refused and left exactly as it was", async (t) => {
   const home = join(scratch(t), "iva");
   mkdirSync(home);
@@ -231,20 +255,38 @@ void test("a checkout no shim of ours runs is refused and left exactly as it was
   git("commit", "-q", "-m", "release");
   writeFileSync(join(home, "package.json"), '{ "version": "mine" }\n');
   writeFileSync(join(home, "notes.txt"), "untracked\n");
-  const before = [git("rev-parse", "HEAD"), git("status", "--porcelain")];
+  // The tap came from the chat, so the refusal is owed to the chat: the terminal of
+  // a self-update belongs to systemd-run and nobody reads it.
+  writeFileSync(join(home, ".env"), "TELEGRAM_BOT_TOKEN=1:token\n");
+  const job = join(home, "data/update-jobs/deadbeefdeadbeef.json");
+  mkdirSync(dirname(job), { recursive: true });
+  writeFileSync(job, JSON.stringify({ chatId: 7, messageId: 100 }));
+  // Everything but the agent's own state: the job file the refusal closes lives there.
+  const tree = (): readonly string[] => [
+    git("rev-parse", "HEAD"),
+    git("status", "--porcelain", "--", ".", ":(exclude)data"),
+  ];
+  const before = tree();
 
   const out = printed(t);
-  await createCliMain(home).commands.update([]);
+  const sent = chat(t);
+  await createCliMain(home).commands.update([
+    "--telegram-job",
+    "deadbeefdeadbeef",
+  ]);
 
   assert.equal(process.exitCode, 1);
   assert.match(
     out(),
     /development checkout, not an installation: git pull && npm run build/u,
   );
-  assert.deepEqual(
-    [git("rev-parse", "HEAD"), git("status", "--porcelain")],
-    before,
-  );
+  assert.deepEqual(sent, [
+    "⚠️ this is a development checkout, not an installation: git pull && npm run build",
+  ]);
+  // Left behind, the job keeps the bridge waiting on an update that will never run,
+  // and the chat stays on "Saving your changes" until the six-hour TTL.
+  assert.equal(existsSync(job), false);
+  assert.deepEqual(tree(), before);
 });
 
 void test("an installed version is handed to the updater", async (t) => {

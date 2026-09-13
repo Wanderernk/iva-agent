@@ -38,6 +38,8 @@ type Reporter = {
   busy(): Promise<void>;
   /** Refusal before the first phase — the message carries what to fix, in the job's language. */
   badProvider(value: string, accepted: string): Promise<void>;
+  /** Refusal before the first write: this tree is somebody's checkout, not an installation. */
+  devCheckout(): Promise<void>;
   /** Refusal before the first write: this CLI is older than the release it fetched. */
   updaterTooOld(version: string): Promise<void>;
   postCommitFailure(message: string): Promise<void>;
@@ -76,6 +78,8 @@ const COPY = {
     busy: "An update is already running",
     badProvider:
       "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
+    devCheckout:
+      "this is a development checkout, not an installation: git pull && npm run build",
     final: "✅ Iva updated",
     preserved: "Local changes: preserved",
     failure: (version: string) =>
@@ -98,6 +102,8 @@ const COPY = {
     busy: "Обновление уже идёт",
     badProvider:
       "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
+    devCheckout:
+      "это чекаут разработчика, а не установка: git pull && npm run build",
     final: "✅ Iva обновлена",
     preserved: "Локальные изменения: сохранены",
     failure: (version: string) =>
@@ -298,6 +304,13 @@ export function createTelegramUpdateReporter({
       await finish(
         `⚠️ ${copy.badProvider}: ${JSON.stringify(value)} (${accepted})`,
       );
+    },
+    // Тап по /update в дереве, которое апдейтеру не принадлежит: сказать это в чат, а не
+    // в терминал systemd-run. Иначе мост ждёт лока, которого не будет, и последнее, что
+    // видит пользователь, — «Сохраняю ваши изменения» на шесть часов.
+    async devCheckout() {
+      currentPhase = null;
+      await finish(`⚠️ ${copy.devCheckout}`);
     },
     // Отказ до первой записи: обновиться сама эта установка уже не может. Текст — тот же,
     // что уходит в терминал, и собирается ЗДЕСЬ, из языка того, кто нажал. Без parse_mode:

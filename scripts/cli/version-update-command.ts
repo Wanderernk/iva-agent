@@ -48,6 +48,7 @@ type UpdateCopy = Record<
   readonly current: string;
   readonly busy: string;
   readonly badProvider: string;
+  readonly devCheckout: string;
   readonly failed: string;
   readonly stock: string;
 };
@@ -65,6 +66,8 @@ const COPY: Record<"en" | "ru", UpdateCopy> = {
     busy: "Обновление уже идёт",
     badProvider:
       "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
+    devCheckout:
+      "это чекаут разработчика, а не установка: git pull && npm run build",
     failed: "Не удалось завершить обновление",
     stock: "ваша доработка в data/custom не входит в эту версию",
   },
@@ -75,6 +78,8 @@ const COPY: Record<"en" | "ru", UpdateCopy> = {
     busy: "An update is already running",
     badProvider:
       "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
+    devCheckout:
+      "this is a development checkout, not an installation: git pull && npm run build",
     failed: "Couldn't complete the update",
     stock: "your customization in data/custom is not in this version",
   },
@@ -224,21 +229,40 @@ export function createVersionUpdateCommand(
     const reporter = job
       ? reporterFor(job.job, env.TELEGRAM_BOT_TOKEN, env)
       : null;
-    // Тот же префлайт, что на legacy-пути, и на боевом он именно этот: managed-layout —
-    // всё, что стоит через install.sh. Без него опечатка в MODEL_PROVIDER прогоняла
-    // fetch → build → restart → health-fail и возвращала «Couldn't build Iva … Retry:
-    // /update» по кругу, ни разу не назвав причину. Отказ до зеркала, до лока и до первой
-    // записи — установка остаётся нетронутой (ADR-0003).
-    const configuredProvider = env.MODEL_PROVIDER ?? "ollama";
-    if (!catalogProvider(configuredProvider)) {
-      terminal.fail(invalidProviderRefusal(text, configuredProvider));
-      await reporter?.badProvider(configuredProvider, ACCEPTED_PROVIDERS);
+    /**
+     * Отказ до зеркала, до лока и до первой записи: установка остаётся нетронутой
+     * (ADR-0003). Причина уходит и в терминал, и в чат, а job закрывается: /update
+     * из Telegram отказывал только в терминал systemd-run, которого никто не видит,
+     * и мост, не найдя ни лока, ни outcome, оставлял «Сохраняю ваши изменения»
+     * висеть в чате до шестичасового TTL.
+     */
+    const refuse = async (
+      line: string,
+      chat?: Promise<void>,
+    ): Promise<null> => {
+      terminal.fail(line);
+      await chat;
       terminal.dispose();
       reporter?.dispose();
       await removeTelegramJob(job?.path);
       process.exitCode = 1;
       return null;
-    }
+    };
+
+    // Обновляется только установка: версия или чекаут, который запускает наш шим.
+    // Любой другой чекаут — чужое рабочее дерево, и его оставляют как есть.
+    if (!isManagedInstall(install))
+      return refuse(text.devCheckout, reporter?.devCheckout());
+
+    // Без этого префлайта опечатка в MODEL_PROVIDER прогоняла fetch → build → restart →
+    // health-fail и возвращала «Couldn't build Iva … Retry: /update» по кругу, ни разу
+    // не назвав причину.
+    const configuredProvider = env.MODEL_PROVIDER ?? "ollama";
+    if (!catalogProvider(configuredProvider))
+      return refuse(
+        invalidProviderRefusal(text, configuredProvider),
+        reporter?.badProvider(configuredProvider, ACCEPTED_PROVIDERS),
+      );
 
     const store = createVersionStore(install.home);
     // The last version the installation actually settled on: after an interrupted
@@ -501,8 +525,6 @@ export function createVersionUpdateCommand(
   }
 
   return {
-    /** Only a real installation is converted; a development checkout is left alone. */
-    active: (): boolean => isManagedInstall(install),
     run,
     rebuild,
     rollback,

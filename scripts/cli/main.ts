@@ -76,20 +76,6 @@ export function createCliMain(root: string) {
   const cmdRemind = createRemindCommand(runtime);
   const cmdPost = createPostCommand(runtime);
   const versionUpdate = createVersionUpdateCommand(runtime, systemdLifecycle);
-  // Only an installation is updated: a version, or the checkout our shim runs. A
-  // checkout without one is somebody's working tree, and it is left exactly as is.
-  const cmdUpdate = (args: readonly string[]): Promise<void> => {
-    if (versionUpdate.active()) return versionUpdate.run(args);
-    const ru =
-      (runtime.readEnv().AGENT_LANGUAGE || process.env.AGENT_LANGUAGE) === "ru";
-    bad(
-      ru
-        ? "это чекаут разработчика, а не установка: git pull && npm run build"
-        : "this is a development checkout, not an installation: git pull && npm run build",
-    );
-    process.exitCode = 1;
-    return Promise.resolve();
-  };
   // The code of a plugin is built into a version, on exactly the updater's rails
   // (ADR-0009), so `iva plugin` is handed the updater's own rebuild instead of a
   // second path to the same probe, flip and restart.
@@ -129,7 +115,7 @@ ${C.b}Commands:${C.x}
   }
 
   const commands: Readonly<Record<string, CliCommand>> = {
-    update: cmdUpdate,
+    update: versionUpdate.run,
     rollback: versionUpdate.rollback,
     userbot: userbot.cmdUserbot,
     config: cmdConfig,
