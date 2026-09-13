@@ -999,6 +999,8 @@ test("a conversion wipes an edit to Iva's own code and keeps the file beside it"
     '{ "name": "iva", "mine": true }\n',
   );
   writeFileSync(join(home, "notes.md"), "# my notes\n");
+  // Чужой файл в нашем же каталоге, рядом с правленым исходником: спасает себя, но не его.
+  writeFileSync(join(home, "agent/secret.env"), "TOKEN=keep-me\n");
 
   const removed = retireCheckout(home);
 
@@ -1011,6 +1013,10 @@ test("a conversion wipes an edit to Iva's own code and keeps the file beside it"
   assert.equal(existsSync(join(home, "agent/index.ts")), false);
   // Неотслеживаемое - пользователя, остаётся как есть, и каталог под него тоже.
   assert.equal(readFileSync(join(home, "notes.md"), "utf8"), "# my notes\n");
+  assert.equal(
+    readFileSync(join(home, "agent/secret.env"), "utf8"),
+    "TOKEN=keep-me\n",
+  );
   const saved = readdirSync(home, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile())
     .map((entry) => join(String(entry.parentPath ?? home), entry.name))
@@ -1050,4 +1056,6 @@ test("a conversion leaves an untracked file inside a directory of ours", (t) => 
     readFileSync(join(home, "agent/secret.env"), "utf8"),
     "TOKEN=keep-me\n",
   );
+  // И только его: соседний tracked-файл в том же каталоге уходит вместе со всеми.
+  assert.equal(existsSync(join(home, "agent/index.ts")), false);
 });

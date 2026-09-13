@@ -537,6 +537,11 @@ export function writeShim(home: string, log: Say): void {
  * the userbot's venv, a skill's credentials are theirs, and a layout change is no
  * right to them.
  *
+ * Судится каждый файл, не каталог: чужой файл в нашем каталоге спасает себя, а не
+ * правленые исходники рядом с собой - иначе один `scripts/mine.txt` оставлял бы весь
+ * `scripts/` от старой установки. Каталоги-артефакты (`node_modules`, `.git`) уходят
+ * целиком, как и раньше; опустевшие наши каталоги подчищаются проходом ниже.
+ *
  * Прерываемость: до первого удаления ставится метка (RETIRE_MARKER), `.git` идёт
  * последним, а пустые родители подчищаются отдельным проходом в конце. Поэтому
  * повтор после обрыва на любом шаге доводит вывод до конца.
@@ -545,26 +550,12 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
   const marker = join(home, RETIRE_MARKER);
   const previous = readRetireMarker(marker);
   let tracked: string[] | null;
-  let untracked: Set<string>;
   try {
-    // -z on both: without it git escapes and quotes every path outside ASCII,
-    // and a quoted name matches no file, retiring the checkout only in part.
+    // -z: without it git escapes and quotes every path outside ASCII, and a quoted
+    // name matches no file, retiring the checkout only in part.
     tracked = git(home, ["ls-tree", "-r", "-z", "--name-only", "HEAD"])
       .split("\0")
       .filter(Boolean);
-    untracked = new Set(
-      git(home, ["status", "--porcelain=v1", "--untracked-files=all", "-z"])
-        .split("\0")
-        .filter(Boolean)
-        // Только неотслеживаемое: правка в коде Ивы обновление не переживает (решение
-        // владельца), а чужой файл рядом с ней - переживает.
-        .filter((entry) => entry.slice(0, 2) === "??")
-        // Защищать имеет смысл только то, что лежит на диске: файл, уже удалённый
-        // (нашим же оборванным выводом или самим владельцем), не помечает весь
-        // верхний каталог как чужой - иначе повтор не дочищал бы соседей.
-        .filter((entry) => existsSync(join(home, entry.slice(3))))
-        .map((entry) => topLevel(entry.slice(3))),
-    );
   } catch (error) {
     // Git как команда недоступен (нет в PATH): не сносим ничего. Метка санкционирует
     // снос только покалеченного репозитория (git есть, но не отвечает), и только если
@@ -576,7 +567,6 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
       return [];
     }
     tracked = null;
-    untracked = new Set();
   }
   if (tracked === null) {
     // Git есть, но репозиторий не отвечает (покалечен обрывом).
@@ -615,8 +605,7 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
   // работающий git, а не дерево без истории.
   for (const path of [...tracked, ...RETIRE_ARTIFACTS, ".git"]) {
     const name = topLevel(path);
-    if (KEEP.has(name) || (untracked.has(name) && !ARTIFACTS.includes(path)))
-      continue;
+    if (KEEP.has(name)) continue;
     const full = join(home, path);
     if (!existsSync(full)) continue;
     // Идентичность снимается до удалений (`.git` уходит последним, так что он ещё цел)
