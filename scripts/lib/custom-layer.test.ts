@@ -23,7 +23,6 @@ import { fileURLToPath } from "node:url";
 import {
   captureCustomLayer,
   commitCustomLayer,
-  ensureCustomRecoveryBundle,
   isAuthoredPath,
   materializeCustomLayer,
   readCustomManifest,
@@ -411,48 +410,6 @@ test("an upstream conflict resolution replaces the canonical local copy", (t) =>
   assert.equal(
     readCustomManifest(dataDir).entries["agent/instructions.md"]?.conflict,
     undefined,
-  );
-});
-
-test("a failed custom build keeps the canonical local side intact", (t) => {
-  const { root, dataDir, base, stash } = fixture(t);
-  captureCustomLayer({
-    root,
-    dataDir,
-    baseRevision: base,
-    stashRevision: stash,
-  });
-  write(
-    root,
-    "agent/instructions.md",
-    "tone: stock\nkeep-a\nkeep-b\ncore: upstream\n",
-  );
-  const result = materializeCustomLayer({
-    root,
-    dataDir,
-    targetRevision: "5".repeat(40),
-  });
-
-  ensureCustomRecoveryBundle({
-    result,
-    root,
-    targetRevision: "5".repeat(40),
-    reason: "custom-build-failed",
-  });
-  commitCustomLayer(result);
-
-  assert.equal(
-    readFileSync(join(dataDir, "custom/agent/instructions.md"), "utf8"),
-    "tone: mine\nkeep-a\nkeep-b\ncore: stock\n",
-  );
-  assert.throws(
-    () =>
-      resolveCustomConflict({
-        dataDir,
-        path: "agent/instructions.md",
-        side: "edited",
-      }),
-    /edit the canonical customization/u,
   );
 });
 

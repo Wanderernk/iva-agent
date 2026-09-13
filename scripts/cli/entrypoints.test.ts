@@ -90,6 +90,18 @@ void test("update rejects a fresh lock without mutating update state", async (t)
     shim,
     shimScript(await realpath(fixture.project), process.execPath, dataDir),
   );
+  // An installation's own repository: the updater mirrors the history it follows
+  // before it asks for the lock, and a tree without one fails the clone instead.
+  for (const args of [
+    ["init", "-q", "--initial-branch=main"],
+    ["remote", "add", "origin", fixture.project],
+  ]) {
+    const done = spawnSync("git", args, {
+      cwd: fixture.project,
+      encoding: "utf8",
+    });
+    assert.equal(done.status, 0, done.stderr);
+  }
   const ownerPath = join(lockDir, "owner.json");
   // A live owner: the lock of a process that is gone is a leftover, and the updater
   // is right to take it over.

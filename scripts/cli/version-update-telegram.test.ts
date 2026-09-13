@@ -242,6 +242,29 @@ test("a successful update leaves the final word to the bridge", async (t) => {
   assert.equal((stored as { chatId?: unknown }).chatId, 1);
 });
 
+// Обновление запускают мост, iva-update-check.service и repair.sh - своим node, не тем,
+// что записан в шиме. Сравни апдейтер node, и первый же переезд node (nvm, apt) делал бы
+// из установки «чекаут разработчика» навсегда, без шанса на самопочинку.
+test("a shim of ours written for another node still names an installation", async (t) => {
+  const iva = world(t);
+  writeFileSync(
+    iva.shim,
+    shimScript(iva.home, "/usr/bin/node", join(iva.home, "data")),
+  );
+
+  await iva.run();
+
+  assert.equal(
+    iva.lines().some((line) => line.startsWith("handoff ")),
+    true,
+    iva.lines().join("\n"),
+  );
+  assert.deepEqual(
+    iva.finals().filter((text) => /development checkout/u.test(text)),
+    [],
+  );
+});
+
 test("an update whose job file is gone reports the result itself", async (t) => {
   const iva = world(t);
 

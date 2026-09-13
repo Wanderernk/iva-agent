@@ -355,8 +355,11 @@ test("the shim alone tells an installation: branches and commits of one's own do
     `#!/usr/bin/env bash\nexec "/bin/echo" "${alias}/bin/iva.mjs" "$@"\n`,
   );
   assert.equal(managed(alias), false);
-  writeFileSync(shim, shimScript(alias, "/bin/echo", join(alias, "data")));
-  assert.equal(managed(alias), false);
+  // Наш шим, написанный под другой node: обновление всё равно идёт. Мост,
+  // iva-update-check.service и repair.sh стартуют его своим node, и сравнение
+  // выключало бы самообновление навсегда после переезда node.
+  writeFileSync(shim, shimScript(alias, "/usr/bin/node", join(alias, "data")));
+  assert.equal(managed(alias), true);
   writeFileSync(shim, shimScript(alias, process.execPath, join(alias, "data")));
   assert.equal(managed(alias), true);
 
@@ -410,6 +413,8 @@ test("property: the layout and the shim decide the route, git and dirt never do"
   const version = join(home, "versions", "0.4.2-abcdefabcdef");
   mkdirSync(version, { recursive: true });
   const ours = shimScript(home, process.execPath, join(home, "data"));
+  // The same script install.sh wrote, for a node that has since moved: still ours.
+  const oursMovedNode = shimScript(home, "/usr/bin/node", join(home, "data"));
   const shim = join(dir, "iva-shim");
   const elsewhere = join(dir, "iva-elsewhere");
 
@@ -418,6 +423,7 @@ test("property: the layout and the shim decide the route, git and dirt never do"
       fc.record({
         shim: fc.constantFrom(
           "ours" as const,
+          "ours-moved-node" as const,
           "missing" as const,
           "foreign" as const,
           "symlink" as const,
@@ -439,6 +445,8 @@ test("property: the layout and the shim decide the route, git and dirt never do"
         );
         rmSync(shim, { force: true });
         if (world.shim === "ours") writeFileSync(shim, ours);
+        else if (world.shim === "ours-moved-node")
+          writeFileSync(shim, oursMovedNode);
         else if (world.shim === "junk") writeFileSync(shim, world.junk);
         else if (world.shim === "foreign")
           writeFileSync(shim, `#!/bin/sh\nexec /bin/echo "$@"\n`);
@@ -454,7 +462,9 @@ test("property: the layout and the shim decide the route, git and dirt never do"
         assert.equal(
           decision,
           world.shim === "ours" ||
-            (world.shim === "junk" && world.junk === ours),
+            world.shim === "ours-moved-node" ||
+            (world.shim === "junk" &&
+              (world.junk === ours || world.junk === oursMovedNode)),
         );
         // A version is an installation whatever sits on PATH: nothing else is there.
         assert.equal(isManagedInstall(classifyRoot(version), shim), true);

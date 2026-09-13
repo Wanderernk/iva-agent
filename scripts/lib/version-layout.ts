@@ -65,17 +65,21 @@ export function classifyRoot(root: string): Install {
  * An installation is a version, or the checkout our own shim runs: install.sh
  * writes that shim and nothing else does. Every other checkout is somebody's
  * working tree, and the updater leaves it alone.
+ *
+ * Which node the shim names is not part of the answer: the bridge,
+ * `iva-update-check.service` and `repair.sh` all start the update with a node of
+ * their own, and a comparison would call an installation a developer's checkout
+ * for good the first time node moved - the one state the updater exists to repair.
  */
 export function isManagedInstall(
   install: Install,
   shimPath: string = SHIM_PATH,
-  node: string = process.execPath,
 ): boolean {
   if (install.kind === "version") return true;
   const opened = openShim(shimPath);
   if (opened.kind !== "file") return false;
   try {
-    return isOwnedShim(opened.text, install.home, node);
+    return isOwnedShim(opened.text, install.home, null);
   } finally {
     closeShim(opened.fd);
   }
@@ -88,13 +92,19 @@ export function shimPointsAt(shim: string, home: string): boolean {
     .some((path) => path === home || path.startsWith(`${home}/`));
 }
 
-/** Exact generated-shim grammar used only before replacing an existing command. */
+/**
+ * Exact generated-shim grammar. `expectedNode` null accepts whichever node the shim
+ * was written for - what the route asks; the refresh names one, because it replaces
+ * an existing command only when it is byte-for-byte the script it would write.
+ */
 function isOwnedShim(
   shim: string,
   home: string,
-  expectedNode: string,
+  expectedNode: string | null,
 ): boolean {
   const lines = shim.split("\n");
+  const sameNode = (node: string): boolean =>
+    expectedNode === null || real(node) === real(expectedNode);
   const exec = (line: string | undefined): string | null =>
     /^exec "([^"\\$`\r\n]+)" "\$IVA_ROOT\/bin\/iva\.mjs" "\$@"$/u.exec(
       line ?? "",
@@ -115,7 +125,7 @@ function isOwnedShim(
     const target = direct[2];
     return (
       basename(node) === "node" &&
-      real(node) === real(expectedNode) &&
+      sameNode(node) &&
       basename(target) === "iva.mjs" &&
       basename(dirname(target)) === "bin" &&
       real(dirname(dirname(target))) === real(home) &&
@@ -133,15 +143,14 @@ function isOwnedShim(
     return (
       writtenData !== null &&
       node !== null &&
-      real(node) === real(expectedNode) &&
+      sameNode(node) &&
       shim === shimScript(writtenHome, node, writtenData)
     );
   }
 
   // The previous release had no IVA_DATA snapshot and always read home/data.
   const node = exec(lines[16]);
-  if (lines.length !== 18 || node === null || real(node) !== real(expectedNode))
-    return false;
+  if (lines.length !== 18 || node === null || !sameNode(node)) return false;
   const expected = shimScript(
     writtenHome,
     node,

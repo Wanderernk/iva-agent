@@ -45,10 +45,7 @@ import type { createCliRuntime } from "./runtime.ts";
 
 type CliRuntime = ReturnType<typeof createCliRuntime>;
 
-type UpdateCopy = Record<
-  "fetch" | "build",
-  readonly [string, string, string]
-> & {
+type UpdateCopy = Record<"fetch" | "build", readonly [string, string]> & {
   readonly current: string;
   readonly busy: string;
   readonly badProvider: string;
@@ -60,12 +57,8 @@ type UpdateCopy = Record<
 /** What the terminal says; the chat has its own words in telegram-status.ts. */
 const COPY: Record<"en" | "ru", UpdateCopy> = {
   ru: {
-    fetch: [
-      "Получаю обновление",
-      "Обновление получено",
-      "Не удалось получить обновление",
-    ],
-    build: ["Собираю Iva", "Iva собрана", "Не удалось собрать Iva"],
+    fetch: ["Получаю обновление", "Обновление получено"],
+    build: ["Собираю Iva", "Iva собрана"],
     current: "Iva уже обновлена",
     busy: "Обновление уже идёт",
     badProvider:
@@ -76,8 +69,8 @@ const COPY: Record<"en" | "ru", UpdateCopy> = {
     stock: "ваша доработка в data/custom не входит в эту версию",
   },
   en: {
-    fetch: ["Getting the update", "Update received", "Couldn't get the update"],
-    build: ["Building Iva", "Iva built", "Couldn't build Iva"],
+    fetch: ["Getting the update", "Update received"],
+    build: ["Building Iva", "Iva built"],
     current: "Iva is already up to date",
     busy: "An update is already running",
     badProvider:
@@ -298,12 +291,11 @@ export function createVersionUpdateCommand(
     try {
       terminal.start(text.fetch[0]);
       await reporter?.start("fetch");
+      const repo = await ensureMirror(install.home);
       const outcome = await runVersionUpdate({
         home: install.home,
         store,
-        // Зеркало клонируется под локом, а не до него: пока лок чужой, клон истории -
-        // работа впустую и второй rename рядом с чужим обновлением.
-        resolveTarget: async () => target(await ensureMirror(install.home)),
+        resolveTarget: () => target(repo),
         run: commandRunner(verbose),
         force,
         requirePlugins,
