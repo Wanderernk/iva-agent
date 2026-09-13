@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   alertOwnerAboutPlugins,
+  retireCheckout,
   captureOptionalWriterState,
   restartPluginUnits,
   quarantineUpdateState,
@@ -14,6 +15,7 @@ import {
   stopWriterUnits,
   tombstoned,
 } from "./update-finish.ts";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -963,4 +965,57 @@ test("the flip restarts the plugin units that were running, and only those", asy
     said.join("\n"),
     /some plugin units did not restart: job failed/u,
   );
+});
+
+/**
+ * Конверсия чекаута в версию правки в коде Ивы не сохраняет: ни патча, ни стэша, ни
+ * копии рядом. Своё живёт в `data/custom/`, а разработчик ставит `.iva-dev`. Документация
+ * обещала обратное («the updater stashes them and replays them») - обещания не было.
+ */
+test("a conversion saves no patch of an edit to Iva's own code", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-retire-edits-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-C", home, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva" }\n');
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  // Правка в коде Ивы и файл пользователя рядом с ней.
+  writeFileSync(join(home, "agent/index.ts"), "export const mine = 2;\n");
+  writeFileSync(join(home, "notes.md"), "# my notes\n");
+
+  const removed = retireCheckout(home);
+
+  // Конверсия прошла: шапка чекаута выведена вместе с историей.
+  assert.ok(removed.includes("package.json"), JSON.stringify(removed));
+  assert.equal(existsSync(join(home, ".git")), false);
+  // Неотслеживаемое - пользователя, остаётся как есть.
+  assert.equal(readFileSync(join(home, "notes.md"), "utf8"), "# my notes\n");
+  // Правка остаётся ровно там, где её сделали, и нигде больше: версия соберётся из
+  // коммита, и это весь ответ.
+  assert.equal(
+    readFileSync(join(home, "agent/index.ts"), "utf8"),
+    "export const mine = 2;\n",
+  );
+  const saved = readdirSync(home, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(String(entry.parentPath ?? home), entry.name))
+    .filter(
+      (path) =>
+        path !== join(home, "agent/index.ts") &&
+        readFileSync(path, "utf8").includes("export const mine = 2;"),
+    );
+  assert.deepEqual(saved, []);
 });
