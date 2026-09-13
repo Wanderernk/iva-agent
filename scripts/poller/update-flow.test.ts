@@ -291,44 +291,6 @@ test("the /update button leaves the lock to the update it launches", async (t) =
   assert.equal(readdirSync(jobs).length, 2);
 });
 
-test("saved update view explains a preserved change set with no conflicts", async (t) => {
-  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
-  const bundle = "2026-08-07T00-00-00-000Z-deadbeef1234";
-  const bundleDir = join(dataDir, "update-conflicts", bundle);
-  mkdirSync(bundleDir, { recursive: true });
-  writeFileSync(
-    join(bundleDir, "report.json"),
-    JSON.stringify({ schema: "iva-update-conflicts/v1", conflicts: [] }),
-  );
-  const calls: { method: string | undefined; body: unknown }[] = [];
-  const previousFetch = mutableGlobal.fetch;
-  mutableGlobal.fetch = (url, init) => {
-    const body: unknown = JSON.parse(init.body ?? "{}");
-    calls.push({
-      method: url.split("/").at(-1),
-      body,
-    });
-    return Promise.resolve({
-      json: () => Promise.resolve({ ok: true, result: {} }),
-    });
-  };
-  try {
-    await handleUpdateCallback({
-      id: "callback",
-      from: { id: 42 },
-      message: { chat: { id: 1 }, message_id: 10 },
-      data: `iva_update:conflicts:${bundle}`,
-    });
-  } finally {
-    mutableGlobal.fetch = previousFetch;
-  }
-
-  const edit = calls.find((call) => call.method === "editMessageText");
-  const text = screenText(edit?.body ?? {});
-  assert.match(text, /saved in full/i);
-  assert.doesNotMatch(text, /Saved local conflicts:/);
-});
-
 /** git in a directory, with an identity, so a commit needs no ambient config. */
 function git(cwd: string, args: readonly string[]): string {
   return execFileSync("git", [...args], {

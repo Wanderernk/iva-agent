@@ -3,7 +3,6 @@ import { basename, join } from "node:path";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { readEnvFresh } from "../lib/env-file.ts";
-import { escapeRichText } from "../lib/telegram-buttons.ts";
 import {
   inspectUpstream,
   markVersionNotified,
@@ -26,10 +25,7 @@ import {
   sleep,
 } from "./config.ts";
 import { edit, reply, tg } from "./transport.ts";
-import {
-  parseUpdateCallbackData,
-  validRecoveryBundleId,
-} from "./update-callback.ts";
+import { parseUpdateCallbackData } from "./update-callback.ts";
 export { parseUpdateCallbackData } from "./update-callback.ts";
 
 type UpdateInfo = Awaited<ReturnType<typeof inspectUpstream>>;
@@ -52,10 +48,6 @@ type UpdateCallbackQuery = {
 };
 type LaunchResult = { ok: boolean; msg: string };
 type ErrorLike = { message?: unknown };
-type RecoveryReport = {
-  schema: "iva-update-conflicts/v1";
-  conflicts: { path: string }[];
-};
 
 function messageEditSucceeded(value: unknown): boolean {
   return (
@@ -222,97 +214,6 @@ async function removeStaleUpdateJobs(): Promise<void> {
   );
 }
 
-async function showSavedUpdateConflicts(
-  bundleId: string,
-  chatId: string | number,
-  messageId: number,
-): Promise<boolean> {
-  if (!validRecoveryBundleId(bundleId)) {
-    return messageEditSucceeded(
-      await edit(
-        chatId,
-        messageId,
-        tr("⚠️ Invalid recovery bundle", "⚠️ Неверный пакет восстановления"),
-      ),
-    );
-  }
-  let report: RecoveryReport;
-  try {
-    const parsed: unknown = JSON.parse(
-      await readFile(
-        join(DATA_DIR, "update-conflicts", bundleId, "report.json"),
-        "utf8",
-      ),
-    );
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      (parsed as { schema?: unknown }).schema !== "iva-update-conflicts/v1" ||
-      !Array.isArray((parsed as { conflicts?: unknown }).conflicts)
-    )
-      throw new Error("invalid recovery report");
-    const conflicts = (parsed as { conflicts: unknown[] }).conflicts;
-    if (
-      conflicts.some(
-        (item) =>
-          !item ||
-          typeof item !== "object" ||
-          typeof (item as { path?: unknown }).path !== "string",
-      )
-    )
-      throw new Error("invalid conflict list");
-    report = parsed as RecoveryReport;
-  } catch {
-    return messageEditSucceeded(
-      await edit(
-        chatId,
-        messageId,
-        tr(
-          "⚠️ Saved update details are unavailable",
-          "⚠️ Детали обновления недоступны",
-        ),
-      ),
-    );
-  }
-  // Путь из отчёта — пользовательские данные: в rich markdown он обязан быть
-  // экранирован, иначе `*`, `#` или `<` в имени файла сломают разметку сообщения.
-  const visible = report.conflicts
-    .slice(0, 10)
-    .map(({ path }) => `- ${escapeRichText(path)}`);
-  if (report.conflicts.length > visible.length) {
-    const remaining = report.conflicts.length - visible.length;
-    visible.push(
-      tr(`- ${remaining} more conflict(s)`, `- Ещё конфликтов: ${remaining}`),
-    );
-  }
-  const details =
-    visible.length > 0
-      ? tr(
-          `Saved local conflicts:\n${visible.join("\n")}`,
-          `Сохранённые локальные конфликты:\n${visible.join("\n")}`,
-        )
-      : tr(
-          "Your local changes are saved in full.",
-          "Ваши локальные изменения сохранены целиком.",
-        );
-  return messageEditSucceeded(
-    await edit(
-      chatId,
-      messageId,
-      [
-        tr("✅ The new Iva core is active.", "✅ Новое ядро Iva активно."),
-        "",
-        details,
-        "",
-        tr(
-          "Tell Iva: “restore my update changes”.",
-          "Напишите Иве: «восстанови мои изменения после обновления».",
-        ),
-      ].join("\n"),
-    ),
-  );
-}
-
 // Inline-button taps for the /update flow. Handled by the bridge; never delivered to eve.
 export async function handleUpdateCallback(
   cq: UpdateCallbackQuery,
@@ -339,15 +240,6 @@ export async function handleUpdateCallback(
     );
     return messageEditSucceeded(edited);
   }
-  if (parsed.action === "conflicts") {
-    const shown = await showSavedUpdateConflicts(
-      parsed.bundleId,
-      chatId as string | number,
-      messageId as number,
-    );
-    return shown;
-  }
-
   const jobId = randomBytes(8).toString("hex");
   // Asked, never taken: the updater this launches owns the lock from end to end.
   // A lock claimed here on its behalf would outlive the launch - this bridge does
