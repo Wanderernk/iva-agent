@@ -968,11 +968,11 @@ test("the flip restarts the plugin units that were running, and only those", asy
 });
 
 /**
- * Конверсия чекаута в версию правки в коде Ивы не сохраняет: ни патча, ни стэша, ни
- * копии рядом. Своё живёт в `data/custom/`, а разработчик ставит `.iva-dev`. Документация
- * обещала обратное («the updater stashes them and replays them») - обещания не было.
+ * Конверсия чекаута в версию правку в коде Ивы затирает: после перевода на диске
+ * остаётся то, что в коммите, а не то, что правил владелец, и копии правки нет нигде.
+ * Своё живёт в `data/custom/`, а разработчик ставит `.iva-dev`.
  */
-test("a conversion saves no patch of an edit to Iva's own code", (t) => {
+test("a conversion wipes an edit to Iva's own code and keeps the file beside it", (t) => {
   const home = mkdtempSync(join(tmpdir(), "iva-retire-edits-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const git = (...args: string[]): string =>
@@ -992,8 +992,9 @@ test("a conversion saves no patch of an edit to Iva's own code", (t) => {
   writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
   git("add", "-A");
   git("commit", "-q", "-m", "release");
-  // Правка в коде Ивы и файл пользователя рядом с ней.
+  // Правка в коде Ивы, правка в файле верхнего уровня и файл пользователя рядом.
   writeFileSync(join(home, "agent/index.ts"), "export const mine = 2;\n");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva", "mine": true }\n');
   writeFileSync(join(home, "notes.md"), "# my notes\n");
 
   const removed = retireCheckout(home);
@@ -1001,21 +1002,49 @@ test("a conversion saves no patch of an edit to Iva's own code", (t) => {
   // Конверсия прошла: шапка чекаута выведена вместе с историей.
   assert.ok(removed.includes("package.json"), JSON.stringify(removed));
   assert.equal(existsSync(join(home, ".git")), false);
-  // Неотслеживаемое - пользователя, остаётся как есть.
+  assert.equal(existsSync(join(home, "package.json")), false);
+  // Правленый tracked-файл уходит вместе с остальными: дальше работает версия из
+  // коммита, правка не переносится и нигде не сохраняется.
+  assert.equal(existsSync(join(home, "agent/index.ts")), false);
+  // Неотслеживаемое - пользователя, остаётся как есть, и каталог под него тоже.
   assert.equal(readFileSync(join(home, "notes.md"), "utf8"), "# my notes\n");
-  // Правка остаётся ровно там, где её сделали, и нигде больше: версия соберётся из
-  // коммита, и это весь ответ.
-  assert.equal(
-    readFileSync(join(home, "agent/index.ts"), "utf8"),
-    "export const mine = 2;\n",
-  );
   const saved = readdirSync(home, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile())
     .map((entry) => join(String(entry.parentPath ?? home), entry.name))
-    .filter(
-      (path) =>
-        path !== join(home, "agent/index.ts") &&
-        readFileSync(path, "utf8").includes("export const mine = 2;"),
-    );
+    .filter((path) => readFileSync(path, "utf8").includes("mine"));
   assert.deepEqual(saved, []);
+});
+
+/**
+ * Обратная сторона того же шва: неотслеживаемый файл внутри нашего каталога - чужой,
+ * вывод его не трогает, даже когда все tracked-файлы каталога уходят.
+ */
+test("a conversion leaves an untracked file inside a directory of ours", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-retire-untracked-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-C", home, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva" }\n');
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  writeFileSync(join(home, "agent/secret.env"), "TOKEN=keep-me\n");
+
+  retireCheckout(home);
+
+  assert.equal(
+    readFileSync(join(home, "agent/secret.env"), "utf8"),
+    "TOKEN=keep-me\n",
+  );
 });

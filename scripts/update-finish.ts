@@ -531,9 +531,11 @@ export function writeShim(home: string, log: Say): void {
 
 /**
  * Remove the working tree the installation ran from, now that a version runs
- * instead. Only files git accounts for, only where unedited, one at a time: what
- * git ignores inside a tracked directory - the userbot's venv, a skill's
- * credentials - is the user's, and a layout change is no right to it.
+ * instead. Every file git accounts for goes, an edited one too - the version is
+ * built from the commit, and an edit to Iva's own code the update does not carry
+ * over. What git does not account for stays: a file the owner put next to ours,
+ * the userbot's venv, a skill's credentials are theirs, and a layout change is no
+ * right to them.
  *
  * Прерываемость: до первого удаления ставится метка (RETIRE_MARKER), `.git` идёт
  * последним, а пустые родители подчищаются отдельным проходом в конце. Поэтому
@@ -543,17 +545,20 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
   const marker = join(home, RETIRE_MARKER);
   const previous = readRetireMarker(marker);
   let tracked: string[] | null;
-  let dirty: Set<string>;
+  let untracked: Set<string>;
   try {
     // -z on both: without it git escapes and quotes every path outside ASCII,
     // and a quoted name matches no file, retiring the checkout only in part.
     tracked = git(home, ["ls-tree", "-r", "-z", "--name-only", "HEAD"])
       .split("\0")
       .filter(Boolean);
-    dirty = new Set(
+    untracked = new Set(
       git(home, ["status", "--porcelain=v1", "--untracked-files=all", "-z"])
         .split("\0")
         .filter(Boolean)
+        // Только неотслеживаемое: правка в коде Ивы обновление не переживает (решение
+        // владельца), а чужой файл рядом с ней - переживает.
+        .filter((entry) => entry.slice(0, 2) === "??")
         // Защищать имеет смысл только то, что лежит на диске: файл, уже удалённый
         // (нашим же оборванным выводом или самим владельцем), не помечает весь
         // верхний каталог как чужой - иначе повтор не дочищал бы соседей.
@@ -571,7 +576,7 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
       return [];
     }
     tracked = null;
-    dirty = new Set();
+    untracked = new Set();
   }
   if (tracked === null) {
     // Git есть, но репозиторий не отвечает (покалечен обрывом).
@@ -610,7 +615,7 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
   // работающий git, а не дерево без истории.
   for (const path of [...tracked, ...RETIRE_ARTIFACTS, ".git"]) {
     const name = topLevel(path);
-    if (KEEP.has(name) || (dirty.has(name) && !ARTIFACTS.includes(path)))
+    if (KEEP.has(name) || (untracked.has(name) && !ARTIFACTS.includes(path)))
       continue;
     const full = join(home, path);
     if (!existsSync(full)) continue;

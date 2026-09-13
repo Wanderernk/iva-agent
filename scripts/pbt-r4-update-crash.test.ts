@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   statSync,
@@ -260,12 +261,15 @@ await test(`НАХОДКА R4-1/R4-2: свойство «повтор после
   );
 });
 
-// Зелёный control: правленый пользователем файл не выводится ни при каком раскладе.
-await test("зелёное: правка пользователя в чекауте переживает вывод", () => {
+// Решение владельца (13.09.2026): правки в коде Ивы обновление затирает, ставится версия
+// из коммита. Чужой файл рядом с правкой - не наш, он остаётся.
+await test("правка в коде Ивы вывод не переживает, файл рядом переживает", () => {
   const home = makeHome();
   writeFileSync(join(home, "agent", "index.ts"), "// правка пользователя\n");
+  writeFileSync(join(home, "notes.md"), "# моё\n");
   const removed = retireCheckout(home);
-  assert.ok(existsSync(join(home, "agent", "index.ts")));
+  assert.equal(existsSync(join(home, "agent", "index.ts")), false);
+  assert.equal(readFileSync(join(home, "notes.md"), "utf8"), "# моё\n");
   assert.ok(removed.includes("package.json"), JSON.stringify(removed));
 });
 
