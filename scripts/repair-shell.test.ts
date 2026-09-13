@@ -178,3 +178,114 @@ test("repair refuses a directory that is not an Iva installation", (t) => {
   assert.equal(failure.status, 1);
   assert.match(failure.output, /this is not an Iva installation/u);
 });
+
+/**
+ * Дерево, которое владелец сам помеченным `.iva-dev`: ремонт к нему не прикасается.
+ * `git reset --hard` стёр бы незакоммиченную работу, а обновление такому дереву всё равно
+ * отказывает - тогда правки потеряны, а обновление не сделано.
+ */
+test("repair refuses a development checkout and leaves the work on disk", (t) => {
+  const { install, handoff, run } = checkout(t);
+  writeFileSync(join(install, "bin/iva.mjs"), "// work in progress\n");
+  writeFileSync(join(install, ".iva-dev"), "");
+  const head = git(install, "rev-parse", "HEAD");
+
+  const failure = (() => {
+    try {
+      return { output: run(), status: 0 };
+    } catch (error) {
+      const failed = error as { status?: number; stderr?: string };
+      return { output: String(failed.stderr), status: failed.status };
+    }
+  })();
+
+  assert.equal(failure.status, 1);
+  assert.match(failure.output, /development checkout \(\.iva-dev\)/u);
+  // Работа на месте, история не двинулась, обновление никому не передано.
+  assert.equal(
+    readFileSync(join(install, "bin/iva.mjs"), "utf8"),
+    "// work in progress\n",
+  );
+  assert.equal(git(install, "rev-parse", "HEAD"), head);
+  assert.throws(() => readFileSync(handoff, "utf8"));
+});
+
+/**
+ * Обрыв на переключении версий: `versions/` есть, `current` потерян, чекаута уже нет.
+ * Ремонт обязан запустить обновлятор из версии на диске - он переключение и доводит.
+ */
+test("repair starts the update from the version on disk when current is lost", (t) => {
+  const { install, handoff, run } = checkout(t);
+  rmSync(join(install, ".git"), { recursive: true, force: true });
+  mkdirSync(join(install, "versions/0.4.1-aaaaaaaaaaaa/bin"), {
+    recursive: true,
+  });
+  writeFileSync(
+    join(install, "versions/0.4.1-aaaaaaaaaaaa/bin/iva.mjs"),
+    "// older version\n",
+  );
+  mkdirSync(join(install, "versions/0.4.2-bbbbbbbbbbbb/bin"), {
+    recursive: true,
+  });
+  writeFileSync(
+    join(install, "versions/0.4.2-bbbbbbbbbbbb/bin/iva.mjs"),
+    "// newest version\n",
+  );
+
+  const output = run();
+
+  assert.match(output, /stopped while switching versions/u);
+  assert.equal(
+    readFileSync(handoff, "utf8"),
+    `${join(install, "versions/0.4.2-bbbbbbbbbbbb/bin/iva.mjs")}\n`,
+  );
+});
+
+/**
+ * У установки может не быть remote-tracking ref на канал (клон без него, свёрнутый
+ * refspec): `git fetch origin <ветка>` пишет тогда только FETCH_HEAD, и ремонт обязан
+ * работать по нему, а не падать на `origin/<ветка>`.
+ */
+test("repair resets onto what it fetched, with no remote-tracking ref to read", (t) => {
+  const { install, remote, handoff, run } = checkout(t);
+  const released = readFileSync(join(install, "bin/iva.mjs"), "utf8");
+  git(install, "config", "--unset-all", "remote.origin.fetch");
+  git(install, "update-ref", "-d", "refs/remotes/origin/main");
+  writeFileSync(join(install, "bin/iva.mjs"), "// my own updater\n");
+  const released_head = git(remote, "rev-parse", "main");
+
+  run();
+
+  assert.equal(git(install, "rev-parse", "HEAD"), released_head);
+  assert.equal(readFileSync(join(install, "bin/iva.mjs"), "utf8"), released);
+  assert.equal(
+    readFileSync(handoff, "utf8"),
+    `${join(install, "bin/iva.mjs")}\n`,
+  );
+});
+
+/**
+ * Ремонт тянет код и сразу его запускает: из чужого origin - никогда.
+ */
+test("repair refuses an installation whose origin is not the project", (t) => {
+  const { install, run } = checkout(t);
+  git(
+    install,
+    "remote",
+    "set-url",
+    "origin",
+    "https://example.invalid/iva.git",
+  );
+
+  const failure = (() => {
+    try {
+      return { output: run(), status: 0 };
+    } catch (error) {
+      const failed = error as { status?: number; stderr?: string };
+      return { output: String(failed.stderr), status: failed.status };
+    }
+  })();
+
+  assert.equal(failure.status, 1);
+  assert.match(failure.output, /origin is not github\.com\/smixs\/iva-agent/u);
+});
