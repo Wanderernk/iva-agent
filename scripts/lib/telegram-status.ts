@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { modelSummary } from "./model-summary.ts";
 import { redactTelegramBody } from "./notice.ts";
 import { screenPayload } from "./telegram-buttons.ts";
-import { updaterTooOldMessage } from "./update-check.ts";
+import { updateKeepsLine, updaterTooOldMessage } from "./update-check.ts";
 
 type UpdatePhase = "fetch" | "build";
 type TelegramJob = {
@@ -47,7 +47,6 @@ type Reporter = {
   complete(versions: {
     beforeVersion?: string;
     afterVersion: string;
-    changedLocal?: boolean;
   }): Promise<boolean>;
   dispose(): void;
 };
@@ -76,7 +75,6 @@ const COPY = {
     devCheckout:
       "this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
     final: "✅ Iva updated",
-    preserved: "Settings, memory and your skills are where they were.",
     failure: (version: string) =>
       `Iva is still running ${version}.\nYour settings, memory and skills are where they were.\nRetry: /update`,
   },
@@ -95,7 +93,6 @@ const COPY = {
     devCheckout:
       "это чекаут разработчика (.iva-dev): обновляйся через git, собирай `npm run build`",
     final: "✅ Iva обновлена",
-    preserved: "Настройки, память и ваши скиллы на месте.",
     failure: (version: string) =>
       `Iva продолжает работать на ${version}.\nНастройки, память и ваши скиллы на месте.\nПовторить: /update`,
   },
@@ -331,7 +328,9 @@ export function createTelegramUpdateReporter({
           ? `${beforeVersion} → ${afterVersion}`
           : `${lang === "ru" ? "Версия" : "Version"}: ${afterVersion}`,
         `${lang === "ru" ? "Модель" : "Model"}: ${model.line}`,
-        copy.preserved,
+        // Ровно та же строка, что в предложении обновиться: что остаётся на месте и что
+        // обновление не переносит. Иначе финал обещал бы сохранность правок в коде Ивы.
+        updateKeepsLine(lang),
       ];
       return finish(lines.join("\n"));
     },

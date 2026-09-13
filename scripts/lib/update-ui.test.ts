@@ -201,6 +201,12 @@ test("Telegram update edits one message through every phase and final result", a
   );
   assert.match(screenOf(edits[2]?.body), /Iva обновлена/);
   assert.match(screenOf(edits[2]?.body), /OpenAI · gpt-5.5/);
+  // Финал говорит ту же правду, что и предложение обновиться: настройки и скиллы на
+  // месте, правки в коде Ивы не переносятся. Обещания сохранности правок тут нет.
+  assert.match(
+    screenOf(edits[2]?.body),
+    /Настройки, память и ваши скиллы на месте\. Правки в коде Ивы не переносятся\./u,
+  );
   assert.equal(edits[2].body.entities, undefined);
 });
 
@@ -240,6 +246,12 @@ test("Telegram does not recreate phase messages after the active message was del
     calls.filter((call) => call.method === "sendRichMessage").length,
     1,
     "only the final result is recreated",
+  );
+  // Английский финал - та же строка, ни слова о сохранённых правках.
+  const recreated = calls.find((call) => call.method === "sendRichMessage");
+  assert.match(
+    screenOf(recreated?.body),
+    /Settings, memory and your skills stay in place\. Edits to Iva's own code are not carried over\./u,
   );
 });
 
