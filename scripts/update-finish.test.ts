@@ -994,7 +994,10 @@ test("a conversion wipes an edit to Iva's own code and keeps the file beside it"
   git("commit", "-q", "-m", "release");
   // Правка в коде Ивы, правка в файле верхнего уровня и файл пользователя рядом.
   writeFileSync(join(home, "agent/index.ts"), "export const mine = 2;\n");
-  writeFileSync(join(home, "package.json"), '{ "name": "iva", "mine": true }\n');
+  writeFileSync(
+    join(home, "package.json"),
+    '{ "name": "iva", "mine": true }\n',
+  );
   writeFileSync(join(home, "notes.md"), "# my notes\n");
 
   const removed = retireCheckout(home);
