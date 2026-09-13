@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { basename, join } from "node:path";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { readEnvFresh } from "../lib/env-file.ts";
 import {
@@ -201,17 +201,16 @@ async function removeStaleUpdateJobs(): Promise<void> {
     return;
   }
   await Promise.all(
-    names
-      .filter((name) => name.endsWith(".json"))
-      .map(async (name) => {
-        const path = join(jobs, name);
-        try {
-          if (Date.now() - (await stat(path)).mtimeMs > UPDATE_JOB_TTL_MS)
-            await rm(path, { force: true });
-        } catch {
-          // Stale-job cleanup tolerates files disappearing or changing concurrently.
-        }
-      }),
+    // Всё, что лежит в каталоге: файл job и заявка на повтор рядом с ним.
+    names.map(async (name) => {
+      const path = join(jobs, name);
+      try {
+        if (Date.now() - (await stat(path)).mtimeMs > UPDATE_JOB_TTL_MS)
+          await rm(path, { force: true });
+      } catch {
+        // Stale-job cleanup tolerates files disappearing or changing concurrently.
+      }
+    }),
   );
 }
 
@@ -312,8 +311,6 @@ type UpdateJob = {
   startedAt?: string;
   /** The version that ran when the tap was made; absent on a checkout. */
   currentAtStart?: string;
-  /** This job's update was already restarted once; a second break waits for the TTL. */
-  retried?: boolean;
   outcome?: unknown;
 };
 type FinalVersions = { beforeVersion?: string; afterVersion: string };
@@ -429,6 +426,7 @@ function rolledBack(store: VersionStore, running: string): boolean {
 async function dropDeliveredJob(path: string): Promise<void> {
   try {
     await rm(path, { force: true });
+    await rm(retryMark(path), { force: true });
   } catch (error) {
     log(
       "update job file left on disk after its final:",
@@ -568,7 +566,10 @@ async function watchUpdateJob(
       const moved = flippedTo(store, snapshot);
       // The file went with an updater that answered the chat itself: nothing was
       // installed, so nothing restarted, so the report went out the ordinary way.
-      if (!job && !moved) return;
+      if (!job && !moved) {
+        await rm(retryMark(path), { force: true }); // Заявка живёт не дольше своего job.
+        return;
+      }
       quietSince ??= Date.now();
       if (Date.now() - quietSince < graceMs) continue;
       await concludeUpdateJob(path, job ?? snapshot, store, moved);
@@ -580,25 +581,31 @@ async function watchUpdateJob(
   log("update job watch gave up on:", basename(path));
 }
 
+/** The claim that an interrupted update was already restarted, beside its job file. */
+const retryMark = (path: string): string => `${path}.retried`;
+
 /**
  * An update that was interrupted before it wrote anything down - the box lost power,
  * the process was killed - is started again, once. `runVersionUpdate` finishes whatever
- * the dead run left half-done, so the retry is the whole repair; the mark in the job
- * file is what keeps it from becoming a loop, and a second break is left to the TTL
+ * the dead run left half-done, so the retry is the whole repair; the claim beside the
+ * job file is what keeps it from becoming a loop, and a second break is left to the TTL
  * path below with the message it already has.
+ *
+ * Заявка создаётся с `wx` (O_EXCL) до запуска: два моста, читающие один job
+ * одновременно, получают ровно одно обновление, второй - EEXIST. Обратный порядок
+ * (запуск, потом заявка) стоил бы перезапуска обновления на каждом старте моста.
  */
 async function retryInterruptedUpdate(
   path: string,
   job: UpdateJob,
-  launch: (jobId: string) => Promise<LaunchResult>,
+  launch: (jobId: string) => Promise<LaunchResult> = launchSelfUpdate,
 ): Promise<boolean> {
-  if (job.retried === true) return false;
   if (updateRunning(DATA_DIR)) return false; // Живой владелец лока: обновление идёт.
-  // Отметка ложится до запуска: обрыв между ними стоит одной незапущенной попытки,
-  // обратный порядок - бесконечного перезапуска обновления на каждом старте моста.
-  await writeFileAtomic(path, JSON.stringify({ ...job, retried: true }), {
-    mode: 0o600,
-  });
+  try {
+    await writeFile(retryMark(path), "", { flag: "wx", mode: 0o600 });
+  } catch {
+    return false; // Заявка уже стоит: обновление этого job повторяли.
+  }
   const launched = await launch(basename(path, ".json"));
   if (!launched.ok) {
     log("interrupted update not restarted:", launched.msg || "(no output)");
@@ -627,7 +634,7 @@ export async function reconcileUpdateJobs({
   root = ROOT,
   tickMs = WATCH_TICK_MS,
   graceMs = WATCH_GRACE_MS,
-  launchImpl = launchSelfUpdate,
+  launchImpl,
 }: ReconcileOptions = {}): Promise<Promise<void>[]> {
   let names: string[];
   try {
@@ -647,18 +654,14 @@ export async function reconcileUpdateJobs({
       if (!job) continue;
       const outcome = outcomeOf(job);
       if (!outcome) {
-        const retried = await retryInterruptedUpdate(path, job, launchImpl);
-        watchers.push(
-          watchUpdateJob(path, retried ? { ...job, retried: true } : job, {
-            root,
-            tickMs,
-            graceMs,
-          }),
-        );
+        await retryInterruptedUpdate(path, job, launchImpl);
+        watchers.push(watchUpdateJob(path, job, { root, tickMs, graceMs }));
         continue;
       }
-      if (await deliverFinal(job, outcome)) await rm(path, { force: true });
-      else log("update final undelivered; the job waits for the next start");
+      if (await deliverFinal(job, outcome)) {
+        await rm(path, { force: true });
+        await rm(retryMark(path), { force: true });
+      } else log("update final undelivered; the job waits for the next start");
     } catch (error) {
       log("update job reconcile failed:", name, (error as ErrorLike).message);
     }

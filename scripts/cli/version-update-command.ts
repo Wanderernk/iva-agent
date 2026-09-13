@@ -285,11 +285,12 @@ export function createVersionUpdateCommand(
     try {
       terminal.start(text.fetch[0]);
       await reporter?.start("fetch");
-      const repo = await ensureMirror(install.home);
       const outcome = await runVersionUpdate({
         home: install.home,
         store,
-        resolveTarget: () => target(repo),
+        // Зеркало клонируется под локом, а не до него: пока лок чужой, клон истории -
+        // работа впустую и второй rename рядом с чужим обновлением.
+        resolveTarget: async () => target(await ensureMirror(install.home)),
         run: commandRunner(verbose),
         force,
         requirePlugins,
