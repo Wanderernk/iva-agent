@@ -18,6 +18,7 @@ import {
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1058,6 +1059,43 @@ test("a conversion leaves an untracked file inside a directory of ours", (t) => 
   );
   // И только его: соседний tracked-файл в том же каталоге уходит вместе со всеми.
   assert.equal(existsSync(join(home, "agent/index.ts")), false);
+});
+
+/**
+ * Tracked-файл можно подменить локально не только правкой, но и симлинком в никуда:
+ * `existsSync` идёт по ссылке и такой путь считает пустым. Контракт вывода - «все
+ * tracked-файлы сняты» - решается по самой записи, а неотслеживаемая ссылка остаётся
+ * пользователю, как любой его файл.
+ */
+test("a conversion removes a tracked path held by a dangling symlink", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-retire-dangling-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-C", home, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva" }\n');
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  rmSync(join(home, "agent/index.ts"));
+  symlinkSync(join(home, "agent/gone.ts"), join(home, "agent/index.ts"));
+  // Такая же ссылка, но git о ней не знает: она пользователя и остаётся.
+  symlinkSync(join(home, "agent/gone.ts"), join(home, "agent/mine.ts"));
+
+  retireCheckout(home);
+
+  assert.throws(() => lstatSync(join(home, "agent/index.ts")));
+  assert.equal(lstatSync(join(home, "agent/mine.ts")).isSymbolicLink(), true);
 });
 
 /**

@@ -491,6 +491,20 @@ export function sameRetireTree(
   return true;
 }
 
+/**
+ * Есть ли что-то по пути - хоть битый симлинк. `existsSync` идёт по ссылке и на
+ * симлинке в никуда отвечает «нет», а tracked-файл, подменённый такой ссылкой, вывод
+ * чекаута обязан снести наравне с обычным.
+ */
+function pathPresent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Убрать опустевшие родители пути до home; каталог с любым содержимым остаётся. */
 function pruneEmptyParents(home: string, path: string): void {
   for (let at = dirname(path); at !== home; at = dirname(at)) {
@@ -605,7 +619,7 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
     const removed = new Set<string>();
     for (const path of [...RETIRE_ARTIFACTS, ".git"]) {
       const full = join(home, path);
-      if (!existsSync(full)) continue;
+      if (!pathPresent(full)) continue;
       rmSync(full, { recursive: true, force: true });
       removed.add(path);
     }
@@ -626,7 +640,7 @@ export function retireCheckout(home: string, notify: Say = () => {}): string[] {
     const name = topLevel(path);
     if (KEEP.has(name)) continue;
     const full = join(home, path);
-    if (!existsSync(full)) continue;
+    if (!pathPresent(full)) continue;
     // Идентичность снимается до удалений (`.git` уходит последним, так что он ещё цел)
     // и ложится в метку только после первого состоявшегося удаления: упавший на первом
     // файле вывод не оставляет метки вовсе.
