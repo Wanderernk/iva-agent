@@ -217,6 +217,15 @@ type ClaimedShim = { readonly directory: string; readonly path: string };
 /** Вернуть перенесённую запись на шим-путь: ссылку переименованием, файл жёсткой ссылкой. */
 function putBack(previous: string, shimPath: string): void {
   if (lstatSync(previous).isSymbolicLink()) {
+    // rename перезаписал бы то, что успело появиться на пути; жёсткая ссылка на симлинк
+    // не везде ссылка на него самого, поэтому занятый путь - отказ, как и для файла.
+    let taken = true;
+    try {
+      lstatSync(shimPath);
+    } catch {
+      taken = false;
+    }
+    if (taken) throw new Error(`EEXIST: ${shimPath} is taken`);
     renameSync(previous, shimPath);
     return;
   }
