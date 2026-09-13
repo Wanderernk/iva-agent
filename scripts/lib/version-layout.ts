@@ -81,16 +81,14 @@ export function isManagedInstall(install: Install): boolean {
 }
 
 /**
- * Exact generated-shim grammar: the refresh replaces an existing command only when it
- * is byte-for-byte the script it would write, for the node it would write it for.
+ * Exact generated-shim grammar: the refresh replaces an existing command only when it is
+ * byte-for-byte the script it would write - for whichever node that script names. The
+ * node is deliberately not compared: a shim written for a node that has since moved
+ * still leads into this installation, and leaving it alone is the command `iva` dying
+ * the moment the checkout it pointed at becomes a version (13.09.2026).
  */
-function isOwnedShim(
-  shim: string,
-  home: string,
-  expectedNode: string,
-): boolean {
+function isOwnedShim(shim: string, home: string): boolean {
   const lines = shim.split("\n");
-  const sameNode = (node: string): boolean => real(node) === real(expectedNode);
   const exec = (line: string | undefined): string | null =>
     /^exec "([^"\\$`\r\n]+)" "\$IVA_ROOT\/bin\/iva\.mjs" "\$@"$/u.exec(
       line ?? "",
@@ -107,11 +105,8 @@ function isOwnedShim(
     lines[1] ?? "",
   );
   if (lines.length === 3 && lines[0] === "#!/usr/bin/env bash" && direct) {
-    const node = direct[1];
     const target = direct[2];
     return (
-      basename(node) === "node" &&
-      sameNode(node) &&
       basename(target) === "iva.mjs" &&
       basename(dirname(target)) === "bin" &&
       real(dirname(dirname(target))) === real(home) &&
@@ -129,14 +124,13 @@ function isOwnedShim(
     return (
       writtenData !== null &&
       node !== null &&
-      sameNode(node) &&
       shim === shimScript(writtenHome, node, writtenData)
     );
   }
 
   // The previous release had no IVA_DATA snapshot and always read home/data.
   const node = exec(lines[16]);
-  if (lines.length !== 18 || node === null || !sameNode(node)) return false;
+  if (lines.length !== 18 || node === null) return false;
   const expected = shimScript(
     writtenHome,
     node,
@@ -479,7 +473,7 @@ export function refreshOwnedShim(
     const claim = (() => {
       try {
         if (opened.text === desired) return null;
-        if (!isOwnedShim(opened.text, home, node)) return null;
+        if (!isOwnedShim(opened.text, home)) return null;
         if (!sameOpenShim(shimPath, opened)) return null;
         return claimOpenShim(shimPath, opened);
       } finally {

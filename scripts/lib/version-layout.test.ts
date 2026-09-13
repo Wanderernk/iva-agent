@@ -113,23 +113,35 @@ test("an owned shim refreshes its data snapshot without replacing a foreign comm
     shimScript(home, process.execPath, nextData),
   );
 
-  const foreignExecutable = Buffer.from(
-    `#!/usr/bin/env bash\nexec "/bin/echo" "${home}/bin/iva.mjs" "$@"\n`,
-  );
-  writeFileSync(shim, foreignExecutable);
+  // Наш же шим, написанный под другой node: он ведёт в эту установку, и переписать его
+  // обязаны - иначе после перевода чекаута на версии команда `iva` мертва, потому что
+  // `bin/iva.mjs` чекаута удалён (HIGH-4, 13.09.2026).
+  const otherNodeDirect = `#!/usr/bin/env bash\nexec "/opt/node/bin/node" "${home}/bin/iva.mjs" "$@"\n`;
+  writeFileSync(shim, otherNodeDirect);
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, firstData), true);
   assert.equal(
-    refreshOwnedShim(shim, home, process.execPath, firstData),
-    false,
+    readFileSync(shim, "utf8"),
+    shimScript(home, process.execPath, firstData),
   );
-  assert.deepEqual(readFileSync(shim), foreignExecutable);
 
-  const foreignCurrent = Buffer.from(shimScript(home, "/bin/echo", firstData));
-  writeFileSync(shim, foreignCurrent);
+  const otherNodeCurrent = shimScript(home, "/opt/node/bin/node", firstData);
+  writeFileSync(shim, otherNodeCurrent);
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, nextData), true);
+  assert.equal(
+    readFileSync(shim, "utf8"),
+    shimScript(home, process.execPath, nextData),
+  );
+
+  // Чужая установка - чужой файл: шим, ведущий не в этот home, не наш ни при каком node.
+  const otherInstall = Buffer.from(
+    shimScript(join(home, "elsewhere"), process.execPath, firstData),
+  );
+  writeFileSync(shim, otherInstall);
   assert.equal(
     refreshOwnedShim(shim, home, process.execPath, firstData),
     false,
   );
-  assert.deepEqual(readFileSync(shim), foreignCurrent);
+  assert.deepEqual(readFileSync(shim), otherInstall);
 
   const victim = join(home, "other-file");
   writeFileSync(victim, previousDirect);
