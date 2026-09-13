@@ -161,7 +161,7 @@ Reinstall from the current tree — one command, and it is the only way out:
 curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/repair.sh | bash
 ```
 
-Your data and `.env` stay in place: `.env`, `data/`, `vault/` and `attachments/` are copied byte for byte, and the whole old installation is kept beside the new one as `~/iva-backup-<timestamp>`.
+Your data and `.env` stay in place: nothing outside Iva's own code is touched. What the command does touch is that code - it puts the checkout back on the release it tracks, so local edits to Iva's files are removed - and then runs the ordinary update.
 
 ### gh not available warnings
 
