@@ -1074,3 +1074,38 @@ void test("property: withoutLookaroundPatterns drops exactly the lookaround patt
     { numRuns: 300 },
   );
 });
+
+// --- Codex: инструменты уходят с strict:false, иначе Responses включает строгий режим сам --
+const { codexProviderOptions } = await import("./provider.ts");
+
+void test("codex sends every function tool with strict:false and leaves provider tools alone", async () => {
+  const out = await codexProviderOptions.transformParams?.({
+    type: "stream",
+    model: new MockLanguageModelV4(),
+    params: {
+      prompt: [],
+      tools: [
+        ...calendarTools(),
+        {
+          type: "provider",
+          id: "openai.web_search",
+          name: "web_search",
+          args: {},
+        },
+      ],
+    },
+  });
+  const tools = out?.tools ?? [];
+  assert.equal(tools.length, 2);
+  assert.equal((tools[0] as { strict?: boolean }).strict, false);
+  assert.equal("strict" in tools[1], false);
+});
+
+void test("codex without tools still passes: nothing to mark", async () => {
+  const out = await codexProviderOptions.transformParams?.({
+    type: "stream",
+    model: new MockLanguageModelV4(),
+    params: { prompt: [] },
+  });
+  assert.equal(out?.tools, undefined);
+});
