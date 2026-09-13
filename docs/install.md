@@ -63,7 +63,7 @@ Five steps. Each key comes with a direct link to where it lives, and each is val
 - 🧰 **The `iva` command** — installed into `~/.local/bin`: `iva status`, `iva doctor`, `iva update`. Full reference: [cli.md](cli.md).
 - ✅ **Telegram confirmation** — the last thing the installer does is message you from your own bot: "Iva is installed and online. Send me a message — I'll reply." That's the success signal.
 
-Re-running the same command later is safe, and cheap: it reuses the existing checkout, fast-forwards it, and keeps `.env` and the vault untouched.
+Re-running the same command later is safe: over an installation that already exists the installer updates nothing itself — it hands the installation to the one updater, exactly as `iva update` and `repair.sh` do. A checkout is put back onto its release first (edits to Iva's own code are removed, `.env`, `data/` and the vault are not touched), a versioned installation goes straight to its own updater, and a checkout you marked with `.iva-dev` is refused.
 
 Every stage checks whether its work is already done and skips it, so a run after a failure costs seconds instead of minutes:
 
@@ -75,9 +75,9 @@ Every stage checks whether its work is already done and skips it, so a run after
 | `gws`           | the binary is installed (`iva update` keeps it current)                                 |
 | Build           | `.output` carries this installer's stamp for the current commit, local edits and `.env` |
 
-The wizard, the vault check, the `iva` command and the systemd units are cheap, so they run every time. A run that fails is undone: the checkout goes back to the commit and the changes it started with, and the copies it made of `.env` and of your untracked files are deleted — on Ctrl-C and on a dropped SSH session too.
+The wizard, the vault check, the `iva` command and the systemd units are cheap, so they run every time. A run that fails is undone: the copy it made of `.env` goes back, the build it replaced is put back, and both copies are deleted — on Ctrl-C and on a dropped SSH session too. The code is never this script's to move.
 
-If the undo itself cannot finish — a read-only checkout, a full disk — nothing it saved is thrown away. Whatever is still the only copy of something stays where it is, and the installer prints each one by name before it exits: the stash entry holding your changes (`git stash list`), the commit it recorded under `refs/iva/update-backups/`, the copy of `.env` under `data/update-backups/`, and the previous build under `.output.iva-install-backup-*`. Read those lines before running anything else. An installation unpacked from an archive instead of cloned has no commit to compare against, so it rebuilds every time; so does one with a file the build cannot read.
+If the undo itself cannot finish — a read-only checkout, a full disk — nothing it saved is thrown away. Whatever is still the only copy of something stays where it is, and the installer prints each one by name before it exits: the copy of `.env` under `data/update-backups/`, and the previous build under `.output.iva-install-backup-*`. Read those lines before running anything else. An installation unpacked from an archive instead of cloned has no commit to compare against, so it rebuilds every time; so does one with a file the build cannot read.
 
 Only one installer runs in an installation at a time: a second one is refused by name, with the process id of the one already working. A lock left by a run that no longer exists is taken over, so a power cut cannot leave the installation unusable.
 

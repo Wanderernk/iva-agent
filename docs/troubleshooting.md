@@ -128,13 +128,13 @@ ffmpeg -i note.m4a -f segment -segment_time 600 -c copy part%02d.m4a
 
 ### iva update fails after force-push
 
-Cause: old versions used a destructive recovery path when upstream history changed. Re-run the current installer; it creates a backup ref, stashes tracked and untracked customizations by exact OID, and refuses an unsafe merge:
+Cause: old versions used a destructive recovery path when upstream history changed. Run the repair command; it puts the checkout back onto its release — edits to Iva's own code are removed, `.env`, `data/` and the vault are not touched — and hands the rest to the one updater:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/repair.sh | bash
 ```
 
-Do not reset or clean the checkout. If the histories cannot be combined safely, the existing version and user files remain in place and the full reason is recorded under `data/logs/`.
+The installer command does the same thing over an existing installation: it hands it to that updater instead of updating anything itself. If the update cannot finish, the version that was running stays in place and the full reason is recorded under `data/logs/`.
 
 ### Update says "local commits conflict with the update"
 
