@@ -21,6 +21,7 @@ import {
 import {
   isEntrypoint,
   refreshOwnedShim,
+  shimIsForeign,
   SHIM_PATH,
 } from "./lib/version-layout.ts";
 import { throughLink } from "./lib/link-target.ts";
@@ -523,10 +524,28 @@ function git(home: string, args: string[]): string {
   });
 }
 
-/** Install the shim that outlives every version; refresh only an owned stale snapshot. */
-export function writeShim(home: string, log: Say): void {
-  if (refreshOwnedShim(SHIM_PATH, home, process.execPath, layoutFor(home).data))
+/**
+ * Install the shim that outlives every version; refresh only an owned stale snapshot.
+ *
+ * Чужой файл на том же пути не трогаем - но и молчать нельзя: `bin/iva.mjs` чекаута
+ * при переводе на версии уходит, и команда `iva` через чужой файл в установку уже не
+ * ведёт. Одна строка владельцу говорит, чем запускать, пока файл на месте.
+ */
+export function writeShim(
+  home: string,
+  log: Say,
+  notify: Say = () => {},
+): void {
+  if (
+    refreshOwnedShim(SHIM_PATH, home, process.execPath, layoutFor(home).data)
+  ) {
     log(`rewrote ${SHIM_PATH}`);
+    return;
+  }
+  if (shimIsForeign(SHIM_PATH, home))
+    notify(
+      `${SHIM_PATH} is not a shim of ours, so the update left it alone; until you move it away run \`node ${join(home, "current/bin/iva.mjs")}\` instead of \`iva\``,
+    );
 }
 
 /**
@@ -899,7 +918,7 @@ export async function main(argv: readonly string[]): Promise<number> {
         await Promise.resolve();
       },
       adopt: () => {
-        writeShim(home, log);
+        writeShim(home, log, notify);
         // Метка прерванного вывода - тот же повод дочистить, что и живого `.git`.
         if (
           !existsSync(join(home, ".git")) &&

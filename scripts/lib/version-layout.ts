@@ -435,6 +435,21 @@ export function shimScript(
   ].join("\n");
 }
 
+/**
+ * True when the shim path is held by something that is not a shim of ours: a symlink,
+ * a hard link, an unreadable entry or a plain file of the owner's. Свободный путь и наш
+ * шим (хоть под другим node) - не чужие: их обновление пишет само.
+ */
+export function shimIsForeign(shimPath: string, home: string): boolean {
+  const opened = openShim(shimPath);
+  if (opened.kind !== "file") return opened.kind === "foreign";
+  try {
+    return !isOwnedShim(opened.text, home);
+  } finally {
+    closeShim(opened.fd);
+  }
+}
+
 /** Refresh an Iva-owned shim without replacing another program at the same path. */
 export function refreshOwnedShim(
   shimPath: string,

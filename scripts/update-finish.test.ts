@@ -1059,3 +1059,52 @@ test("a conversion leaves an untracked file inside a directory of ours", (t) => 
   // И только его: соседний tracked-файл в том же каталоге уходит вместе со всеми.
   assert.equal(existsSync(join(home, "agent/index.ts")), false);
 });
+
+/**
+ * Шим на PATH решается по `homedir()`, а он читается при загрузке модуля - поэтому шов
+ * проверяется дочерним процессом с подменённым HOME.
+ */
+test("a foreign file on the shim path stays, and the owner is told what to run", (t) => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "iva-shim-foreign-"));
+  t.after(() => rmSync(fakeHome, { recursive: true, force: true }));
+  const install = join(fakeHome, "iva");
+  mkdirSync(join(install, "data"), { recursive: true });
+  mkdirSync(join(fakeHome, ".local/bin"), { recursive: true });
+  const shim = join(fakeHome, ".local/bin/iva");
+  writeFileSync(shim, "#!/bin/sh\necho not-iva\n");
+  const driver = join(fakeHome, "driver.ts");
+  writeFileSync(
+    driver,
+    [
+      `const { writeShim } = await import(${JSON.stringify(join(import.meta.dirname, "update-finish.ts"))});`,
+      "const logged: string[] = [];",
+      "const said: string[] = [];",
+      `writeShim(${JSON.stringify(install)}, (line) => logged.push(line), (line) => said.push(line));`,
+      "console.log(JSON.stringify({ logged, said }));",
+      "",
+    ].join("\n"),
+  );
+  const run = (): { logged: string[]; said: string[] } =>
+    JSON.parse(
+      execFileSync(process.execPath, [driver], {
+        encoding: "utf8",
+        env: { ...process.env, HOME: fakeHome },
+      }),
+    ) as { logged: string[]; said: string[] };
+
+  const foreign = run();
+
+  assert.equal(readFileSync(shim, "utf8"), "#!/bin/sh\necho not-iva\n");
+  assert.equal(foreign.logged.length, 0);
+  assert.equal(foreign.said.length, 1);
+  assert.match(foreign.said[0] ?? "", /\.local\/bin\/iva/u);
+  assert.match(foreign.said[0] ?? "", /current\/bin\/iva\.mjs/u);
+
+  // Свободное место - шим ставится, и владельцу говорить не о чем.
+  rmSync(shim);
+  const free = run();
+
+  assert.equal(free.said.length, 0);
+  assert.equal(free.logged.length, 1);
+  assert.equal(existsSync(shim), true);
+});
