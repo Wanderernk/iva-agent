@@ -177,6 +177,7 @@ test("a tool schema the provider rejects names the plugin switch, not the schema
       "AI_APICallError: Invalid JSON schema: regex lookaround is not supported. Found at $.properties.attendees.items.pattern.",
     details: { statusCode: 400, upstreamType: "invalid_request_error" },
   });
-  assert.match(text.ru, /iva plugin disable/u);
+  assert.match(text.ru, /attendees\.items\.pattern/u);
+  assert.match(text.ru, /data\/custom\/agent\/tools/u);
   assert.match(text.en, /iva plugin disable/u);
 });
