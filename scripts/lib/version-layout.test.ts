@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import fc from "fast-check";
 import {
   classifyRoot,
   isManagedInstall,
@@ -375,6 +376,92 @@ test("the shim alone tells an installation: branches and commits of one's own do
   assert.equal(managed(), true);
   rmSync(shim);
   assert.equal(managed(), false);
+});
+
+const ROUTE_SEED = 43_017;
+
+/**
+ * The invariant this route stands on: the answer is a function of the layout and the
+ * shim's bytes, and of nothing else. The predicate it replaced read git - a branch of
+ * one's own, a commit ahead - and every user who had rolled back through `release/<v>`
+ * was declared a developer's checkout and never updated again.
+ */
+test("property: the layout and the shim decide the route, git and dirt never do", (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "iva-route-")));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  const home = join(dir, "iva");
+  mkdirSync(home);
+  writeFileSync(join(home, "package.json"), "{}\n");
+  git(home, "init", "--initial-branch=main");
+  git(home, "add", "-A");
+  git(home, "commit", "-m", "release");
+  const version = join(home, "versions", "0.4.2-abcdefabcdef");
+  mkdirSync(version, { recursive: true });
+  const ours = shimScript(home, process.execPath, join(home, "data"));
+  const shim = join(dir, "iva-shim");
+  const elsewhere = join(dir, "iva-elsewhere");
+
+  fc.assert(
+    fc.property(
+      fc.record({
+        shim: fc.constantFrom(
+          "ours" as const,
+          "missing" as const,
+          "foreign" as const,
+          "symlink" as const,
+          "junk" as const,
+        ),
+        junk: fc.string(),
+        branches: fc.integer({ min: 1, max: 3 }),
+        commits: fc.integer({ min: 0, max: 2 }),
+        dirty: fc.boolean(),
+      }),
+      (world) => {
+        for (let ahead = 0; ahead < world.commits; ahead += 1)
+          git(home, "commit", "-q", "--allow-empty", "-m", "mine");
+        for (let extra = 1; extra < world.branches; extra += 1)
+          git(home, "branch", "-f", `release/0.4.${extra}`, "HEAD");
+        writeFileSync(
+          join(home, "package.json"),
+          world.dirty ? `{ "edited": ${world.junk.length} }\n` : "{}\n",
+        );
+        rmSync(shim, { force: true });
+        if (world.shim === "ours") writeFileSync(shim, ours);
+        else if (world.shim === "junk") writeFileSync(shim, world.junk);
+        else if (world.shim === "foreign")
+          writeFileSync(shim, `#!/bin/sh\nexec /bin/echo "$@"\n`);
+        else if (world.shim === "symlink") {
+          writeFileSync(elsewhere, ours);
+          symlinkSync(elsewhere, shim);
+        }
+
+        const decision = isManagedInstall(classifyRoot(home), shim);
+        // Одно решение, и то же самое при повторе: маршрут читают и апдейтер, и мост.
+        assert.equal(isManagedInstall(classifyRoot(home), shim), decision);
+        // Мусор в шиме — не исключение и не «может быть»: он просто не наш.
+        assert.equal(
+          decision,
+          world.shim === "ours" ||
+            (world.shim === "junk" && world.junk === ours),
+        );
+        // A version is an installation whatever sits on PATH: nothing else is there.
+        assert.equal(isManagedInstall(classifyRoot(version), shim), true);
+      },
+    ),
+    { seed: ROUTE_SEED, numRuns: 40 },
+  );
 });
 
 test("install.sh creates and refreshes only its own shim", (t) => {
