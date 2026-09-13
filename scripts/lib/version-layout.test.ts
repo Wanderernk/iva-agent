@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -15,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import fc from "fast-check";
 import {
@@ -129,6 +130,42 @@ test("after the conversion the shim on PATH still runs Iva", (t) => {
   );
 });
 
+/**
+ * Вторая форма того же HIGH-4: на шим-пути не файл, а симлинк в установку (его пишет
+ * прежний установщик или сам владелец). Цель - `bin/iva.mjs` чекаута, который конверсия
+ * удаляет, значит ссылку обязаны заменить сгенерированным шимом. Проверяется запуск.
+ */
+test("after the conversion a shim that was a symlink into the installation runs Iva", (t) => {
+  const home = installation(t);
+  const shim = join(home, ".local/bin/iva");
+  const data = join(home, "data");
+  mkdirSync(join(home, "bin"), { recursive: true });
+  writeFileSync(
+    join(home, "bin/iva.mjs"),
+    'process.stdout.write("checkout");\n',
+  );
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  symlinkSync(join(home, "bin/iva.mjs"), shim);
+
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), true);
+  // Заменена сама ссылка, а не файл, на который она смотрела.
+  assert.equal(lstatSync(shim).isSymbolicLink(), false);
+  assert.equal(
+    readFileSync(join(home, "bin/iva.mjs"), "utf8"),
+    'process.stdout.write("checkout");\n',
+  );
+  rmSync(join(home, "bin"), { recursive: true, force: true });
+  writeFileSync(
+    join(data, "active.json"),
+    '{"version":"0.3.14-aaaaaaaaaaaa"}\n',
+  );
+
+  assert.equal(
+    execFileSync(shim, { encoding: "utf8" }).trim(),
+    "0.3.14-aaaaaaaaaaaa",
+  );
+});
+
 test("an owned shim refreshes its data snapshot without replacing a foreign command", (t) => {
   const home = installation(t);
   const shim = join(home, ".local/bin/iva");
@@ -180,7 +217,9 @@ test("an owned shim refreshes its data snapshot without replacing a foreign comm
   );
   assert.deepEqual(readFileSync(shim), otherInstall);
 
-  const victim = join(home, "other-file");
+  // Симлинк наружу установки - чужая программа: её не переписывают, как и файл.
+  const victim = join(dirname(home), `${basename(home)}-other-file`);
+  t.after(() => rmSync(victim, { force: true }));
   writeFileSync(victim, previousDirect);
   rmSync(shim);
   symlinkSync(victim, shim);

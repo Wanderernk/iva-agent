@@ -12,6 +12,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -21,7 +22,7 @@ import {
   writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isIvaProcess, processCommand } from "./process-command.ts";
 import { createVersionStore, parseVersionName } from "./version-store.ts";
@@ -450,6 +451,41 @@ export function shimIsForeign(shimPath: string, home: string): boolean {
   }
 }
 
+/**
+ * Симлинк на шим-пути - наш, когда он ведёт внутрь установки: его оставил прежний
+ * установщик или сам владелец, и после перевода на версии он указывал бы на снесённый
+ * `bin/iva.mjs` - команда `iva` умирает. Ссылка наружу - чужая программа, её не трогаем.
+ * Судится написанный в ссылке путь: цель могла уже уйти, и тогда realpath не отвечает.
+ */
+function shimLinksIntoInstall(shimPath: string, home: string): boolean {
+  let target: string;
+  try {
+    if (!lstatSync(shimPath).isSymbolicLink()) return false;
+    target = real(resolve(dirname(shimPath), readlinkSync(shimPath)));
+  } catch {
+    return false;
+  }
+  const root = real(home);
+  return target === root || target.startsWith(`${root}${sep}`);
+}
+
+/**
+ * Заменить такую ссылку сгенерированным шимом: он публикуется рядом целиком и
+ * переезжает на место одним `rename` - переименование меняет саму ссылку, а не файл,
+ * на который она смотрит, и на шим-пути ни на миг не лежит половина скрипта.
+ */
+function replaceLinkedShim(shimPath: string, desired: string): boolean {
+  const temporary = `${shimPath}.iva-shim-link-${process.pid}-${randomUUID()}`;
+  if (!createShimExclusive(temporary, desired)) return false;
+  try {
+    renameSync(temporary, shimPath);
+    return true;
+  } catch (cause) {
+    rmSync(temporary, { force: true });
+    throw cause;
+  }
+}
+
 /** Refresh an Iva-owned shim without replacing another program at the same path. */
 export function refreshOwnedShim(
   shimPath: string,
@@ -462,7 +498,11 @@ export function refreshOwnedShim(
   // они копятся в ~/.local/bin навсегда.
   sweepStaleShimClaims(dirname(shimPath), shimPath);
   const opened = openShim(shimPath);
-  if (opened.kind === "foreign") return false;
+  if (opened.kind === "foreign")
+    return (
+      shimLinksIntoInstall(shimPath, home) &&
+      replaceLinkedShim(shimPath, desired)
+    );
   if (opened.kind === "file") {
     const claim = (() => {
       try {
