@@ -214,10 +214,19 @@ function sameOpenShim(
 
 type ClaimedShim = { readonly directory: string; readonly path: string };
 
+/** Вернуть перенесённую запись на шим-путь: ссылку переименованием, файл жёсткой ссылкой. */
+function putBack(previous: string, shimPath: string): void {
+  if (lstatSync(previous).isSymbolicLink()) {
+    renameSync(previous, shimPath);
+    return;
+  }
+  linkSync(previous, shimPath);
+  unlinkSync(previous);
+}
+
 function restoreClaim(claim: ClaimedShim, shimPath: string): boolean {
   try {
-    linkSync(claim.path, shimPath);
-    unlinkSync(claim.path);
+    putBack(claim.path, shimPath);
     rmdirSync(claim.directory);
     return true;
   } catch (error) {
@@ -257,17 +266,16 @@ function processIsAlive(pid: number): boolean {
 function discardClaim(claim: string, shimPath: string): void {
   const previous = join(claim, "previous");
   try {
-    const copy = lstatSync(previous).isFile();
+    // Файл или ссылка - что перенёс оборванный ход, то и возвращается: чужой симлинк,
+    // подменивший шим между проверкой и переносом, иначе пропадал бы с PATH.
+    const copy = !lstatSync(previous).isDirectory();
     let shimThere = true;
     try {
       lstatSync(shimPath);
     } catch {
       shimThere = false;
     }
-    if (copy && !shimThere) {
-      linkSync(previous, shimPath);
-      unlinkSync(previous);
-    }
+    if (copy && !shimThere) putBack(previous, shimPath);
   } catch {
     // Копии нет — убираем каталог как есть.
   }
@@ -452,30 +460,10 @@ export function shimIsForeign(shimPath: string, home: string): boolean {
 }
 
 /**
- * Канонический путь и для цели, которой уже нет: канонизируется самый глубокий
- * существующий предок, хвост дописывается как написан. Иначе битая ссылка через
- * симлинк-каталог (`home/looks-inside/x`, где `looks-inside` ведёт наружу) читалась бы
- * по буквам как «внутри», а после `realpath` живого предка видно, куда она ведёт.
- */
-function canonical(path: string): string {
-  let head = path;
-  let tail = "";
-  for (;;) {
-    try {
-      return join(realpathSync(head), tail);
-    } catch {
-      const parent = dirname(head);
-      if (parent === head) return path;
-      tail = join(basename(head), tail);
-      head = parent;
-    }
-  }
-}
-
-/**
  * Симлинк на шим-пути - наш, когда он ведёт внутрь установки: его оставил прежний
  * установщик или сам владелец, и после перевода на версии он указывал бы на снесённый
- * `bin/iva.mjs` - команда `iva` умирает. Ссылка наружу - чужая программа, её не трогаем.
+ * `bin/iva.mjs` - команда `iva` умирает (шим переписывается до сноса чекаута, поэтому
+ * цель ещё жива). Ссылка наружу - чужая программа, её не трогаем.
  * Возвращает текст ссылки, чтобы замена проверила, что двигает ровно её.
  */
 function shimLinksIntoInstall(shimPath: string, home: string): string | null {
@@ -486,7 +474,14 @@ function shimLinksIntoInstall(shimPath: string, home: string): string | null {
   } catch {
     return null;
   }
-  const target = canonical(resolve(dirname(shimPath), link));
+  // Только цель, которую realpath проходит целиком, судится: битый предок, цикл или
+  // недоступный каталог не доказывают, куда ссылка ведёт, - такую не трогаем.
+  let target: string;
+  try {
+    target = realpathSync(resolve(dirname(shimPath), link));
+  } catch {
+    return null;
+  }
   const root = real(home);
   return target === root || target.startsWith(`${root}${sep}`) ? link : null;
 }

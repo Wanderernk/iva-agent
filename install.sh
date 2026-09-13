@@ -245,7 +245,11 @@ INSTALL_TREE_RESTORED=false
 # a run killed by a power cut must not leave the installation unusable.
 acquire_install_lock() {
   local lock owner=""
-  INSTALL_DATA="$(
+  # Путь замка обязан быть одним для всех, кто бежит над этим деревом: передача
+  # обновлятору получает его явно, потому что старый чекаут может не уметь ответить,
+  # где его data, а после ремонта ответил бы уже иначе.
+  INSTALL_DATA="${1:-}"
+  [ -n "$INSTALL_DATA" ] || INSTALL_DATA="$(
     cd "$PROJECT_DIR"
     node --input-type=module -e '
 import { loadEnvFile } from "node:process";
@@ -877,7 +881,7 @@ elif [ -d "$INSTALL_DIR/.git" ] || [ -d "$INSTALL_DIR/versions" ]; then
   # Чекаут ниже двигает git: второй установщик над тем же деревом получал бы сырой
   # «index.lock: File exists» вместо отказа по имени. Версионную раскладку сторожит замок
   # самого обновлятора.
-  if [ -d "$INSTALL_DIR/.git" ]; then PROJECT_DIR="$INSTALL_DIR"; acquire_install_lock; fi
+  if [ -d "$INSTALL_DIR/.git" ]; then PROJECT_DIR="$INSTALL_DIR"; acquire_install_lock "$INSTALL_DIR/data"; fi
   hand_installation_to_repair
 else
   run_stage "$(t "Cloning Iva" "Клонирую Iva")" "$(t "Iva downloaded" "Iva загружена")" \

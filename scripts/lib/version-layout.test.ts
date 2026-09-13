@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -166,21 +167,6 @@ test("after the conversion a shim that was a symlink into the installation runs 
   );
 });
 
-test("a dangling symlink into an installation reached through a symlinked path is still ours", (t) => {
-  const home = installation(t);
-  const data = join(home, "data");
-  // Путь установки, как его написал человек: через симлинк, не канонический.
-  const alias = join(dirname(home), `${basename(home)}-alias`);
-  symlinkSync(home, alias);
-  const shim = join(home, ".local/bin/iva");
-  mkdirSync(join(home, ".local/bin"), { recursive: true });
-  // Цель уже снесена переводом чекаута: realpath не отвечает.
-  symlinkSync(join(alias, "bin/iva.mjs"), shim);
-
-  assert.equal(refreshOwnedShim(shim, alias, process.execPath, data), true);
-  assert.equal(lstatSync(shim).isSymbolicLink(), false);
-});
-
 test("a symlink that only looks inside the installation but leads out is not ours", (t) => {
   const home = installation(t);
   const data = join(home, "data");
@@ -199,6 +185,35 @@ test("a symlink that only looks inside the installation but leads out is not our
     readFileSync(join(outside, "foreign-command"), "utf8"),
     "#!/bin/sh\necho foreign\n",
   );
+  // Предок, который ведёт на отсутствующий том: куда ведёт ссылка, недоказуемо - не наша.
+  rmSync(outside, { recursive: true, force: true });
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), false);
+  assert.equal(lstatSync(shim).isSymbolicLink(), true);
+});
+
+test("a foreign link moved into a claim by an interrupted run goes back on the path", (t) => {
+  const home = installation(t);
+  const data = join(home, "data");
+  const shim = join(home, ".local/bin/iva");
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  const outside = join(dirname(home), `${basename(home)}-cmd`);
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, "foreign"), "#!/bin/sh\n");
+  const dead = execFileSync(process.execPath, ["-p", "process.pid"], {
+    encoding: "utf8",
+  }).trim();
+  const claim = join(
+    home,
+    ".local/bin",
+    `.iva-shim-refresh-${dead}-12345678-1234-1234-1234-123456789abc`,
+  );
+  mkdirSync(claim);
+  symlinkSync(join(outside, "foreign"), join(claim, "previous"));
+
+  // Шима на пути нет: чужая ссылка возвращается из заявки, а не заменяется нашим шимом.
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), false);
+  assert.equal(lstatSync(shim).isSymbolicLink(), true);
+  assert.equal(existsSync(claim), false);
 });
 
 test("an owned shim refreshes its data snapshot without replacing a foreign command", (t) => {
