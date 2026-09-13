@@ -39,10 +39,8 @@ type Reconcile = (options: {
 }) => Promise<Promise<void>[]>;
 
 /** Повтор в этом тесте не ожидается: запуск отвечает отказом и никуда не ходит. */
-const refuseLaunch = async (): Promise<{ ok: boolean; msg: string }> => ({
-  ok: false,
-  msg: "no launch is expected here",
-});
+const refuseLaunch = (): Promise<{ ok: boolean; msg: string }> =>
+  Promise.resolve({ ok: false, msg: "no launch is expected here" });
 
 const { reconcileUpdateJobs } = (await import(
   `./update-flow.ts?reconcile=${Date.now()}`
