@@ -83,6 +83,31 @@ test("stale update-job cleanup removes only expired JSON job files", async () =>
   );
 });
 
+/**
+ * Заявка на повтор - часть своего job: TTL судит job, а не её собственный mtime.
+ * Иначе свежий job остаётся без заявки, и обрыв повторяется второй раз.
+ */
+test("the retry claim outlives the sweep while its job does", async () => {
+  const jobs = join(dataDir, "update-jobs");
+  mkdirSync(jobs, { recursive: true });
+  const fresh = join(jobs, "live.json");
+  const claim = `${fresh}.retried`;
+  const orphan = join(jobs, "gone.json.retried");
+  writeFileSync(fresh, "{}");
+  writeFileSync(claim, "");
+  writeFileSync(orphan, "");
+  const old = new Date(Date.now() - 7 * 60 * 60 * 1000);
+  utimesSync(claim, old, old);
+  utimesSync(orphan, old, old);
+
+  await removeStaleUpdateJobs();
+
+  assert.equal(existsSync(fresh), true);
+  assert.equal(existsSync(claim), true);
+  // Заявка, чей job уже убрали, - мусор: уходит вместе с ним, не живёт вечно.
+  assert.equal(existsSync(orphan), false);
+});
+
 type MockFetch = (
   url: string,
   init: { body?: string },

@@ -192,6 +192,12 @@ export async function handleUpdateCheck(
 
 const jobsDir = (): string => join(DATA_DIR, "update-jobs");
 
+/**
+ * Заявка на повтор - часть своего job, а не отдельный файл со своим возрастом: TTL
+ * судит только job, а заявка уходит вместе с ним (или когда его уже нет). Иначе
+ * восстановление файлов или сдвиг времён оставлял свежий job без заявки, и обрыв
+ * повторялся второй раз - инвариант «один повтор» держался бы на двух mtime.
+ */
 async function removeStaleUpdateJobs(): Promise<void> {
   const jobs = jobsDir();
   let names;
@@ -200,13 +206,28 @@ async function removeStaleUpdateJobs(): Promise<void> {
   } catch {
     return;
   }
+  const marks = names.filter((name) => name.endsWith(RETRY_MARK_SUFFIX));
+  const alive = new Set(
+    names.filter((name) => !name.endsWith(RETRY_MARK_SUFFIX)),
+  );
   await Promise.all(
-    // Всё, что лежит в каталоге: файл job и заявка на повтор рядом с ним.
-    names.map(async (name) => {
+    [...alive].map(async (name) => {
       const path = join(jobs, name);
       try {
-        if (Date.now() - (await stat(path)).mtimeMs > UPDATE_JOB_TTL_MS)
-          await rm(path, { force: true });
+        if (Date.now() - (await stat(path)).mtimeMs <= UPDATE_JOB_TTL_MS)
+          return;
+        await rm(path, { force: true });
+        alive.delete(name);
+      } catch {
+        // Stale-job cleanup tolerates files disappearing or changing concurrently.
+      }
+    }),
+  );
+  await Promise.all(
+    marks.map(async (name) => {
+      if (alive.has(name.slice(0, -RETRY_MARK_SUFFIX.length))) return;
+      try {
+        await rm(join(jobs, name), { force: true });
       } catch {
         // Stale-job cleanup tolerates files disappearing or changing concurrently.
       }
@@ -586,7 +607,8 @@ async function watchUpdateJob(
 }
 
 /** The claim that an interrupted update was already restarted, beside its job file. */
-const retryMark = (path: string): string => `${path}.retried`;
+const RETRY_MARK_SUFFIX = ".retried";
+const retryMark = (path: string): string => `${path}${RETRY_MARK_SUFFIX}`;
 
 /**
  * An update that was interrupted before it wrote anything down - the box lost power,
