@@ -283,7 +283,7 @@ void test("a checkout marked `.iva-dev` is refused and left exactly as it was", 
     "⚠️ this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
   ]);
   // Left behind, the job keeps the bridge waiting on an update that will never run,
-  // and the chat stays on "Saving your changes" until the six-hour TTL.
+  // and the chat stays on "Starting the update" until the six-hour TTL.
   assert.equal(existsSync(job), false);
   assert.deepEqual(tree(), before);
 });

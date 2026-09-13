@@ -6,6 +6,7 @@ import { readEnvFresh } from "../lib/env-file.ts";
 import {
   inspectUpstream,
   markVersionNotified,
+  updateKeepsLine,
   updateOfferActionLines,
 } from "../lib/update-check.ts";
 import { modelSummary } from "../lib/model-summary.ts";
@@ -175,8 +176,8 @@ export async function handleUpdateCheck(
     chatId,
     status.message_id,
     tr(
-      `⬆️ Update available\n\n${bump}\nSettings and local changes will be preserved.`,
-      `⬆️ Доступно обновление\n\n${bump}\nНастройки и локальные изменения будут сохранены.`,
+      `⬆️ Update available\n\n${bump}\n${updateKeepsLine("en")}`,
+      `⬆️ Доступно обновление\n\n${bump}\n${updateKeepsLine("ru")}`,
     ) + `\n\n${updateOfferActionLines(getLang(), target)}`,
   );
   const offerShown = messageEditSucceeded(offered);
@@ -274,7 +275,7 @@ export async function handleUpdateCallback(
   await edit(
     chatId as string | number,
     messageId as number,
-    tr("◇ Saving your changes", "◇ Сохраняю ваши изменения"),
+    tr("◇ Starting the update", "◇ Запускаю обновление"),
   );
   const r = await launchSelfUpdate(jobId);
   if (!r.ok) {

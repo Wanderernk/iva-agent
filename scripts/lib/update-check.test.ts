@@ -748,7 +748,7 @@ test("this checkout names its own release, and the refusal says how to repair it
 test("the update Alert carries the repair command only for an updater that is too old", async () => {
   const plain = updateOffer("1.2.3", "1.2.4", "en");
   assert.doesNotMatch(plain.text, /repair\.sh/);
-  assert.match(plain.text, /Settings and local changes will be preserved\./);
+  assert.match(plain.text, /Edits to Iva's own code are not carried over\./u);
 
   for (const locale of ["en", "ru"]) {
     const stuck = updateOffer("1.2.3", "1.2.4", locale, true);

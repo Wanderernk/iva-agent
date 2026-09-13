@@ -5,7 +5,7 @@ import { redactTelegramBody } from "./notice.ts";
 import { screenPayload } from "./telegram-buttons.ts";
 import { updaterTooOldMessage } from "./update-check.ts";
 
-type UpdatePhase = "protect" | "fetch" | "build";
+type UpdatePhase = "fetch" | "build";
 type TelegramJob = {
   chatId: string | number;
   messageId: string | number;
@@ -66,11 +66,6 @@ export const UPDATE_LOADER = {
 
 const COPY = {
   en: {
-    protect: [
-      "Saving your changes",
-      "Changes saved",
-      "Couldn't save your changes",
-    ],
     fetch: ["Getting the update", "Update received", "Couldn't get the update"],
     build: ["Building Iva", "Iva built", "Couldn't build Iva"],
     timerFailure:
@@ -81,16 +76,11 @@ const COPY = {
     devCheckout:
       "this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
     final: "✅ Iva updated",
-    preserved: "Local changes: preserved",
+    preserved: "Settings, memory and your skills are where they were.",
     failure: (version: string) =>
       `Iva is still running ${version}.\nYour settings, memory and skills are where they were.\nRetry: /update`,
   },
   ru: {
-    protect: [
-      "Сохраняю ваши изменения",
-      "Изменения сохранены",
-      "Не удалось сохранить изменения",
-    ],
     fetch: [
       "Получаю обновление",
       "Обновление получено",
@@ -105,7 +95,7 @@ const COPY = {
     devCheckout:
       "это чекаут разработчика (.iva-dev): обновляйся через git, собирай `npm run build`",
     final: "✅ Iva обновлена",
-    preserved: "Локальные изменения: сохранены",
+    preserved: "Настройки, память и ваши скиллы на месте.",
     failure: (version: string) =>
       `Iva продолжает работать на ${version}.\nНастройки, память и ваши скиллы на месте.\nПовторить: /update`,
   },
@@ -307,7 +297,7 @@ export function createTelegramUpdateReporter({
     },
     // Тап по /update в дереве, которое апдейтеру не принадлежит: сказать это в чат, а не
     // в терминал systemd-run. Иначе мост ждёт лока, которого не будет, и последнее, что
-    // видит пользователь, — «Сохраняю ваши изменения» на шесть часов.
+    // видит пользователь, — «Запускаю обновление» на шесть часов.
     async devCheckout() {
       currentPhase = null;
       await finish(`⚠️ ${copy.devCheckout}`);

@@ -174,45 +174,34 @@ test("Telegram update edits one message through every phase and final result", a
     fetchImpl,
   });
   assert.ok(reporter);
-  await reporter.start("protect");
-  await reporter.done("protect");
   await reporter.start("fetch");
   await reporter.done("fetch");
   await reporter.start("build");
   await reporter.done("build");
-  await reporter.complete({
-    beforeVersion: "v1",
-    afterVersion: "v2",
-    changedLocal: true,
-  });
+  await reporter.complete({ beforeVersion: "v1", afterVersion: "v2" });
   reporter.dispose();
 
   assert.equal(calls.filter((call) => call.method === "sendMessage").length, 0);
   const edits = calls.filter((call) => call.method === "editMessageText");
-  assert.equal(edits.length, 4);
+  assert.equal(edits.length, 3);
   assert.deepEqual(
     edits.map((call) => call.body.message_id),
-    [100, 100, 100, 100],
+    [100, 100, 100],
   );
   assert.deepEqual(
-    edits.slice(0, 3).map((call) => call.body.entities?.[0]?.custom_emoji_id),
-    [
-      UPDATE_LOADER.customEmojiId,
-      UPDATE_LOADER.customEmojiId,
-      UPDATE_LOADER.customEmojiId,
-    ],
+    edits.slice(0, 2).map((call) => call.body.entities?.[0]?.custom_emoji_id),
+    [UPDATE_LOADER.customEmojiId, UPDATE_LOADER.customEmojiId],
   );
   assert.deepEqual(
-    edits.slice(0, 3).map((call) => call.body.text),
+    edits.slice(0, 2).map((call) => call.body.text),
     [
-      `${UPDATE_LOADER.alt} Сохраняю ваши изменения`,
       `${UPDATE_LOADER.alt} Получаю обновление`,
       `${UPDATE_LOADER.alt} Собираю Iva`,
     ],
   );
-  assert.match(screenOf(edits[3]?.body), /Iva обновлена/);
-  assert.match(screenOf(edits[3]?.body), /OpenAI · gpt-5.5/);
-  assert.equal(edits[3].body.entities, undefined);
+  assert.match(screenOf(edits[2]?.body), /Iva обновлена/);
+  assert.match(screenOf(edits[2]?.body), /OpenAI · gpt-5.5/);
+  assert.equal(edits[2].body.entities, undefined);
 });
 
 test("Telegram does not recreate phase messages after the active message was deleted", async () => {
@@ -243,7 +232,6 @@ test("Telegram does not recreate phase messages after the active message was del
     fetchImpl,
   });
   assert.ok(reporter);
-  await reporter.start("protect");
   await reporter.start("fetch");
   await reporter.start("build");
   await reporter.complete({ beforeVersion: "v1", afterVersion: "v2" });
@@ -282,10 +270,10 @@ test("Telegram retries 429 without downgrading the custom emoji and deduplicates
     sleepImpl: async () => {},
   });
   assert.ok(reporter);
-  await reporter.start("protect");
-  await reporter.start("protect");
-  await reporter.done("protect");
-  await reporter.done("protect");
+  await reporter.start("fetch");
+  await reporter.start("fetch");
+  await reporter.done("fetch");
+  await reporter.done("fetch");
   reporter.dispose();
   assert.equal(calls.length, 2, "one retry and no duplicate edit");
   assert.ok(
@@ -324,20 +312,17 @@ test("Telegram falls back to a simple Unicode marker when custom emoji is unavai
     fetchImpl,
   });
   assert.ok(reporter);
-  await reporter.start("protect");
   await reporter.start("fetch");
+  await reporter.start("build");
   reporter.dispose();
 
   assert.equal(calls.length, 3);
   assert.ok(calls[0].body.entities);
   assert.equal(
     calls[1].body.text,
-    `${UPDATE_LOADER.fallback} Saving your changes`,
-  );
-  assert.equal(
-    calls[2].body.text,
     `${UPDATE_LOADER.fallback} Getting the update`,
   );
+  assert.equal(calls[2].body.text, `${UPDATE_LOADER.fallback} Building Iva`);
   assert.equal(calls[1].body.entities, undefined);
   assert.equal(calls[2].body.entities, undefined);
 });
@@ -367,7 +352,7 @@ test("Telegram preserves error-like status when selecting the custom emoji fallb
     sleepImpl: async () => {},
   });
   assert.ok(reporter);
-  await reporter.start("protect");
+  await reporter.start("fetch");
   reporter.dispose();
 
   assert.equal(calls.length, 4);
@@ -375,7 +360,7 @@ test("Telegram preserves error-like status when selecting the custom emoji fallb
   assert.equal(calls[3].body.entities, undefined);
   assert.equal(
     calls[3].body.text,
-    `${UPDATE_LOADER.fallback} Saving your changes`,
+    `${UPDATE_LOADER.fallback} Getting the update`,
   );
 });
 

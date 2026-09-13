@@ -304,6 +304,17 @@ export function updateOfferActionLines(locale: string, what: string): string {
   ].join("\n\n");
 }
 
+/**
+ * Что обновление действительно оставляет на месте, одной строкой на оба экрана
+ * предложения. Правки в коде Ивы оно не переносит: версия ставится из коммита
+ * (решение владельца 13.09.2026), и обещать обратное нельзя.
+ */
+export function updateKeepsLine(locale: string): string {
+  return locale === "ru"
+    ? "Настройки, память и ваши скиллы на месте. Правки в коде Ивы не переносятся."
+    : "Settings, memory and your skills stay in place. Edits to Iva's own code are not carried over.";
+}
+
 export function updateOffer(
   localVersion: string | null | undefined,
   remoteVersion: string | null | undefined,
@@ -318,9 +329,7 @@ export function updateOffer(
     : `⬆️ A new Iva version is available\n\nv${escapeRichText(String(localVersion))} → v${escapeRichText(String(remoteVersion))}`;
   const tail = updaterTooOld
     ? repairInstructions(locale)
-    : ru
-      ? "Настройки и локальные изменения будут сохранены."
-      : "Settings and local changes will be preserved.";
+    : updateKeepsLine(locale);
   // Кнопки — строки самого сообщения: каждая рядом со своим пояснением (контракт rich).
   const actions = updateOfferActionLines(
     locale,
