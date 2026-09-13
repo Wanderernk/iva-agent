@@ -270,9 +270,15 @@ test("the /update button leaves the lock to the update it launches", async (t) =
   assert.equal(existsSync(lock), false);
   assert.equal(readdirSync(jobs).length, 2);
 
-  // A launcher that fails takes the job file back down with it.
-  rmSync(join(bin, "systemd-run"));
-  assert.match((await press(bin)).at(-1) ?? "", /Couldn't start the update/u);
+  // A launcher that fails takes the job file back down with it, and names the reason.
+  writeFileSync(
+    join(bin, "systemd-run"),
+    `#!/bin/sh\necho 'Failed to connect to bus: No such file or directory' >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  const failed = (await press(bin)).at(-1) ?? "";
+  assert.match(failed, /Couldn't start the update/u);
+  assert.match(failed, /Failed to connect to bus/u);
   assert.equal(readdirSync(jobs).length, 2);
 
   // And an update that is really running is answered before anything is launched.

@@ -330,12 +330,15 @@ function customLayerSection(dataDir: string): string {
 }
 
 /** Новейший файл журнала из data/logs: у self-host это единственный лог, который есть. */
-function newestLogFile(dataDir: string): { name: string; text: string } | null {
+function newestLogFile(
+  dataDir: string,
+  prefix = "",
+): { name: string; text: string } | null {
   const directory = join(dataDir, "logs");
   let names: string[];
   try {
     names = readdirSync(directory)
-      .filter((name) => name.endsWith(".log"))
+      .filter((name) => name.endsWith(".log") && name.startsWith(prefix))
       .sort()
       .reverse();
   } catch {
@@ -355,6 +358,14 @@ function newestLogFile(dataDir: string): { name: string; text: string } | null {
     }
   }
   return null;
+}
+
+/** Хвост последнего лога обновлятора: без него «не удалось собрать» в чате не разобрать. */
+function updateLogSection(dataDir: string): string {
+  const latest = newestLogFile(dataDir, "update-");
+  return latest
+    ? `data/logs/${latest.name}\n\n${latest.text}`
+    : "- no data/logs/update-*.log — no update has run on this install yet";
 }
 
 /**
@@ -410,6 +421,7 @@ async function packageMarkdown(input: {
   readonly now: Date;
   readonly doctor: string;
   readonly journal: string;
+  readonly updateLog: string;
   readonly redaction: string;
   readonly schedules: string;
 }): Promise<string> {
@@ -432,6 +444,10 @@ async function packageMarkdown(input: {
     "```",
     input.doctor.trimEnd(),
     "```",
+    "",
+    `## Last update log (data/logs/update-*.log, last ${JOURNAL_LINES} lines)`,
+    "",
+    input.updateLog.trimEnd(),
     "",
     `## Service journal (last ${JOURNAL_LINES} lines)`,
     "```",
@@ -519,6 +535,7 @@ export function createDiagnoseCommand(
       now: collectedAt,
       doctor: doctorLines.join("\n"),
       journal: journalSection(cap, dataDirectory, units),
+      updateLog: updateLogSection(dataDirectory),
       redaction: redactionLine(envFound, secrets.length),
       schedules: await schedulesSection(dataDirectory, collectedAt.getTime()),
     });

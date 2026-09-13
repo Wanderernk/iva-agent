@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { basename, join } from "node:path";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
@@ -71,6 +71,12 @@ function messageEditSucceeded(value: unknown): boolean {
 // killed with us). --collect GC's the unit after exit. The updater reads a 0600 job
 // file and posts each phase directly through Bot API, so no bridge process survives.
 function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
+  const updater = [
+    join(ROOT, "bin/iva.mjs"),
+    "update",
+    "--telegram-job",
+    jobId,
+  ];
   const args = [
     "--user",
     "--collect",
@@ -79,15 +85,37 @@ function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
     `--setenv=PATH=${process.env.PATH || ""}`,
     `--setenv=ASSISTANT_DATA_DIR=${DATA_DIR}`,
     NODE,
-    join(ROOT, "bin/iva.mjs"),
-    "update",
-    "--telegram-job",
-    jobId,
+    ...updater,
   ];
   return new Promise<LaunchResult>((resolve) =>
-    execFile("systemd-run", args, (err, out, e) =>
-      resolve({ ok: !err, msg: (e || out || "").toString().trim() }),
-    ),
+    execFile("systemd-run", args, (err, out, e) => {
+      // Без systemd (Docker, чужой супервизор) systemd-run нет вовсе: тогда обновлятор
+      // запускается отсоединённым дочерним процессом. Он переживёт рестарт моста, потому
+      // что ему не родитель, а своя сессия; рестарт сервисов обновлятор сам пропустит
+      // (hasSystemd). Прецедент 13.09.2026: «Не удалось запустить обновление» ×3 в Docker.
+      if (err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+        try {
+          const child = spawn(NODE, updater, {
+            cwd: ROOT,
+            env: { ...process.env, ASSISTANT_DATA_DIR: DATA_DIR },
+            detached: true,
+            stdio: "ignore",
+          });
+          child.unref();
+          log(
+            "systemd-run not found; self-update launched as a detached process",
+          );
+          resolve({ ok: true, msg: "detached" });
+        } catch (spawnError) {
+          resolve({
+            ok: false,
+            msg: String((spawnError as ErrorLike).message ?? spawnError),
+          });
+        }
+        return;
+      }
+      resolve({ ok: !err, msg: (e || out || "").toString().trim() });
+    }),
   );
 }
 
