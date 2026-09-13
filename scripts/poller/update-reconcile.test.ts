@@ -34,6 +34,7 @@ type Reconcile = (options?: {
   root?: string;
   tickMs?: number;
   graceMs?: number;
+  launchImpl?: (jobId: string) => Promise<{ ok: boolean; msg: string }>;
 }) => Promise<Promise<void>[]>;
 
 const { reconcileUpdateJobs } = (await import(
@@ -146,10 +147,18 @@ function clean(t: TestContext): void {
   });
 }
 
+/**
+ * A job whose update was already restarted once: that is the state every test below
+ * reads about, because the first break is answered by a retry (retryInterruptedUpdate)
+ * and only the second one is left to the evidence on disk and the TTL. A test about the
+ * retry itself writes `retried: false`.
+ */
 function job(id: string, body: Record<string, unknown>): string {
   const path = join(jobsDir, `${id}.json`);
   mkdirSync(jobsDir, { recursive: true });
-  writeFileSync(path, JSON.stringify(body), { mode: 0o600 });
+  writeFileSync(path, JSON.stringify({ retried: true, ...body }), {
+    mode: 0o600,
+  });
   return path;
 }
 
@@ -820,4 +829,110 @@ test("an outcome written under a reader is never read half-written", async (t) =
   await reader;
 
   assert.ok(reads > 30, `the reader ran ${reads} times`);
+});
+
+test("an interrupted update is restarted once, and the chat is told", async (t) => {
+  clean(t);
+  const root = install(t);
+  const calls = telegram(t);
+  const launched: string[] = [];
+  const path = job("broken", {
+    chatId: 1,
+    messageId: 100,
+    locale: "en",
+    startedAt: minutesAgo(1),
+    currentAtStart: OLD,
+    retried: false,
+  });
+
+  const watchers = await reconcileUpdateJobs({
+    root,
+    tickMs: 5,
+    graceMs: 10,
+    launchImpl: (jobId) => {
+      launched.push(jobId);
+      return Promise.resolve({ ok: true, msg: "" });
+    },
+  });
+  await Promise.all(watchers);
+
+  assert.deepEqual(launched, ["broken"], "the same job is handed back");
+  assert.match(finals(calls)[0] ?? "", /interrupted, retrying/u);
+  // Отметка в файле job - то, чем один повтор отличается от бесконечного.
+  const marked = JSON.parse(readFileSync(path, "utf8")) as {
+    retried?: unknown;
+    chatId?: unknown;
+  };
+  assert.equal(marked.retried, true);
+  assert.equal(marked.chatId, 1, "the job keeps the chat it must answer");
+});
+
+test("an update that is still running is never restarted under it", async (t) => {
+  clean(t);
+  const root = install(t);
+  const calls = telegram(t);
+  const launched: string[] = [];
+  const path = job("running", {
+    chatId: 1,
+    messageId: 100,
+    locale: "en",
+    startedAt: minutesAgo(1),
+    currentAtStart: OLD,
+    retried: false,
+  });
+  // Живой владелец лока: обновление идёт, второй обновлятор рядом с ним - катастрофа.
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(
+    join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+  );
+
+  const watchers = await reconcileUpdateJobs({
+    root,
+    tickMs: 5,
+    graceMs: 10,
+    launchImpl: (jobId) => {
+      launched.push(jobId);
+      return Promise.resolve({ ok: true, msg: "" });
+    },
+  });
+  rmSync(lockDir, { recursive: true, force: true });
+  await Promise.all(watchers);
+
+  assert.deepEqual(launched, []);
+  assert.deepEqual(calls, []);
+  assert.equal(
+    (JSON.parse(readFileSync(path, "utf8")) as { retried?: unknown }).retried,
+    false,
+    "the job is left for the next start exactly as it was",
+  );
+});
+
+test("a job whose update was already retried is left to the ttl", async (t) => {
+  clean(t);
+  const root = install(t);
+  const calls = telegram(t);
+  const launched: string[] = [];
+  const path = job("second-break", {
+    chatId: 1,
+    messageId: 100,
+    locale: "en",
+    startedAt: minutesAgo(1),
+    currentAtStart: OLD,
+  });
+
+  const watchers = await reconcileUpdateJobs({
+    root,
+    tickMs: 5,
+    graceMs: 10,
+    launchImpl: (jobId) => {
+      launched.push(jobId);
+      return Promise.resolve({ ok: true, msg: "" });
+    },
+  });
+  await Promise.all(watchers);
+
+  assert.deepEqual(launched, [], "one break, one retry");
+  assert.deepEqual(calls, []);
+  assert.equal(existsSync(path), true);
 });

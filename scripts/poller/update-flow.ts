@@ -311,6 +311,8 @@ type UpdateJob = {
   startedAt?: string;
   /** The version that ran when the tap was made; absent on a checkout. */
   currentAtStart?: string;
+  /** This job's update was already restarted once; a second break waits for the TTL. */
+  retried?: boolean;
   outcome?: unknown;
 };
 type FinalVersions = { beforeVersion?: string; afterVersion: string };
@@ -318,6 +320,8 @@ type ReconcileOptions = {
   root?: string;
   tickMs?: number;
   graceMs?: number;
+  /** How the retry of an interrupted update is started; the real one by default. */
+  launchImpl?: (jobId: string) => Promise<LaunchResult>;
 };
 type VersionStore = ReturnType<typeof createVersionStore>;
 
@@ -533,7 +537,11 @@ async function concludeUpdateJob(
 async function watchUpdateJob(
   path: string,
   snapshot: UpdateJob,
-  { root, tickMs, graceMs }: Required<ReconcileOptions>,
+  {
+    root,
+    tickMs,
+    graceMs,
+  }: Required<Pick<ReconcileOptions, "root" | "tickMs" | "graceMs">>,
 ): Promise<void> {
   const store = createVersionStore(classifyRoot(root).home);
   const deadline = Date.now() + UPDATE_JOB_TTL_MS;
@@ -572,6 +580,42 @@ async function watchUpdateJob(
 }
 
 /**
+ * An update that was interrupted before it wrote anything down - the box lost power,
+ * the process was killed - is started again, once. `runVersionUpdate` finishes whatever
+ * the dead run left half-done, so the retry is the whole repair; the mark in the job
+ * file is what keeps it from becoming a loop, and a second break is left to the TTL
+ * path below with the message it already has.
+ */
+async function retryInterruptedUpdate(
+  path: string,
+  job: UpdateJob,
+  launch: (jobId: string) => Promise<LaunchResult>,
+): Promise<boolean> {
+  if (job.retried === true) return false;
+  if (updateRunning(DATA_DIR)) return false; // Живой владелец лока: обновление идёт.
+  // Отметка ложится до запуска: обрыв между ними стоит одной незапущенной попытки,
+  // обратный порядок - бесконечного перезапуска обновления на каждом старте моста.
+  await writeFileAtomic(path, JSON.stringify({ ...job, retried: true }), {
+    mode: 0o600,
+  });
+  const launched = await launch(basename(path, ".json"));
+  if (!launched.ok) {
+    log("interrupted update not restarted:", launched.msg || "(no output)");
+    return false;
+  }
+  if (job.chatId !== undefined && job.messageId !== undefined)
+    await edit(
+      job.chatId,
+      Number(job.messageId),
+      tr(
+        "◇ The update was interrupted, retrying",
+        "◇ Обновление прервалось, повторяю",
+      ),
+    );
+  return true;
+}
+
+/**
  * Answer every update the box has not answered yet. Called once at start, after
  * the stale-job sweep and before the first poll: a job with an outcome is a final
  * screen owed right now, and a job without one is watched in the background while
@@ -582,6 +626,7 @@ export async function reconcileUpdateJobs({
   root = ROOT,
   tickMs = WATCH_TICK_MS,
   graceMs = WATCH_GRACE_MS,
+  launchImpl = launchSelfUpdate,
 }: ReconcileOptions = {}): Promise<Promise<void>[]> {
   let names: string[];
   try {
@@ -601,7 +646,14 @@ export async function reconcileUpdateJobs({
       if (!job) continue;
       const outcome = outcomeOf(job);
       if (!outcome) {
-        watchers.push(watchUpdateJob(path, job, { root, tickMs, graceMs }));
+        const retried = await retryInterruptedUpdate(path, job, launchImpl);
+        watchers.push(
+          watchUpdateJob(path, retried ? { ...job, retried: true } : job, {
+            root,
+            tickMs,
+            graceMs,
+          }),
+        );
         continue;
       }
       if (await deliverFinal(job, outcome)) await rm(path, { force: true });
