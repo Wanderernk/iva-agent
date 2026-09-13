@@ -240,6 +240,10 @@ export const SHIM_CLAIM_TTL_MS = 60 * 60 * 1000;
 const SHIM_CLAIM_NAME =
   /^\.iva-shim-refresh-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
+/** Временный файл замены ссылки: тот же pid и uuid, только это файл рядом с шимом. */
+const SHIM_LINK_TEMP_NAME =
+  /^\.iva-shim-link-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
 /** Живой процесс? EPERM тоже значит «жив»: чужой пользователь — не смерть (QA Н3). */
 function processIsAlive(pid: number): boolean {
   try {
@@ -286,6 +290,7 @@ function discardClaim(claim: string, shimPath: string): void {
  */
 function sweepStaleShimClaims(directory: string, shimPath: string): void {
   const prefix = ".iva-shim-refresh-";
+  const linkPrefix = `${basename(shimPath)}.iva-shim-link-`;
   let names: string[];
   try {
     names = readdirSync(directory);
@@ -294,7 +299,10 @@ function sweepStaleShimClaims(directory: string, shimPath: string): void {
   }
   const now = Date.now();
   for (const name of names) {
-    if (!name.startsWith(prefix)) continue;
+    // Временный файл замены ссылки (replaceLinkedShim): обрыв между созданием и
+    // rename оставлял бы его в ~/.local/bin навсегда. Те же правила по pid и возрасту.
+    const linkTemp = name.startsWith(linkPrefix);
+    if (!name.startsWith(prefix) && !linkTemp) continue;
     const claim = join(directory, name);
     let age: number;
     try {
@@ -302,7 +310,9 @@ function sweepStaleShimClaims(directory: string, shimPath: string): void {
     } catch {
       continue;
     }
-    const parsed = SHIM_CLAIM_NAME.exec(name);
+    const parsed = linkTemp
+      ? SHIM_LINK_TEMP_NAME.exec(name.slice(basename(shimPath).length))
+      : SHIM_CLAIM_NAME.exec(name);
     let remove = false;
     if (parsed) {
       const owner = Number(parsed[1]);
@@ -314,7 +324,9 @@ function sweepStaleShimClaims(directory: string, shimPath: string): void {
     } else if (age >= SHIM_CLAIM_TTL_MS) {
       remove = true; // Старый формат: pid в имени нет, решает только возраст.
     }
-    if (remove) discardClaim(claim, shimPath);
+    if (!remove) continue;
+    if (linkTemp) rmSync(claim, { force: true });
+    else discardClaim(claim, shimPath);
   }
 }
 
@@ -465,8 +477,14 @@ function shimLinksIntoInstall(shimPath: string, home: string): boolean {
   } catch {
     return false;
   }
-  const root = real(home);
-  return target === root || target.startsWith(`${root}${sep}`);
+  // Цель могла уже уйти (перевод чекаута), и тогда realpath оставляет её как написано;
+  // поэтому сравниваем и как написано, и канонически - с обеими формами корня.
+  const written = resolve(dirname(shimPath), readlinkSync(shimPath));
+  const inside = (path: string, root: string): boolean =>
+    path === root || path.startsWith(`${root}${sep}`);
+  return [written, target].some((path) =>
+    [home, real(home)].some((root) => inside(path, root)),
+  );
 }
 
 /**

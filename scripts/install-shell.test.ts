@@ -1791,6 +1791,24 @@ void test("a re-run over a checkout puts it back on the release and hands the up
   assert.doesNotMatch(calls, /^npm ci$/mu);
 });
 
+void test("a second installer over the same checkout is refused by name before the hand-over", (t) => {
+  const world = createWorld(t);
+  const lock = join(world.install, "data/install.lock");
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(join(lock, "pid"), `${process.pid}\n`);
+  const head = world.git("rev-parse", "HEAD");
+
+  const refused = world.run({
+    script: world.piped,
+    env: { REPO_URL: "https://github.com/smixs/iva-agent.git" },
+  });
+  assert.notEqual(refused.status, 0, refused.stdout + refused.stderr);
+  assert.match(refused.stderr, new RegExp(`pid ${process.pid}`, "u"));
+  // Дерево не двигалось и обновлятор не вызывался.
+  assert.equal(world.git("rev-parse", "HEAD"), head);
+  assert.doesNotMatch(world.calls(), /iva update/u);
+});
+
 void test("a re-run over a development checkout is refused and changes nothing", (t) => {
   const world = createWorld(t);
   writeFileSync(join(world.install, ".iva-dev"), "");

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -164,6 +165,41 @@ test("after the conversion a shim that was a symlink into the installation runs 
     execFileSync(shim, { encoding: "utf8" }).trim(),
     "0.3.14-aaaaaaaaaaaa",
   );
+});
+
+test("a dangling symlink into an installation reached through a symlinked path is still ours", (t) => {
+  const home = installation(t);
+  const data = join(home, "data");
+  // Путь установки, как его написал человек: через симлинк, не канонический.
+  const alias = join(dirname(home), `${basename(home)}-alias`);
+  symlinkSync(home, alias);
+  const shim = join(home, ".local/bin/iva");
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  // Цель уже снесена переводом чекаута: realpath не отвечает.
+  symlinkSync(join(alias, "bin/iva.mjs"), shim);
+
+  assert.equal(refreshOwnedShim(shim, alias, process.execPath, data), true);
+  assert.equal(lstatSync(shim).isSymbolicLink(), false);
+});
+
+test("a temporary file left by an interrupted link replacement is swept", (t) => {
+  const home = installation(t);
+  const data = join(home, "data");
+  const shim = join(home, ".local/bin/iva");
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  const dead = execFileSync(process.execPath, ["-p", "process.pid"], {
+    encoding: "utf8",
+  }).trim();
+  const orphan = `${shim}.iva-shim-link-${dead}-12345678-1234-1234-1234-123456789abc`;
+  writeFileSync(orphan, "half a shim\n");
+  // Своя свежая заявка живого процесса не трогается: чужой мёртвый pid - убирается.
+  const mine = `${shim}.iva-shim-link-${process.pid}-12345678-1234-1234-1234-123456789abc`;
+  writeFileSync(mine, "in flight\n");
+
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), true);
+  assert.equal(existsSync(orphan), false);
+  assert.equal(existsSync(mine), true);
+  rmSync(mine, { force: true });
 });
 
 test("an owned shim refreshes its data snapshot without replacing a foreign command", (t) => {

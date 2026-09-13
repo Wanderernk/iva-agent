@@ -871,6 +871,10 @@ elif [ -d "$INSTALL_DIR/.git" ] || [ -d "$INSTALL_DIR/versions" ]; then
   # отказ, версионная раскладка - её собственный обновлятор, чекаут - назад на релиз и
   # потом обновление. Своей копии этого решения у установщика нет.
   CURRENT_STEP="$(t "handing the installation to the updater" "передача установки обновлятору")"
+  # Чекаут ниже двигает git: второй установщик над тем же деревом получал бы сырой
+  # «index.lock: File exists» вместо отказа по имени. Версионную раскладку сторожит замок
+  # самого обновлятора.
+  if [ -d "$INSTALL_DIR/.git" ]; then PROJECT_DIR="$INSTALL_DIR"; acquire_install_lock; fi
   hand_installation_to_repair
 else
   run_stage "$(t "Cloning Iva" "Клонирую Iva")" "$(t "Iva downloaded" "Iva загружена")" \
