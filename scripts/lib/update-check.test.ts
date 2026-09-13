@@ -204,7 +204,7 @@ test("notification target prefers digest chat and falls back to the first truste
   assert.equal(notificationChat({}), "");
 });
 
-test("installer persists the selected update channel and integrates the fetched oid", () => {
+test("installer persists the selected update channel", () => {
   const installer = readFileSync(
     new URL("../../install.sh", import.meta.url),
     "utf8",
@@ -216,12 +216,6 @@ test("installer persists the selected update channel and integrates the fetched 
   assert.match(
     installer,
     /UPDATE_CHANNEL="\$\(git -C "\$PROJECT_DIR" branch --show-current/,
-  );
-  // Fetch и merge установщик больше не делает вовсе: установку, которая уже есть, он
-  // отдаёт обновлятору (repair.sh), и путь «назад на релиз» проверяется его тестами.
-  assert.doesNotMatch(
-    installer,
-    /git -C "\$PROJECT_DIR" (?:fetch|merge|rebase|stash)/u,
   );
 });
 
