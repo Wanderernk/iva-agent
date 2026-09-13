@@ -17,7 +17,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
 import { MODEL_PROVIDER_NAMES } from "#lib/model-provider.ts";
-import { shimScript } from "../lib/version-layout.ts";
 import { createCliRuntime } from "./runtime.ts";
 import { createVersionUpdateCommand } from "./version-update-command.ts";
 
@@ -74,7 +73,6 @@ type World = {
   readonly log: string;
   readonly jobPath: string;
   /** The command on PATH that makes this checkout an installation. */
-  readonly shim: string;
   readonly calls: Call[];
   /** Run `iva update --telegram-job job-1`, with the job file already in place. */
   run(env?: Record<string, string>): Promise<void>;
@@ -130,11 +128,6 @@ function world(
     { mode: 0o600 },
   );
 
-  // install.sh leaves exactly this behind, and it alone says the tree is an
-  // installation: without it the updater refuses to touch a checkout.
-  const shim = join(dir, "iva-shim");
-  writeFileSync(shim, shimScript(home, process.execPath, dataDir));
-
   const calls: Call[] = [];
   const previousFetch = mutableGlobal.fetch;
   const previousExitCode = process.exitCode;
@@ -177,7 +170,6 @@ function world(
     home,
     log,
     jobPath,
-    shim,
     calls,
     run: async (extra = {}) => {
       const command = createVersionUpdateCommand(
@@ -190,7 +182,6 @@ function world(
           },
         },
         { restartServices: () => {} },
-        shim,
       );
       await command.run(["--telegram-job", "job-1"]);
     },
@@ -240,29 +231,6 @@ test("a successful update leaves the final word to the bridge", async (t) => {
   assert.equal(typeof outcome?.finishedAt, "string");
   // The job keeps the chat it has to answer.
   assert.equal((stored as { chatId?: unknown }).chatId, 1);
-});
-
-// Обновление запускают мост, iva-update-check.service и repair.sh - своим node, не тем,
-// что записан в шиме. Сравни апдейтер node, и первый же переезд node (nvm, apt) делал бы
-// из установки «чекаут разработчика» навсегда, без шанса на самопочинку.
-test("a shim of ours written for another node still names an installation", async (t) => {
-  const iva = world(t);
-  writeFileSync(
-    iva.shim,
-    shimScript(iva.home, "/usr/bin/node", join(iva.home, "data")),
-  );
-
-  await iva.run();
-
-  assert.equal(
-    iva.lines().some((line) => line.startsWith("handoff ")),
-    true,
-    iva.lines().join("\n"),
-  );
-  assert.deepEqual(
-    iva.finals().filter((text) => /development checkout/u.test(text)),
-    [],
-  );
 });
 
 test("an update whose job file is gone reports the result itself", async (t) => {
@@ -330,8 +298,8 @@ test("an update that finds one already running answers and drops its job", async
   process.exitCode = 0;
 });
 
-// Боевой путь апдейта — этот: install.sh ставит шим, и pipeline по isManagedInstall
-// признаёт такой чекаут установкой. Префлайт, живущий только
+// Боевой путь апдейта — этот: чекаут без метки `.iva-dev` pipeline признаёт установкой.
+// Префлайт, живущий только
 // в legacy-обновлении, боевую установку не защищал: опечатка в MODEL_PROVIDER прогоняла
 // fetch → build → restart, упиралась в health-check и возвращала «Couldn't build Iva»
 // без единого слова о причине.

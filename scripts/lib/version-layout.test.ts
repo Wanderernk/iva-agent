@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import fc from "fast-check";
 import {
   classifyRoot,
+  DEV_MARKER,
   isManagedInstall,
   refreshOwnedShim,
   shimScript,
@@ -138,7 +139,6 @@ test("an owned shim refreshes its data snapshot without replacing a foreign comm
     refreshOwnedShim(shim, home, process.execPath, firstData),
     false,
   );
-  assert.equal(isManagedInstall(classifyRoot(home), shim), false);
   assert.equal(readFileSync(victim, "utf8"), previousDirect);
   rmSync(shim);
 
@@ -147,7 +147,6 @@ test("an owned shim refreshes its data snapshot without replacing a foreign comm
     refreshOwnedShim(shim, home, process.execPath, firstData),
     false,
   );
-  assert.equal(isManagedInstall(classifyRoot(home), shim), false);
   assert.equal(readFileSync(victim, "utf8"), previousDirect);
   rmSync(shim);
 
@@ -310,7 +309,7 @@ console.log(JSON.stringify({error,result,complete:fs.readFileSync(shim,"utf8")==
   });
 });
 
-test("the shim alone tells an installation: branches and commits of one's own do not", (t) => {
+test("a checkout is an installation until `.iva-dev` says it is a working tree", (t) => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "iva-managed-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (cwd: string, ...args: string[]): string =>
@@ -325,71 +324,48 @@ test("the shim alone tells an installation: branches and commits of one's own do
         GIT_COMMITTER_EMAIL: "iva@example.com",
       },
     }).trim();
-  const upstream = join(dir, "upstream.git");
-  const source = join(dir, "source");
   const home = join(dir, "iva");
-  git(dir, "init", "--bare", "--initial-branch=main", upstream);
-  mkdirSync(source, { recursive: true });
-  writeFileSync(join(source, "package.json"), "{}\n");
-  git(source, "init", "--initial-branch=main");
-  git(source, "add", "-A");
-  git(source, "commit", "-m", "initial");
-  git(source, "push", "-q", upstream, "main");
-  git(dir, "clone", "-q", upstream, home);
-
-  // Exactly what install.sh leaves behind: one branch, nothing of the user's own
-  // on top of it, and a shim on PATH that runs it.
-  const shim = join(dir, "iva-shim");
-  writeFileSync(shim, shimScript(home, process.execPath, join(home, "data")));
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "package.json"), "{}\n");
+  git(home, "init", "--initial-branch=main");
+  git(home, "add", "-A");
+  git(home, "commit", "-m", "release");
   const managed = (root = home): boolean =>
-    isManagedInstall(classifyRoot(root), shim);
-  assert.equal(managed(), true);
+    isManagedInstall(classifyRoot(root));
 
-  const alias = join(dir, "iva-alias");
-  symlinkSync(home, alias);
-  const previousDirect = `#!/usr/bin/env bash\nexec "${process.execPath}" "${alias}/bin/iva.mjs" "$@"\n`;
-  writeFileSync(shim, previousDirect);
-  assert.equal(managed(alias), true);
-  writeFileSync(
-    shim,
-    `#!/usr/bin/env bash\nexec "/bin/echo" "${alias}/bin/iva.mjs" "$@"\n`,
-  );
-  assert.equal(managed(alias), false);
-  // Наш шим, написанный под другой node: обновление всё равно идёт. Мост,
-  // iva-update-check.service и repair.sh стартуют его своим node, и сравнение
-  // выключало бы самообновление навсегда после переезда node.
-  writeFileSync(shim, shimScript(alias, "/usr/bin/node", join(alias, "data")));
-  assert.equal(managed(alias), true);
-  writeFileSync(shim, shimScript(alias, process.execPath, join(alias, "data")));
-  assert.equal(managed(alias), true);
-
-  const foreignWrapper = `#!/bin/sh\n: "${alias}/reports"\nexec "${process.execPath}" "${alias}/bin/iva.mjs" "$@"\n`;
-  writeFileSync(shim, foreignWrapper);
-  assert.equal(managed(alias), false);
-  writeFileSync(shim, shimScript(home, process.execPath, join(home, "data")));
+  // Exactly what install.sh leaves behind, and a shim nowhere near it: the route
+  // never asks what is on PATH.
   assert.equal(managed(), true);
 
   // An installation is free to have edits, branches and commits of its own: a
   // rollback through `release/<v>` leaves a second branch behind, and none of it
-  // makes the tree a working tree. Only the shim decides.
+  // makes the tree a working tree.
   writeFileSync(join(home, "package.json"), '{ "edited": true }\n');
-  assert.equal(managed(), true);
   git(home, "checkout", "-q", "-b", "release/0.4.0");
   git(home, "commit", "-q", "--allow-empty", "-m", "mine");
   assert.equal(managed(), true);
-  rmSync(shim);
+
+  // The one thing that does: the file its owner writes.
+  writeFileSync(join(home, DEV_MARKER), "");
   assert.equal(managed(), false);
+  // A version under a marked home is still a version: the marker is about the checkout.
+  const version = join(home, "versions", "0.4.2-abcdefabcdef");
+  mkdirSync(version, { recursive: true });
+  assert.equal(managed(version), true);
+  rmSync(join(home, DEV_MARKER));
+  assert.equal(managed(), true);
 });
 
 const ROUTE_SEED = 43_017;
 
 /**
- * The invariant this route stands on: the answer is a function of the layout and the
- * shim's bytes, and of nothing else. The predicate it replaced read git - a branch of
- * one's own, a commit ahead - and every user who had rolled back through `release/<v>`
- * was declared a developer's checkout and never updated again.
+ * The invariant this route stands on: the answer is a function of the layout and one
+ * marker file, and of nothing else. The predicates it replaced read git and the shim on
+ * PATH - a branch of one's own, a commit ahead, which node the shim names - and every
+ * user who had rolled back through `release/<v>` or moved node was declared a
+ * developer's checkout and never updated again.
  */
-test("property: the layout and the shim decide the route, git and dirt never do", (t) => {
+test("property: the layout and `.iva-dev` decide the route, git and the shim never do", (t) => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "iva-route-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (cwd: string, ...args: string[]): string =>
@@ -413,21 +389,23 @@ test("property: the layout and the shim decide the route, git and dirt never do"
   const version = join(home, "versions", "0.4.2-abcdefabcdef");
   mkdirSync(version, { recursive: true });
   const ours = shimScript(home, process.execPath, join(home, "data"));
-  // The same script install.sh wrote, for a node that has since moved: still ours.
-  const oursMovedNode = shimScript(home, "/usr/bin/node", join(home, "data"));
   const shim = join(dir, "iva-shim");
-  const elsewhere = join(dir, "iva-elsewhere");
+  const marker = join(home, DEV_MARKER);
 
   fc.assert(
     fc.property(
       fc.record({
         shim: fc.constantFrom(
           "ours" as const,
-          "ours-moved-node" as const,
           "missing" as const,
           "foreign" as const,
-          "symlink" as const,
           "junk" as const,
+        ),
+        marker: fc.constantFrom(
+          "none" as const,
+          "empty" as const,
+          "junk" as const,
+          "directory" as const,
         ),
         junk: fc.string(),
         branches: fc.integer({ min: 1, max: 3 }),
@@ -445,29 +423,21 @@ test("property: the layout and the shim decide the route, git and dirt never do"
         );
         rmSync(shim, { force: true });
         if (world.shim === "ours") writeFileSync(shim, ours);
-        else if (world.shim === "ours-moved-node")
-          writeFileSync(shim, oursMovedNode);
         else if (world.shim === "junk") writeFileSync(shim, world.junk);
         else if (world.shim === "foreign")
           writeFileSync(shim, `#!/bin/sh\nexec /bin/echo "$@"\n`);
-        else if (world.shim === "symlink") {
-          writeFileSync(elsewhere, ours);
-          symlinkSync(elsewhere, shim);
-        }
+        rmSync(marker, { recursive: true, force: true });
+        if (world.marker === "empty") writeFileSync(marker, "");
+        else if (world.marker === "junk") writeFileSync(marker, world.junk);
+        else if (world.marker === "directory") mkdirSync(marker);
 
-        const decision = isManagedInstall(classifyRoot(home), shim);
+        const decision = isManagedInstall(classifyRoot(home));
         // Одно решение, и то же самое при повторе: маршрут читают и апдейтер, и мост.
-        assert.equal(isManagedInstall(classifyRoot(home), shim), decision);
-        // Мусор в шиме — не исключение и не «может быть»: он просто не наш.
-        assert.equal(
-          decision,
-          world.shim === "ours" ||
-            world.shim === "ours-moved-node" ||
-            (world.shim === "junk" &&
-              (world.junk === ours || world.junk === oursMovedNode)),
-        );
-        // A version is an installation whatever sits on PATH: nothing else is there.
-        assert.equal(isManagedInstall(classifyRoot(version), shim), true);
+        assert.equal(isManagedInstall(classifyRoot(home)), decision);
+        // Метка есть - чекаут разработчика; чем бы она ни была заполнена.
+        assert.equal(decision, world.marker === "none");
+        // A version is an installation whatever the checkout above it is marked with.
+        assert.equal(isManagedInstall(classifyRoot(version)), true);
       },
     ),
     { seed: ROUTE_SEED, numRuns: 40 },

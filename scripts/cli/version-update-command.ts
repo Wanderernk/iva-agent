@@ -23,11 +23,7 @@ import {
   updaterTooOldMessage,
 } from "../lib/update-check.ts";
 import { CATALOG, catalogProvider } from "../lib/model-catalog.ts";
-import {
-  classifyRoot,
-  isManagedInstall,
-  SHIM_PATH,
-} from "../lib/version-layout.ts";
+import { classifyRoot, isManagedInstall } from "../lib/version-layout.ts";
 import {
   acquireUpdateLock,
   createVersionStore,
@@ -64,7 +60,7 @@ const COPY: Record<"en" | "ru", UpdateCopy> = {
     badProvider:
       "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
     devCheckout:
-      "это чекаут разработчика, а не установка: git pull && npm run build",
+      "это чекаут разработчика (.iva-dev): обновляйся через git, собирай `npm run build`",
     failed: "Не удалось завершить обновление",
     stock: "ваша доработка в data/custom не входит в эту версию",
   },
@@ -76,7 +72,7 @@ const COPY: Record<"en" | "ru", UpdateCopy> = {
     badProvider:
       "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
     devCheckout:
-      "this is a development checkout, not an installation: git pull && npm run build",
+      "this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
     failed: "Couldn't complete the update",
     stock: "your customization in data/custom is not in this version",
   },
@@ -197,8 +193,6 @@ export async function resolveTarget(
 export function createVersionUpdateCommand(
   runtime: CliRuntime,
   systemdLifecycle: { restartServices: () => void },
-  /** The command on PATH that decides whether this tree is an installation. */
-  shimPath: string = SHIM_PATH,
 ) {
   const install = classifyRoot(runtime.ROOT);
 
@@ -248,9 +242,9 @@ export function createVersionUpdateCommand(
       return null;
     };
 
-    // Обновляется только установка: версия или чекаут, который запускает наш шим.
-    // Любой другой чекаут — чужое рабочее дерево, и его оставляют как есть.
-    if (!isManagedInstall(install, shimPath))
+    // Обновляется всё, кроме дерева, которое владелец сам помеченным `.iva-dev`
+    // объявил своим рабочим: его оставляют как есть.
+    if (!isManagedInstall(install))
       return refuse(text.devCheckout, reporter?.devCheckout());
 
     // Без этого префлайта опечатка в MODEL_PROVIDER прогоняла fetch → build → restart →
@@ -415,11 +409,11 @@ export function createVersionUpdateCommand(
     /** Whether a plugin that will not build fails the build or is switched off. */
     readonly requirePlugins: boolean;
   }): Promise<PluginVersionBuild> {
-    if (!isManagedInstall(install, shimPath))
+    if (!isManagedInstall(install))
       return {
         status: "skipped",
         reason:
-          "plugin code is built into a version, and this tree is a development checkout - build it yourself: npm run build",
+          "plugin code is built into a version, and this tree is a development checkout (.iva-dev) - build it yourself: npm run build",
       };
     const outcome = await pipeline([], currentTarget, { requirePlugins });
     if (!outcome)

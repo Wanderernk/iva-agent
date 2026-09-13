@@ -61,50 +61,36 @@ export function classifyRoot(root: string): Install {
   return { kind: "checkout", home: dir, root: dir };
 }
 
+/** A checkout its owner marked as a working tree of their own, beside `package.json`. */
+export const DEV_MARKER = ".iva-dev";
+
 /**
- * An installation is a version, or the checkout our own shim runs: install.sh
- * writes that shim and nothing else does. Every other checkout is somebody's
- * working tree, and the updater leaves it alone.
+ * Every version and every checkout is an installation the updater updates. One file
+ * says otherwise: `.iva-dev` in the root of a checkout, which its owner writes to keep
+ * `iva update` out of a tree they build themselves.
  *
- * Which node the shim names is not part of the answer: the bridge,
- * `iva-update-check.service` and `repair.sh` all start the update with a node of
- * their own, and a comparison would call an installation a developer's checkout
- * for good the first time node moved - the one state the updater exists to repair.
+ * Nothing else is read - not which shim sits on PATH, not which node it names, not how
+ * many branches the tree has. Every one of those called an installation a developer's
+ * checkout the first time node moved or a rollback left a `release/<v>` branch behind,
+ * and that is the one state the updater exists to repair.
  */
-export function isManagedInstall(
-  install: Install,
-  shimPath: string = SHIM_PATH,
-): boolean {
-  if (install.kind === "version") return true;
-  const opened = openShim(shimPath);
-  if (opened.kind !== "file") return false;
-  try {
-    return isOwnedShim(opened.text, install.home, null);
-  } finally {
-    closeShim(opened.fd);
-  }
-}
-
-/** Whether a shim script runs this installation, comparing paths resolved. */
-export function shimPointsAt(shim: string, home: string): boolean {
-  return [...shim.matchAll(/"([^"]+)"/gu)]
-    .map((match) => real(match[1]))
-    .some((path) => path === home || path.startsWith(`${home}/`));
+export function isManagedInstall(install: Install): boolean {
+  return (
+    install.kind === "version" || !existsSync(join(install.home, DEV_MARKER))
+  );
 }
 
 /**
- * Exact generated-shim grammar. `expectedNode` null accepts whichever node the shim
- * was written for - what the route asks; the refresh names one, because it replaces
- * an existing command only when it is byte-for-byte the script it would write.
+ * Exact generated-shim grammar: the refresh replaces an existing command only when it
+ * is byte-for-byte the script it would write, for the node it would write it for.
  */
 function isOwnedShim(
   shim: string,
   home: string,
-  expectedNode: string | null,
+  expectedNode: string,
 ): boolean {
   const lines = shim.split("\n");
-  const sameNode = (node: string): boolean =>
-    expectedNode === null || real(node) === real(expectedNode);
+  const sameNode = (node: string): boolean => real(node) === real(expectedNode);
   const exec = (line: string | undefined): string | null =>
     /^exec "([^"\\$`\r\n]+)" "\$IVA_ROOT\/bin\/iva\.mjs" "\$@"$/u.exec(
       line ?? "",

@@ -9,8 +9,10 @@ the custom layer automatically on the first update - a `data/custom/agent/instru
 that arrived that way is the deprecated replacement persona: `iva doctor` names it, and
 "Your rules" below shows the way off it. Skills and the markdown owner rules are the exception:
 they are read straight off disk at run time and never go through a build (see below). Edits anywhere else in
-the tree stay a plain local patch: the updater stashes them and replays them onto the new revision, and
-archives them under `data/update-conflicts/` when they no longer apply.
+the tree are not carried over: an update installs the release as it is, so keep what is yours in
+`data/custom/` - skills, tools, plugins - where a release never touches it. Working on Iva's own code
+instead? Put an empty `.iva-dev` file in the root of the checkout: `iva update` then refuses it and the
+tree is yours to `git pull` and `npm run build` by hand.
 
 A capability can also arrive packaged: a plugin is a folder with skills, code and MCP servers
 that installs with one command and leaves with another, into the same custom layer. This page is

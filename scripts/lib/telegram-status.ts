@@ -79,11 +79,11 @@ const COPY = {
     badProvider:
       "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
     devCheckout:
-      "this is a development checkout, not an installation: git pull && npm run build",
+      "this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
     final: "✅ Iva updated",
     preserved: "Local changes: preserved",
     failure: (version: string) =>
-      `Iva is still running ${version}.\nYour settings and changes are preserved.\nRetry: /update`,
+      `Iva is still running ${version}.\nYour settings, memory and skills are where they were.\nRetry: /update`,
   },
   ru: {
     protect: [
@@ -103,11 +103,11 @@ const COPY = {
     badProvider:
       "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
     devCheckout:
-      "это чекаут разработчика, а не установка: git pull && npm run build",
+      "это чекаут разработчика (.iva-dev): обновляйся через git, собирай `npm run build`",
     final: "✅ Iva обновлена",
     preserved: "Локальные изменения: сохранены",
     failure: (version: string) =>
-      `Iva продолжает работать на ${version}.\nВаши настройки и изменения сохранены.\nПовторить: /update`,
+      `Iva продолжает работать на ${version}.\nНастройки, память и ваши скиллы на месте.\nПовторить: /update`,
   },
 };
 

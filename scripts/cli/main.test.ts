@@ -231,7 +231,7 @@ function chat(t: TestContext): string[] {
   return sent;
 }
 
-void test("a checkout no shim of ours runs is refused and left exactly as it was", async (t) => {
+void test("a checkout marked `.iva-dev` is refused and left exactly as it was", async (t) => {
   const home = join(scratch(t), "iva");
   mkdirSync(home);
   const git = (...args: string[]): string =>
@@ -252,6 +252,8 @@ void test("a checkout no shim of ours runs is refused and left exactly as it was
   git("commit", "-q", "-m", "release");
   writeFileSync(join(home, "package.json"), '{ "version": "mine" }\n');
   writeFileSync(join(home, "notes.txt"), "untracked\n");
+  // The one thing that keeps the updater out of a tree: the file its owner wrote.
+  writeFileSync(join(home, ".iva-dev"), "");
   // The tap came from the chat, so the refusal is owed to the chat: the terminal of
   // a self-update belongs to systemd-run and nobody reads it.
   writeFileSync(join(home, ".env"), "TELEGRAM_BOT_TOKEN=1:token\n");
@@ -275,10 +277,10 @@ void test("a checkout no shim of ours runs is refused and left exactly as it was
   assert.equal(process.exitCode, 1);
   assert.match(
     out(),
-    /development checkout, not an installation: git pull && npm run build/u,
+    /development checkout \(\.iva-dev\): update it with git, build it with `npm run build`/u,
   );
   assert.deepEqual(sent, [
-    "⚠️ this is a development checkout, not an installation: git pull && npm run build",
+    "⚠️ this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
   ]);
   // Left behind, the job keeps the bridge waiting on an update that will never run,
   // and the chat stays on "Saving your changes" until the six-hour TTL.
