@@ -28,6 +28,8 @@ import {
   readActiveState,
   releaseOf,
   retainedVersions,
+  acquireUpdateLock,
+  updateRunning,
   versionName,
 } from "./version-store.ts";
 import { ATOMIC_WRITE_DURABILITY } from "../../agent/lib/fs-atomic.ts";
@@ -1241,4 +1243,40 @@ test("a version the service died on is remembered by what it was built from", (t
   assert.equal(store.liveFailed("0.3.17-dddddddddddd+00000019"), false);
   store.recordLive("0.3.17-dddddddddddd+00000019", false);
   assert.equal(store.liveFailed("0.3.17-dddddddddddd+00000019"), true);
+});
+
+/**
+ * Замок обновления после перезагрузки: pid владельца снова занят, но уже чужим
+ * процессом. Живость по одному `kill(pid, 0)` держала бы установку вечно - лечилось
+ * бы только удалением `data/update.lock` руками.
+ */
+test("an update lock whose pid now runs somebody else is taken over", (t) => {
+  const data = home(t);
+  const lock = join(data, "update.lock");
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(
+    join(lock, "owner.json"),
+    `${JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date(Date.now() - 60_000).toISOString(),
+      command: "/usr/sbin/cron -f",
+    })}\n`,
+  );
+
+  assert.equal(updateRunning(data), false);
+  const taken = acquireUpdateLock(data);
+  assert.ok(taken, "the lock of a reused pid must be free to take");
+  taken?.release();
+});
+
+/** Обратная сторона: владелец жив и это он - замок чужой, его не забирают. */
+test("an update lock held by a live owner is not taken over", (t) => {
+  const data = home(t);
+  const mine = acquireUpdateLock(data);
+  assert.ok(mine);
+
+  assert.equal(updateRunning(data), true);
+  assert.equal(acquireUpdateLock(data), null);
+  mine?.release();
+  assert.equal(updateRunning(data), false);
 });

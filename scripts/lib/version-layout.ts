@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -24,6 +23,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isIvaProcess, processCommand } from "./process-command.ts";
 import { createVersionStore, parseVersionName } from "./version-store.ts";
 
 /** The one command users have on their PATH; rewritten at most once, by the bridge. */
@@ -247,27 +247,6 @@ function processIsAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
-}
-
-/** Команда процесса для проверки, что pid не переиспользован чужим. */
-function processCommand(pid: number): string {
-  try {
-    return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
-  } catch {
-    // Не Linux или /proc закрыт — спросим ps.
-  }
-  try {
-    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
-      encoding: "utf8",
-    });
-  } catch {
-    return "";
-  }
-}
-
-/** Наш ли это процесс: шим, CLI установки или вторая половина обновления. */
-function isIvaProcess(command: string): boolean {
-  return /iva/iu.test(command) || /update-finish/u.test(command);
 }
 
 /**
