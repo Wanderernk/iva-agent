@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
-  existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -182,24 +181,24 @@ test("a dangling symlink into an installation reached through a symlinked path i
   assert.equal(lstatSync(shim).isSymbolicLink(), false);
 });
 
-test("a temporary file left by an interrupted link replacement is swept", (t) => {
+test("a symlink that only looks inside the installation but leads out is not ours", (t) => {
   const home = installation(t);
   const data = join(home, "data");
+  const outside = join(dirname(home), `${basename(home)}-outside`);
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, "foreign-command"), "#!/bin/sh\necho foreign\n");
+  // Каталог внутри установки, который на деле ведёт наружу.
+  symlinkSync(outside, join(home, "looks-inside"));
   const shim = join(home, ".local/bin/iva");
   mkdirSync(join(home, ".local/bin"), { recursive: true });
-  const dead = execFileSync(process.execPath, ["-p", "process.pid"], {
-    encoding: "utf8",
-  }).trim();
-  const orphan = `${shim}.iva-shim-link-${dead}-12345678-1234-1234-1234-123456789abc`;
-  writeFileSync(orphan, "half a shim\n");
-  // Своя свежая заявка живого процесса не трогается: чужой мёртвый pid - убирается.
-  const mine = `${shim}.iva-shim-link-${process.pid}-12345678-1234-1234-1234-123456789abc`;
-  writeFileSync(mine, "in flight\n");
+  symlinkSync(join(home, "looks-inside/foreign-command"), shim);
 
-  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), true);
-  assert.equal(existsSync(orphan), false);
-  assert.equal(existsSync(mine), true);
-  rmSync(mine, { force: true });
+  assert.equal(refreshOwnedShim(shim, home, process.execPath, data), false);
+  assert.equal(lstatSync(shim).isSymbolicLink(), true);
+  assert.equal(
+    readFileSync(join(outside, "foreign-command"), "utf8"),
+    "#!/bin/sh\necho foreign\n",
+  );
 });
 
 test("an owned shim refreshes its data snapshot without replacing a foreign command", (t) => {

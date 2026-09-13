@@ -256,8 +256,11 @@ delete process.env.ASSISTANT_DATA_DIR;
 try { loadEnvFile(join(root, ".env")); }
 catch (cause) { if (cause?.code !== "ENOENT") throw cause; }
 process.stdout.write(resolveDataDir(root, process.env.ASSISTANT_DATA_DIR));
-' "$PROJECT_DIR"
-  )"
+' "$PROJECT_DIR" 2>/dev/null
+  )" || INSTALL_DATA=""
+  # Старый или оборванный чекаут может не иметь этого модуля - именно его сюда и
+  # привели чинить. Замок тогда стоит на каталоге по умолчанию, а не валит ремонт.
+  [ -n "$INSTALL_DATA" ] || INSTALL_DATA="$PROJECT_DIR/data"
   lock="$INSTALL_DATA/install.lock"
   mkdir -p "$INSTALL_DATA" 2>/dev/null || true
   if ! mkdir "$lock" 2>/dev/null; then

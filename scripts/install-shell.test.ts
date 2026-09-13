@@ -1809,6 +1809,20 @@ void test("a second installer over the same checkout is refused by name before t
   assert.doesNotMatch(world.calls(), /iva update/u);
 });
 
+void test("a checkout too old to resolve its data directory is still handed over", (t) => {
+  const world = createWorld(t);
+  rmSync(join(world.install, "packages/data-dir"), {
+    recursive: true,
+    force: true,
+  });
+  const result = world.run({
+    script: world.piped,
+    env: { REPO_URL: "https://github.com/smixs/iva-agent.git" },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(world.calls(), /^iva update$/mu);
+});
+
 void test("a re-run over a development checkout is refused and changes nothing", (t) => {
   const world = createWorld(t);
   writeFileSync(join(world.install, ".iva-dev"), "");

@@ -240,10 +240,6 @@ export const SHIM_CLAIM_TTL_MS = 60 * 60 * 1000;
 const SHIM_CLAIM_NAME =
   /^\.iva-shim-refresh-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
-/** Временный файл замены ссылки: тот же pid и uuid, только это файл рядом с шимом. */
-const SHIM_LINK_TEMP_NAME =
-  /^\.iva-shim-link-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
-
 /** Живой процесс? EPERM тоже значит «жив»: чужой пользователь — не смерть (QA Н3). */
 function processIsAlive(pid: number): boolean {
   try {
@@ -290,7 +286,6 @@ function discardClaim(claim: string, shimPath: string): void {
  */
 function sweepStaleShimClaims(directory: string, shimPath: string): void {
   const prefix = ".iva-shim-refresh-";
-  const linkPrefix = `${basename(shimPath)}.iva-shim-link-`;
   let names: string[];
   try {
     names = readdirSync(directory);
@@ -299,10 +294,7 @@ function sweepStaleShimClaims(directory: string, shimPath: string): void {
   }
   const now = Date.now();
   for (const name of names) {
-    // Временный файл замены ссылки (replaceLinkedShim): обрыв между созданием и
-    // rename оставлял бы его в ~/.local/bin навсегда. Те же правила по pid и возрасту.
-    const linkTemp = name.startsWith(linkPrefix);
-    if (!name.startsWith(prefix) && !linkTemp) continue;
+    if (!name.startsWith(prefix)) continue;
     const claim = join(directory, name);
     let age: number;
     try {
@@ -310,9 +302,7 @@ function sweepStaleShimClaims(directory: string, shimPath: string): void {
     } catch {
       continue;
     }
-    const parsed = linkTemp
-      ? SHIM_LINK_TEMP_NAME.exec(name.slice(basename(shimPath).length))
-      : SHIM_CLAIM_NAME.exec(name);
+    const parsed = SHIM_CLAIM_NAME.exec(name);
     let remove = false;
     if (parsed) {
       const owner = Number(parsed[1]);
@@ -324,9 +314,7 @@ function sweepStaleShimClaims(directory: string, shimPath: string): void {
     } else if (age >= SHIM_CLAIM_TTL_MS) {
       remove = true; // Старый формат: pid в имени нет, решает только возраст.
     }
-    if (!remove) continue;
-    if (linkTemp) rmSync(claim, { force: true });
-    else discardClaim(claim, shimPath);
+    if (remove) discardClaim(claim, shimPath);
   }
 }
 
@@ -464,44 +452,85 @@ export function shimIsForeign(shimPath: string, home: string): boolean {
 }
 
 /**
- * Симлинк на шим-пути - наш, когда он ведёт внутрь установки: его оставил прежний
- * установщик или сам владелец, и после перевода на версии он указывал бы на снесённый
- * `bin/iva.mjs` - команда `iva` умирает. Ссылка наружу - чужая программа, её не трогаем.
- * Судится написанный в ссылке путь: цель могла уже уйти, и тогда realpath не отвечает.
+ * Канонический путь и для цели, которой уже нет: канонизируется самый глубокий
+ * существующий предок, хвост дописывается как написан. Иначе битая ссылка через
+ * симлинк-каталог (`home/looks-inside/x`, где `looks-inside` ведёт наружу) читалась бы
+ * по буквам как «внутри», а после `realpath` живого предка видно, куда она ведёт.
  */
-function shimLinksIntoInstall(shimPath: string, home: string): boolean {
-  let target: string;
-  try {
-    if (!lstatSync(shimPath).isSymbolicLink()) return false;
-    target = real(resolve(dirname(shimPath), readlinkSync(shimPath)));
-  } catch {
-    return false;
+function canonical(path: string): string {
+  let head = path;
+  let tail = "";
+  for (;;) {
+    try {
+      return join(realpathSync(head), tail);
+    } catch {
+      const parent = dirname(head);
+      if (parent === head) return path;
+      tail = join(basename(head), tail);
+      head = parent;
+    }
   }
-  // Цель могла уже уйти (перевод чекаута), и тогда realpath оставляет её как написано;
-  // поэтому сравниваем и как написано, и канонически - с обеими формами корня.
-  const written = resolve(dirname(shimPath), readlinkSync(shimPath));
-  const inside = (path: string, root: string): boolean =>
-    path === root || path.startsWith(`${root}${sep}`);
-  return [written, target].some((path) =>
-    [home, real(home)].some((root) => inside(path, root)),
-  );
 }
 
 /**
- * Заменить такую ссылку сгенерированным шимом: он публикуется рядом целиком и
- * переезжает на место одним `rename` - переименование меняет саму ссылку, а не файл,
- * на который она смотрит, и на шим-пути ни на миг не лежит половина скрипта.
+ * Симлинк на шим-пути - наш, когда он ведёт внутрь установки: его оставил прежний
+ * установщик или сам владелец, и после перевода на версии он указывал бы на снесённый
+ * `bin/iva.mjs` - команда `iva` умирает. Ссылка наружу - чужая программа, её не трогаем.
+ * Возвращает текст ссылки, чтобы замена проверила, что двигает ровно её.
  */
-function replaceLinkedShim(shimPath: string, desired: string): boolean {
-  const temporary = `${shimPath}.iva-shim-link-${process.pid}-${randomUUID()}`;
-  if (!createShimExclusive(temporary, desired)) return false;
+function shimLinksIntoInstall(shimPath: string, home: string): string | null {
+  let link: string;
   try {
-    renameSync(temporary, shimPath);
-    return true;
+    if (!lstatSync(shimPath).isSymbolicLink()) return null;
+    link = readlinkSync(shimPath);
+  } catch {
+    return null;
+  }
+  const target = canonical(resolve(dirname(shimPath), link));
+  const root = real(home);
+  return target === root || target.startsWith(`${root}${sep}`) ? link : null;
+}
+
+/**
+ * Заменить такую ссылку сгенерированным шимом тем же протоколом, что и файл: сначала
+ * ссылка переезжает в каталог-заявку одним `rename`, там сверяется, что это та самая
+ * ссылка (чужой файл, появившийся на пути между проверкой и заменой, уезжает обратно
+ * нетронутым), и только потом шим создаётся на её месте с O_EXCL.
+ */
+function replaceLinkedShim(
+  shimPath: string,
+  link: string,
+  desired: string,
+): boolean {
+  const directory = join(dirname(shimPath), claimDirectoryName());
+  mkdirSync(directory, { mode: 0o700 });
+  const claim = { directory, path: join(directory, "previous") };
+  try {
+    renameSync(shimPath, claim.path);
   } catch (cause) {
-    rmSync(temporary, { force: true });
+    rmdirSync(directory);
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw cause;
   }
+  const moved = (() => {
+    try {
+      return (
+        lstatSync(claim.path).isSymbolicLink() &&
+        readlinkSync(claim.path) === link
+      );
+    } catch {
+      return false;
+    }
+  })();
+  if (moved && createShimExclusive(shimPath, desired)) {
+    removeClaim(claim);
+    return true;
+  }
+  if (!restoreClaim(claim, shimPath))
+    throw new Error(
+      `shim ownership changed; foreign entry kept at ${claim.path}`,
+    );
+  return false;
 }
 
 /** Refresh an Iva-owned shim without replacing another program at the same path. */
@@ -516,11 +545,10 @@ export function refreshOwnedShim(
   // они копятся в ~/.local/bin навсегда.
   sweepStaleShimClaims(dirname(shimPath), shimPath);
   const opened = openShim(shimPath);
-  if (opened.kind === "foreign")
-    return (
-      shimLinksIntoInstall(shimPath, home) &&
-      replaceLinkedShim(shimPath, desired)
-    );
+  if (opened.kind === "foreign") {
+    const link = shimLinksIntoInstall(shimPath, home);
+    return link !== null && replaceLinkedShim(shimPath, link, desired);
+  }
   if (opened.kind === "file") {
     const claim = (() => {
       try {
