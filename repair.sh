@@ -37,14 +37,6 @@ HOME_DIR="$(cd "$HOME" && pwd -P)"
 [ "$INSTALL_DIR" != "/" ] || die "unsafe installation path"
 [ "$INSTALL_DIR" != "$HOME_DIR" ] || die "unsafe installation path"
 
-# Дерево разработчика ремонт не трогает совсем, и раньше всего прочего: `git reset --hard`
-# ниже снёс бы незакоммиченную работу, а обновление такому дереву всё равно отказывает
-# (scripts/cli/version-update-command.ts).
-if [ -f "$INSTALL_DIR/.iva-dev" ]; then
-  fail "this is a development checkout (.iva-dev): update it with git, build it with \`npm run build\`" \
-    "это чекаут разработчика (.iva-dev): обновляйся через git, собирай \`npm run build\`"
-fi
-
 # Самая свежая версия на диске - ею ремонтируется установка, у которой `current` потерян
 # (обрыв на переключении): сам обновлятор переключение и доводит.
 newest_version_entry() {
@@ -71,6 +63,17 @@ if [ -d "$INSTALL_DIR/versions" ] && [ ! -d "$INSTALL_DIR/.git" ]; then
   say "The last update stopped while switching versions; starting the update from the version on disk." \
     "Прошлое обновление оборвалось на переключении версий; запускаю обновление из версии на диске."
   exec node "$entry" update
+fi
+
+# Дерево разработчика ремонт не трогает совсем, и раньше любой работы с git: `git reset
+# --hard` ниже снёс бы незакоммиченную работу, а обновление такому дереву всё равно
+# отказывает (scripts/cli/version-update-command.ts). Судится маркер в любой форме -
+# файл, каталог, ссылка, - тем же `-e`, чем его читает предикат маршрута
+# (`isManagedInstall`), и только у чекаута: версионную раскладку обновляют всегда, что бы
+# ни лежало в её корне.
+if [ -e "$INSTALL_DIR/.iva-dev" ]; then
+  fail "this is a development checkout (.iva-dev): update it with git, build it with \`npm run build\`" \
+    "это чекаут разработчика (.iva-dev): обновляйся через git, собирай \`npm run build\`"
 fi
 
 [ -f "$INSTALL_DIR/package.json" ] || die "package.json is missing"

@@ -187,7 +187,9 @@ test("repair refuses a directory that is not an Iva installation", (t) => {
 test("repair refuses a development checkout and leaves the work on disk", (t) => {
   const { install, handoff, run } = checkout(t);
   writeFileSync(join(install, "bin/iva.mjs"), "// work in progress\n");
-  writeFileSync(join(install, ".iva-dev"), "");
+  // Маркер в любой форме, как его читает предикат маршрута: каталог - тоже маркер, и
+  // раньше `-f` его не видел, а `reset --hard` ниже стирал незакоммиченную работу.
+  mkdirSync(join(install, ".iva-dev"));
   const head = git(install, "rev-parse", "HEAD");
 
   const failure = (() => {
@@ -208,6 +210,26 @@ test("repair refuses a development checkout and leaves the work on disk", (t) =>
   );
   assert.equal(git(install, "rev-parse", "HEAD"), head);
   assert.throws(() => readFileSync(handoff, "utf8"));
+});
+
+/**
+ * Маркер судит только чекаут: версионную раскладку обновляют всегда, как и решает
+ * `isManagedInstall`. Иначе файл, оставшийся в корне установки от чекаутной эпохи,
+ * запирал бы ремонт навсегда.
+ */
+test("repair updates the version layout whatever lies in its root", (t) => {
+  const { install, handoff, run } = checkout(t);
+  rmSync(join(install, ".git"), { recursive: true, force: true });
+  mkdirSync(join(install, "current/bin"), { recursive: true });
+  writeFileSync(join(install, "current/bin/iva.mjs"), "// version entry\n");
+  writeFileSync(join(install, ".iva-dev"), "");
+
+  run();
+
+  assert.equal(
+    readFileSync(handoff, "utf8"),
+    `${join(install, "current/bin/iva.mjs")}\n`,
+  );
 });
 
 /**
