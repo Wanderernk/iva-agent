@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
 import { MODEL_PROVIDER_NAMES } from "#lib/model-provider.ts";
+import { shimScript } from "../lib/version-layout.ts";
 import { createCliRuntime } from "./runtime.ts";
 import { createVersionUpdateCommand } from "./version-update-command.ts";
 
@@ -72,6 +73,8 @@ type World = {
   readonly home: string;
   readonly log: string;
   readonly jobPath: string;
+  /** The command on PATH that makes this checkout an installation. */
+  readonly shim: string;
   readonly calls: Call[];
   /** Run `iva update --telegram-job job-1`, with the job file already in place. */
   run(env?: Record<string, string>): Promise<void>;
@@ -127,6 +130,11 @@ function world(
     { mode: 0o600 },
   );
 
+  // install.sh leaves exactly this behind, and it alone says the tree is an
+  // installation: without it the updater refuses to touch a checkout.
+  const shim = join(dir, "iva-shim");
+  writeFileSync(shim, shimScript(home, process.execPath, dataDir));
+
   const calls: Call[] = [];
   const previousFetch = mutableGlobal.fetch;
   const previousExitCode = process.exitCode;
@@ -169,6 +177,7 @@ function world(
     home,
     log,
     jobPath,
+    shim,
     calls,
     run: async (extra = {}) => {
       const command = createVersionUpdateCommand(
@@ -181,6 +190,7 @@ function world(
           },
         },
         { restartServices: () => {} },
+        shim,
       );
       await command.run(["--telegram-job", "job-1"]);
     },
@@ -297,8 +307,8 @@ test("an update that finds one already running answers and drops its job", async
   process.exitCode = 0;
 });
 
-// Боевой путь апдейта — этот: managed-layout стоит на всём, что поставлено install.sh
-// (scripts/cli/main.ts маршрутизирует туда по isManagedInstall). Префлайт, живущий только
+// Боевой путь апдейта — этот: install.sh ставит шим, и pipeline по isManagedInstall
+// признаёт такой чекаут установкой. Префлайт, живущий только
 // в legacy-обновлении, боевую установку не защищал: опечатка в MODEL_PROVIDER прогоняла
 // fetch → build → restart, упиралась в health-check и возвращала «Couldn't build Iva»
 // без единого слова о причине.

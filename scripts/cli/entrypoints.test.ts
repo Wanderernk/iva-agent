@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { plantCliTree } from "../fixtures/cli-tree.ts";
+import { shimScript } from "../lib/version-layout.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -81,10 +82,20 @@ void test("update rejects a fresh lock without mutating update state", async (t)
   const envText = "AGENT_LANGUAGE=en\nASSISTANT_DATA_DIR=data\n";
   const dataDir = join(fixture.project, "data");
   const lockDir = join(dataDir, "update.lock");
+  // The command install.sh puts on PATH: without it the updater sees a stranger's
+  // working tree and refuses before it ever looks at the lock.
+  const shim = join(fixture.home, ".local/bin/iva");
+  await mkdir(dirname(shim), { recursive: true });
+  await writeFile(
+    shim,
+    shimScript(await realpath(fixture.project), process.execPath, dataDir),
+  );
   const ownerPath = join(lockDir, "owner.json");
+  // A live owner: the lock of a process that is gone is a leftover, and the updater
+  // is right to take it over.
   const ownerText = `${JSON.stringify({
     owner: "existing-update",
-    pid: 4242,
+    pid: process.pid,
     startedAt: new Date().toISOString(),
   })}\n`;
   await mkdir(lockDir, { recursive: true });
@@ -94,7 +105,10 @@ void test("update rejects a fresh lock without mutating update state", async (t)
   const result = runCli(fixture, ["update"]);
 
   assert.equal(result.status, 1, result.stderr || result.stdout);
-  assert.equal(result.stdout, "⚠️ An update is already running\n");
+  assert.equal(
+    result.stdout,
+    "◇ Getting the update\n⚠️ An update is already running\n",
+  );
   assert.equal(result.stderr, "");
   assert.equal(await readFile(envPath, "utf8"), envText);
   assert.equal(await readFile(ownerPath, "utf8"), ownerText);

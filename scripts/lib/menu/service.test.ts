@@ -1,7 +1,8 @@
 /* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/require-await -- Node's test runner owns registrations and injected service doubles preserve asynchronous boundaries. */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -386,6 +387,38 @@ test("update-lock: занят — go:doc не стартует, текст пр�
   assert.ok(st._last);
   assert.match(st._last.text, /обновлени/i);
   lock.release();
+});
+
+// Обратная сторона того же гейта: обновление, убитое вместе с процессом, оставляет
+// каталог лока навсегда, и меню, которое смотрит на существование каталога, после
+// одного такого падения молчит про обновление до конца жизни установки.
+test("update-lock: владелец лока мёртв — go:doc стартует", async () => {
+  resetForTests();
+  const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
+  const dead = spawnSync(process.execPath, ["-e", "0"]).pid;
+  assert.ok(dead);
+  mkdirSync(join(dataDir, "update.lock"), { recursive: true });
+  writeFileSync(
+    join(dataDir, "update.lock/owner.json"),
+    JSON.stringify({ pid: dead, startedAt: new Date().toISOString() }),
+  );
+  const h = makeCtx({
+    deps: {
+      dataDir,
+      root: "/x",
+      envPath: join(dataDir, ".env"),
+      svcRun: fastRun,
+      svcSpec: () => ({ kind: "proc", argv: [process.execPath, "-e", "0"] }),
+    },
+  });
+  const st = newState();
+  h.st = st;
+
+  await service.on("go", ["doc"], st, h.ctx);
+
+  assert.notEqual(currentRun(), null);
+  assert.ok(st._last);
+  assert.doesNotMatch(st._last.text, /обновлени/i);
 });
 
 const PLANTED = `api_key=${"z".repeat(24)}`;

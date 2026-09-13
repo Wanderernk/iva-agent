@@ -23,7 +23,11 @@ import {
   updaterTooOldMessage,
 } from "../lib/update-check.ts";
 import { CATALOG, catalogProvider } from "../lib/model-catalog.ts";
-import { classifyRoot, isManagedInstall } from "../lib/version-layout.ts";
+import {
+  classifyRoot,
+  isManagedInstall,
+  SHIM_PATH,
+} from "../lib/version-layout.ts";
 import {
   acquireUpdateLock,
   createVersionStore,
@@ -200,6 +204,8 @@ export async function resolveTarget(
 export function createVersionUpdateCommand(
   runtime: CliRuntime,
   systemdLifecycle: { restartServices: () => void },
+  /** The command on PATH that decides whether this tree is an installation. */
+  shimPath: string = SHIM_PATH,
 ) {
   const install = classifyRoot(runtime.ROOT);
 
@@ -251,7 +257,7 @@ export function createVersionUpdateCommand(
 
     // Обновляется только установка: версия или чекаут, который запускает наш шим.
     // Любой другой чекаут — чужое рабочее дерево, и его оставляют как есть.
-    if (!isManagedInstall(install))
+    if (!isManagedInstall(install, shimPath))
       return refuse(text.devCheckout, reporter?.devCheckout());
 
     // Без этого префлайта опечатка в MODEL_PROVIDER прогоняла fetch → build → restart →
@@ -292,11 +298,12 @@ export function createVersionUpdateCommand(
     try {
       terminal.start(text.fetch[0]);
       await reporter?.start("fetch");
-      const repo = await ensureMirror(install.home);
       const outcome = await runVersionUpdate({
         home: install.home,
         store,
-        resolveTarget: () => target(repo),
+        // Зеркало клонируется под локом, а не до него: пока лок чужой, клон истории -
+        // работа впустую и второй rename рядом с чужим обновлением.
+        resolveTarget: async () => target(await ensureMirror(install.home)),
         run: commandRunner(verbose),
         force,
         requirePlugins,
@@ -416,7 +423,7 @@ export function createVersionUpdateCommand(
     /** Whether a plugin that will not build fails the build or is switched off. */
     readonly requirePlugins: boolean;
   }): Promise<PluginVersionBuild> {
-    if (!isManagedInstall(install))
+    if (!isManagedInstall(install, shimPath))
       return {
         status: "skipped",
         reason:
