@@ -30,12 +30,19 @@ process.env.AGENT_LANGUAGE = "en";
 process.env.TELEGRAM_BOT_TOKEN = "token";
 process.env.TELEGRAM_ALLOWED_USER_IDS = "42";
 
-type Reconcile = (options?: {
+type Reconcile = (options: {
   root?: string;
   tickMs?: number;
   graceMs?: number;
-  launchImpl?: (jobId: string) => Promise<{ ok: boolean; msg: string }>;
+  /** Обязателен и здесь: тест, забывший подставить свой запуск, самообновлял бы чекаут. */
+  launchImpl: (jobId: string) => Promise<{ ok: boolean; msg: string }>;
 }) => Promise<Promise<void>[]>;
+
+/** Повтор в этом тесте не ожидается: запуск отвечает отказом и никуда не ходит. */
+const refuseLaunch = async (): Promise<{ ok: boolean; msg: string }> => ({
+  ok: false,
+  msg: "no launch is expected here",
+});
 
 const { reconcileUpdateJobs } = (await import(
   `./update-flow.ts?reconcile=${Date.now()}`
@@ -210,7 +217,10 @@ test("an outcome left by a dead updater is delivered exactly and only once", asy
     outcome: outcome(OLD, NEW),
   });
 
-  assert.deepEqual(await reconcileUpdateJobs({ root }), []);
+  assert.deepEqual(
+    await reconcileUpdateJobs({ launchImpl: refuseLaunch, root }),
+    [],
+  );
   assert.equal(existsSync(path), false, "the answered job is gone");
 
   // The same job again: a bridge killed between the edit and the unlink.
@@ -222,7 +232,7 @@ test("an outcome left by a dead updater is delivered exactly and only once", asy
     currentAtStart: OLD,
     outcome: outcome(OLD, NEW),
   });
-  await reconcileUpdateJobs({ root });
+  await reconcileUpdateJobs({ launchImpl: refuseLaunch, root });
 
   assert.equal(existsSync(path), false);
   assert.equal(finals(calls).length, 2, calls.map((c) => c.text).join(" | "));
@@ -253,7 +263,7 @@ test("a delivery Telegram refuses keeps the job for the next start", async (t) =
     outcome: outcome(OLD, NEW),
   });
 
-  await reconcileUpdateJobs({ root });
+  await reconcileUpdateJobs({ launchImpl: refuseLaunch, root });
 
   assert.equal(existsSync(path), true, "an undelivered final is not dropped");
   // Финал — rich-экран: отказанную правку reporter добивает sendRichMessage'ом.
@@ -295,7 +305,11 @@ test(
     // This runs before the first poll, so a throw here is a bridge that never polls.
     chmodSync(jobsDir, 0o555);
     try {
-      assert.deepEqual(await reconcileUpdateJobs({ root }), [], "no watchers");
+      assert.deepEqual(
+        await reconcileUpdateJobs({ launchImpl: refuseLaunch, root }),
+        [],
+        "no watchers",
+      );
     } finally {
       chmodSync(jobsDir, 0o755);
     }
@@ -340,6 +354,7 @@ test(
 
     // No outcome yet, so the job is watched rather than answered on the spot.
     const watchers = await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
       root,
       tickMs: 5,
       graceMs: 10_000, // Long enough that only the outcome below ends the watch.
@@ -405,6 +420,7 @@ test("a job killed after the flip is answered from what the installation says", 
       });
 
       const watchers = await reconcileUpdateJobs({
+        launchImpl: refuseLaunch,
         root,
         tickMs: 5,
         graceMs: 15,
@@ -438,7 +454,12 @@ test("an outcome that arrives while the job is watched wins over the guess", asy
     JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
   );
 
-  const watchers = await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 10 });
+  const watchers = await reconcileUpdateJobs({
+    launchImpl: refuseLaunch,
+    root,
+    tickMs: 5,
+    graceMs: 10,
+  });
   await wait(60);
   assert.deepEqual(calls, [], "a running update is never reported on");
 
@@ -474,7 +495,12 @@ test("a job from a bridge that never named a version falls back to the settle ma
   });
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.equal(existsSync(path), false);
@@ -498,7 +524,12 @@ test("nothing is said when no evidence says the update finished", async (t) => {
   });
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.deepEqual(calls, [], "a false ✅ is worse than a spinner");
@@ -534,7 +565,12 @@ test("a rollback is never a ✅ on a job that never named its version", async (t
     t.diagnostic("the rollback left the old build newest on disk");
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.deepEqual(
@@ -565,7 +601,12 @@ test("an update that stuck is still a ✅ on a job that never named its version"
   store.settle(NEW);
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.equal(existsSync(path), false, "the answered job is gone");
@@ -601,7 +642,12 @@ test("a rollback out of a resumed flip is never a ✅ on the version it left", a
   assert.equal(store.currentName(), OLD, "the box is back where it came from");
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.deepEqual(calls, [], "a downgrade is not an update to announce");
@@ -634,7 +680,12 @@ test("a rollback that never happened is never a ✅ on the version it died on", 
   assert.equal(store.settled(), OLD, "the move never settled");
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.deepEqual(
@@ -670,7 +721,12 @@ test("a flip nobody has judged yet is never a ✅", async (t) => {
   assert.equal(store.settled(), null, "and the move never settled");
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.deepEqual(
@@ -709,7 +765,12 @@ test("a verdict pushed out of the failure list is still not a ✅", async (t) =>
   assert.equal(store.settled(), OLD, "the move never settled");
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.deepEqual(calls, [], "a forgotten failure is not a success");
@@ -746,7 +807,12 @@ test("an old failure on disk does not swallow the ✅ of an update that stuck", 
   );
 
   await Promise.all(
-    await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 }),
+    await reconcileUpdateJobs({
+      launchImpl: refuseLaunch,
+      root,
+      tickMs: 5,
+      graceMs: 15,
+    }),
   );
 
   assert.equal(existsSync(path), false, "the answered job is gone");
@@ -769,7 +835,12 @@ test("a job the updater answered itself is dropped without a second word", async
     currentAtStart: OLD,
   });
 
-  const watchers = await reconcileUpdateJobs({ root, tickMs: 5, graceMs: 15 });
+  const watchers = await reconcileUpdateJobs({
+    launchImpl: refuseLaunch,
+    root,
+    tickMs: 5,
+    graceMs: 15,
+  });
   rmSync(path, { force: true });
   await Promise.all(watchers);
 

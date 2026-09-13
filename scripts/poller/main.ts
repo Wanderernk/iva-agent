@@ -63,7 +63,8 @@ const {
   retireSettledSessions,
 } = queue;
 const { drainReadyQueueHeads, routeMessageUpdate } = routing;
-const { reconcileUpdateJobs, removeStaleUpdateJobs } = updateFlow;
+const { launchSelfUpdate, reconcileUpdateJobs, removeStaleUpdateJobs } =
+  updateFlow;
 const { handleControl, registerBotCommands } = control;
 
 export { readCappedStream } from "./transport.ts";
@@ -293,7 +294,7 @@ export async function main({
   // The update that restarted this bridge left its final screen to us: its own
   // process died with the restart. Delivered before the first poll; the jobs with
   // nothing to say yet are watched beside it.
-  const watched = await reconcileUpdateJobs();
+  const watched = await reconcileUpdateJobs({ launchImpl: launchSelfUpdate });
   if (watched.length > 0)
     log(`watching ${watched.length} unfinished update job(s)`);
   // Upgrade the old {chatKey: string[]} queue atomically before polling. A failed

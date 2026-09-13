@@ -63,7 +63,7 @@ function messageEditSucceeded(value: unknown): boolean {
 // THIS bridge (restartServices restarts iva-telegram-poll too — a plain child would be
 // killed with us). --collect GC's the unit after exit. The updater reads a 0600 job
 // file and posts each phase directly through Bot API, so no bridge process survives.
-function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
+export function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
   const updater = [
     join(ROOT, "bin/iva.mjs"),
     "update",
@@ -318,8 +318,12 @@ type ReconcileOptions = {
   root?: string;
   tickMs?: number;
   graceMs?: number;
-  /** How the retry of an interrupted update is started; the real one by default. */
-  launchImpl?: (jobId: string) => Promise<LaunchResult>;
+  /**
+   * Как запускается повтор прерванного обновления. Без значения по умолчанию: молчаливый
+   * боевой запуск делал бы любой тест, забывший подставить своё, настоящим самообновлением
+   * того дерева, в котором он бежит.
+   */
+  launchImpl: (jobId: string) => Promise<LaunchResult>;
 };
 type VersionStore = ReturnType<typeof createVersionStore>;
 
@@ -598,7 +602,7 @@ const retryMark = (path: string): string => `${path}.retried`;
 async function retryInterruptedUpdate(
   path: string,
   job: UpdateJob,
-  launch: (jobId: string) => Promise<LaunchResult> = launchSelfUpdate,
+  launch: (jobId: string) => Promise<LaunchResult>,
 ): Promise<boolean> {
   if (updateRunning(DATA_DIR)) return false; // Живой владелец лока: обновление идёт.
   try {
@@ -635,7 +639,7 @@ export async function reconcileUpdateJobs({
   tickMs = WATCH_TICK_MS,
   graceMs = WATCH_GRACE_MS,
   launchImpl,
-}: ReconcileOptions = {}): Promise<Promise<void>[]> {
+}: ReconcileOptions): Promise<Promise<void>[]> {
   let names: string[];
   try {
     names = await readdir(jobsDir());
