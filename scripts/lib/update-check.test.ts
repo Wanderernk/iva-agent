@@ -217,11 +217,12 @@ test("installer persists the selected update channel and integrates the fetched 
     installer,
     /UPDATE_CHANNEL="\$\(git -C "\$PROJECT_DIR" branch --show-current/,
   );
-  assert.match(
+  // Fetch и merge установщик больше не делает вовсе: установку, которая уже есть, он
+  // отдаёт обновлятору (repair.sh), и путь «назад на релиз» проверяется его тестами.
+  assert.doesNotMatch(
     installer,
-    /remote_ref="\$\(git -C "\$PROJECT_DIR" rev-parse FETCH_HEAD\)"/,
+    /git -C "\$PROJECT_DIR" (?:fetch|merge|rebase|stash)/u,
   );
-  assert.doesNotMatch(installer, /remote_ref="origin\/\$BRANCH"/);
 });
 
 test("notification state is atomic, private and readable", async () => {
