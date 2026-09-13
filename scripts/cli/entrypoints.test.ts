@@ -17,7 +17,6 @@ import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { plantCliTree } from "../fixtures/cli-tree.ts";
-import { shimScript } from "../lib/version-layout.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -82,14 +81,6 @@ void test("update rejects a fresh lock without mutating update state", async (t)
   const envText = "AGENT_LANGUAGE=en\nASSISTANT_DATA_DIR=data\n";
   const dataDir = join(fixture.project, "data");
   const lockDir = join(dataDir, "update.lock");
-  // The command install.sh puts on PATH: without it the updater sees a stranger's
-  // working tree and refuses before it ever looks at the lock.
-  const shim = join(fixture.home, ".local/bin/iva");
-  await mkdir(dirname(shim), { recursive: true });
-  await writeFile(
-    shim,
-    shimScript(await realpath(fixture.project), process.execPath, dataDir),
-  );
   // An installation's own repository: the updater mirrors the history it follows
   // before it asks for the lock, and a tree without one fails the clone instead.
   for (const args of [
