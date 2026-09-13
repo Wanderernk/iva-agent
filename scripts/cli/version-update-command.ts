@@ -22,7 +22,7 @@ import {
   requireGit,
   updaterTooOldMessage,
 } from "../lib/update-check.ts";
-import { catalogProvider } from "../lib/model-catalog.ts";
+import { CATALOG, catalogProvider } from "../lib/model-catalog.ts";
 import { classifyRoot, isManagedInstall } from "../lib/version-layout.ts";
 import {
   acquireUpdateLock,
@@ -38,9 +38,58 @@ import {
   type UpdateOutcome,
 } from "../lib/version-update.ts";
 import type { createCliRuntime } from "./runtime.ts";
-import { ACCEPTED_PROVIDERS, COPY, invalidProviderRefusal } from "./update.ts";
 
 type CliRuntime = ReturnType<typeof createCliRuntime>;
+
+type UpdateCopy = Record<
+  "fetch" | "build",
+  readonly [string, string, string]
+> & {
+  readonly current: string;
+  readonly busy: string;
+  readonly badProvider: string;
+  readonly failed: string;
+  readonly stock: string;
+};
+
+/** What the terminal says; the chat has its own words in telegram-status.ts. */
+const COPY: Record<"en" | "ru", UpdateCopy> = {
+  ru: {
+    fetch: [
+      "Получаю обновление",
+      "Обновление получено",
+      "Не удалось получить обновление",
+    ],
+    build: ["Собираю Iva", "Iva собрана", "Не удалось собрать Iva"],
+    current: "Iva уже обновлена",
+    busy: "Обновление уже идёт",
+    badProvider:
+      "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
+    failed: "Не удалось завершить обновление",
+    stock: "ваша доработка в data/custom не входит в эту версию",
+  },
+  en: {
+    fetch: ["Getting the update", "Update received", "Couldn't get the update"],
+    build: ["Building Iva", "Iva built", "Couldn't build Iva"],
+    current: "Iva is already up to date",
+    busy: "An update is already running",
+    badProvider:
+      "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
+    failed: "Couldn't complete the update",
+    stock: "your customization in data/custom is not in this version",
+  },
+};
+
+/** Имена, которые примет рантайм, — для сообщения об отказе. */
+const ACCEPTED_PROVIDERS = Object.keys(CATALOG).join(", ");
+
+/**
+ * Отказ апдейта на невалидном MODEL_PROVIDER. В терминал он идёт на языке CLI
+ * (AGENT_LANGUAGE), в чат — из copy репортера (job.locale).
+ */
+function invalidProviderRefusal(text: UpdateCopy, value: string): string {
+  return `${text.badProvider}: ${JSON.stringify(value)} (${ACCEPTED_PROVIDERS})`;
+}
 
 /**
  * What `iva plugin` learns from a build it asked for (ADR-0009). `skipped` is a

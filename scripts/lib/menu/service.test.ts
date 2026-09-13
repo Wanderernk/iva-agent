@@ -22,7 +22,7 @@ import {
   startProcess,
   type RunOptions,
 } from "./svc-run.ts";
-import { acquireUpdateLock, releaseUpdateLock } from "../update-safety.ts";
+import { acquireUpdateLock } from "../version-store.ts";
 import { createFlows } from "../tg-flow.ts";
 
 const { SCREENS } = (await import("./index.ts")) as {
@@ -368,8 +368,8 @@ test("busy-гейт: второй go при running — экран «Уже ид
 test("update-lock: занят — go:doc не стартует, текст про обновление", async () => {
   resetForTests();
   const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
-  const lock = acquireUpdateLock(dataDir, "test-hold");
-  assert.ok(lock.ok);
+  const lock = acquireUpdateLock(dataDir);
+  assert.ok(lock);
   const h = makeCtx({
     deps: {
       dataDir,
@@ -385,7 +385,7 @@ test("update-lock: занят — go:doc не стартует, текст пр�
   assert.equal(currentRun(), null);
   assert.ok(st._last);
   assert.match(st._last.text, /обновлени/i);
-  releaseUpdateLock(lock);
+  lock.release();
 });
 
 const PLANTED = `api_key=${"z".repeat(24)}`;

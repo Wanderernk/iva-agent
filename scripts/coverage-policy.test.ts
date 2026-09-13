@@ -93,38 +93,6 @@ const BLIND_SPOT: ReadonlyArray<{
     path: "scripts/cli/plugin-cli-trust.ts",
     why: "прицеп plugin CLI; trust-юниты в его тестах",
   },
-  {
-    path: "scripts/lib/update-candidate.ts",
-    why: "прицеп version-update; кандидат в его тестах",
-  },
-  {
-    path: "scripts/lib/update-command.ts",
-    why: "прицеп version-update-command; команда в его тестах",
-  },
-  {
-    path: "scripts/lib/update-ignored-collisions.ts",
-    why: "прицеп version-update; коллизии в его тестах",
-  },
-  {
-    path: "scripts/lib/update-recovery-collision-owner.ts",
-    why: "прицеп recovery-сьюта; гоняет фикстура",
-  },
-  {
-    path: "scripts/lib/update-recovery-io.ts",
-    why: "прицеп recovery-сьюта; гоняет фикстура",
-  },
-  {
-    path: "scripts/lib/update-recovery-snapshot-verifier.ts",
-    why: "прицеп recovery-сьюта; гоняет фикстура",
-  },
-  {
-    path: "scripts/lib/update-recovery-tracked-owner.ts",
-    why: "прицеп recovery-сьюта; гоняет фикстура",
-  },
-  {
-    path: "scripts/lib/update-recovery.ts",
-    why: "прицеп recovery-сьюта; гоняет фикстура",
-  },
   // Отдельные процессы: выполняются только на живой установке.
   {
     path: "scripts/check-bash-cwd.ts",

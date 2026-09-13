@@ -317,16 +317,6 @@ test("C4: every product-owned Iva child boundary passes canonical data", () => {
       proofs: [/ASSISTANT_DATA_DIR: resolveDataDir\(cwd\)/u],
     },
     {
-      boundary: "legacy update commands",
-      file: "scripts/lib/update-safety.ts",
-      proofs: [/commandEnv = \{ \.\.\.env, ASSISTANT_DATA_DIR: dataDir \}/u],
-    },
-    {
-      boundary: "repair updater",
-      file: "scripts/repair-update.ts",
-      proofs: [/ASSISTANT_DATA_DIR: resolveDataDir\(root\)/u],
-    },
-    {
       boundary: "Telegram detached updater",
       file: "scripts/poller/update-flow.ts",
       proofs: [/--setenv=ASSISTANT_DATA_DIR=\$\{DATA_DIR\}/u],

@@ -309,7 +309,7 @@ console.log(JSON.stringify({error,result,complete:fs.readFileSync(shim,"utf8")==
   });
 });
 
-test("a checkout somebody develops in is never converted, however the shim points", (t) => {
+test("the shim alone tells an installation: branches and commits of one's own do not", (t) => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "iva-managed-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (cwd: string, ...args: string[]): string =>
@@ -365,22 +365,15 @@ test("a checkout somebody develops in is never converted, however the shim point
   writeFileSync(shim, shimScript(home, process.execPath, join(home, "data")));
   assert.equal(managed(), true);
 
-  // The deliberate ceiling of the test: an installation is free to have edits of
-  // its own - preserving them is what the checkout-era updater is for - so dirt
-  // alone cannot mean somebody develops here. History is the only tell.
+  // An installation is free to have edits, branches and commits of its own: a
+  // rollback through `release/<v>` leaves a second branch behind, and none of it
+  // makes the tree a working tree. Only the shim decides.
   writeFileSync(join(home, "package.json"), '{ "edited": true }\n');
   assert.equal(managed(), true);
-
-  // A branch of their own: a working tree, not an installation. Converting it
-  // would retire the checkout somebody is working in.
-  git(home, "checkout", "-q", "-b", "feature");
-  assert.equal(managed(), false);
-
-  // And commits of their own on the branch that tracks upstream.
-  git(home, "checkout", "-q", "main");
-  git(home, "branch", "-D", "feature");
-  assert.equal(managed(), true);
+  git(home, "checkout", "-q", "-b", "release/0.4.0");
   git(home, "commit", "-q", "--allow-empty", "-m", "mine");
+  assert.equal(managed(), true);
+  rmSync(shim);
   assert.equal(managed(), false);
 });
 

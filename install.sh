@@ -1027,9 +1027,8 @@ fi
 # ─────────────────────────────────────────────────────────────────────────
 # 5c. Google Workspace CLI (`gws`): Gmail / Calendar / Drive / Sheets / Docs
 # ─────────────────────────────────────────────────────────────────────────
-# Installed once and left alone: an installed `gws` is kept current by `iva update`
-# (scripts/cli/update.ts runs the same global install), so re-running the installer after
-# a failure has no reason to pay for it again. Non-fatal — Google-service tasks are
+# Installed once and left alone: an installed `gws` is kept current by `iva update`,
+# so re-running the installer after a failure has no reason to pay for it again. Non-fatal — Google-service tasks are
 # optional. Binary lands in npm-global (already on PATH). Auth is per-user and
 # interactive — the bot walks the user through it in chat (agent skill
 # `google-workspace`); nothing to configure here.

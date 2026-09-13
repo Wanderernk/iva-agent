@@ -12,7 +12,6 @@ import { createServiceCommands } from "./services.ts";
 import { createCliSystemd } from "./systemd.ts";
 import { createTraceCommands } from "./trace.ts";
 import { createTreeRenderer } from "./tree.ts";
-import { createUpdateCommand } from "./update.ts";
 import { createUserbotCommands } from "./userbot.ts";
 import { createVersionUpdateCommand } from "./version-update-command.ts";
 
@@ -62,6 +61,7 @@ export function dispatchCli(
 /** Compose the CLI command groups without executing a command. */
 export function createCliMain(root: string) {
   const runtime = createCliRuntime(root);
+  const { C, SERVICES, TIMERS, bad, ok } = runtime;
   const systemdLifecycle = createCliSystemd(runtime);
   const tree = createTreeRenderer(root);
   const userbot = createUserbotCommands(runtime, systemdLifecycle);
@@ -75,30 +75,27 @@ export function createCliMain(root: string) {
   const cmdJobs = createJobsCommand(runtime);
   const cmdRemind = createRemindCommand(runtime);
   const cmdPost = createPostCommand(runtime);
-  const legacyUpdate = createUpdateCommand({
-    runtime,
-    systemdLifecycle,
-    showTree: tree.showTree,
-    restartUserbotIfActive: userbot.restartUserbotIfActive,
-  });
-  // Installations move to immutable versions; a development checkout keeps the
-  // in-place updater, which is also what the bridge era still needs on the way in.
-  //
-  // The move therefore takes two `iva update` runs, and that is not a bug to fix
-  // here: the first one is executed entirely by the code the user already has -
-  // the old stash-and-rebase updater, which knows nothing about versions - and
-  // all it can do is bring this file onto their disk. The second run is the first
-  // one that reaches this routing, and it is the one that converts the layout.
   const versionUpdate = createVersionUpdateCommand(runtime, systemdLifecycle);
-  const cmdUpdate = (args: readonly string[]): Promise<void> =>
-    versionUpdate.active() ? versionUpdate.run(args) : legacyUpdate(args);
+  // Only an installation is updated: a version, or the checkout our shim runs. A
+  // checkout without one is somebody's working tree, and it is left exactly as is.
+  const cmdUpdate = (args: readonly string[]): Promise<void> => {
+    if (versionUpdate.active()) return versionUpdate.run(args);
+    const ru =
+      (runtime.readEnv().AGENT_LANGUAGE || process.env.AGENT_LANGUAGE) === "ru";
+    bad(
+      ru
+        ? "это чекаут разработчика, а не установка: git pull && npm run build"
+        : "this is a development checkout, not an installation: git pull && npm run build",
+    );
+    process.exitCode = 1;
+    return Promise.resolve();
+  };
   // The code of a plugin is built into a version, on exactly the updater's rails
   // (ADR-0009), so `iva plugin` is handed the updater's own rebuild instead of a
   // second path to the same probe, flip and restart.
   const plugin = createPluginCommands(runtime, {
     buildVersion: versionUpdate.rebuild,
   });
-  const { C, SERVICES, TIMERS, bad, ok } = runtime;
 
   function cmdHelp(): void {
     console.log(`

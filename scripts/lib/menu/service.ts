@@ -7,7 +7,7 @@
 // render сам решает, что показать: идёт процесс → прогресс; иначе список.
 import { join } from "node:path";
 import { readEnvValues } from "../env-file.ts";
-import { acquireUpdateLock, releaseUpdateLock } from "../update-safety.ts";
+import { updateRunning } from "../version-store.ts";
 import { button } from "./buttons.ts";
 import { menuStyle } from "../telegram-buttons.ts";
 import { writeSettings } from "#lib/settings.ts";
@@ -296,22 +296,18 @@ async function startCommand(
       [T("Already running:", "Уже идёт:"), v.text].join("\n\n"),
     );
   }
-  // Гейт 2: идёт обновление — в репо чужим процессам нельзя (probe: взяли лок — отпустили).
-  if (cmd !== "mem") {
-    const lock = acquireUpdateLock(ctx.deps.dataDir, "menu-svc");
-    if (!lock.ok) {
-      return ctx.flows.screen(
-        st,
-        [
-          T(
-            "⬆️ An update is in progress — try again after it finishes.",
-            "⬆️ Идёт обновление — попробуй после его завершения.",
-          ),
-          backLine(ctx),
-        ].join("\n\n"),
-      );
-    }
-    releaseUpdateLock(lock);
+  // Гейт 2: идёт обновление — в репо чужим процессам нельзя.
+  if (cmd !== "mem" && updateRunning(ctx.deps.dataDir)) {
+    return ctx.flows.screen(
+      st,
+      [
+        T(
+          "⬆️ An update is in progress — try again after it finishes.",
+          "⬆️ Идёт обновление — попробуй после его завершения.",
+        ),
+        backLine(ctx),
+      ].join("\n\n"),
+    );
   }
   const spec = await commandSpec(cmd, ctx);
   const over = ctx.deps.svcRun || {};

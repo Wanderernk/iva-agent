@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
 import { createCliMain, dispatchCli, type CliCommand } from "./main.ts";
 
 class ExitSignal extends Error {
@@ -181,4 +185,78 @@ void test("main composition exposes the exact legacy command key set without exe
     "_activate-units",
     "_await-healthy",
   ]);
+});
+
+/** Everything `iva update` prints: `bad` goes through console.log, the progress through stdout. */
+function printed(t: TestContext): () => string {
+  const lines: string[] = [];
+  const previousExitCode = process.exitCode;
+  t.after(() => {
+    process.exitCode = previousExitCode;
+  });
+  t.mock.method(console, "log", (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    lines.push(String(chunk));
+    return true;
+  });
+  return () => lines.join("\n");
+}
+
+function scratch(t: TestContext): string {
+  const dir = mkdtempSync(join(tmpdir(), "iva-main-update-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+void test("a checkout no shim of ours runs is refused and left exactly as it was", async (t) => {
+  const home = join(scratch(t), "iva");
+  mkdirSync(home);
+  const git = (...args: string[]): string =>
+    execFileSync("git", args, {
+      cwd: home,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "version": "0.3.19" }\n');
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  writeFileSync(join(home, "package.json"), '{ "version": "mine" }\n');
+  writeFileSync(join(home, "notes.txt"), "untracked\n");
+  const before = [git("rev-parse", "HEAD"), git("status", "--porcelain")];
+
+  const out = printed(t);
+  await createCliMain(home).commands.update([]);
+
+  assert.equal(process.exitCode, 1);
+  assert.match(
+    out(),
+    /development checkout, not an installation: git pull && npm run build/u,
+  );
+  assert.deepEqual(
+    [git("rev-parse", "HEAD"), git("status", "--porcelain")],
+    before,
+  );
+});
+
+void test("an installed version is handed to the updater", async (t) => {
+  const root = join(scratch(t), "versions", "0.3.19-aaaaaaaaaaaa");
+  mkdirSync(root, { recursive: true });
+  // The first thing the updater checks, and the one refusal that touches nothing.
+  writeFileSync(join(root, ".env"), "MODEL_PROVIDER=ollmaa\n");
+
+  const out = printed(t);
+  await createCliMain(root).commands.update([]);
+
+  assert.equal(process.exitCode, 1);
+  assert.match(out(), /MODEL_PROVIDER/u);
+  assert.doesNotMatch(out(), /development checkout/u);
 });

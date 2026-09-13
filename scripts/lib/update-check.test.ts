@@ -433,10 +433,6 @@ test("systemd templates schedule a persistent 10:00 local check and lifecycle co
     join(root, "scripts", "cli", "systemd.ts"),
     "utf8",
   );
-  const cliUpdate = readFileSync(
-    join(root, "scripts", "cli", "update.ts"),
-    "utf8",
-  );
   const installer = readFileSync(join(root, "install.sh"), "utf8");
   assert.match(timer, /OnCalendar=\*-\*-\* 10:00:00 __TIMEZONE__/);
   assert.match(timer, /Persistent=true/);
@@ -444,32 +440,10 @@ test("systemd templates schedule a persistent 10:00 local check and lifecycle co
   assert.match(service, /EnvironmentFile=__PROJECT_DIR__\/\.env/);
   assert.match(cliRuntime, /const TIMERS = \[BRAIN_TIMER, UPDATE_TIMER\]/);
   assert.match(cliSystemd, /replaceAll\("__TIMEZONE__", timezone\)/);
-  assert.match(cliUpdate, /systemd\.activate\(\[UPDATE_TIMER\]\)/);
   assert.match(installer, /bin\/iva\.mjs" _activate-units/);
   assert.match(
     pollService,
     /ExecStartPost=-\/usr\/bin\/systemctl --user enable --now iva-update-check\.timer/,
-  );
-});
-
-test("a post-commit timer failure exits without rollback or a false update claim", () => {
-  const cliUpdate = readFileSync(
-    new URL("../cli/update.ts", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(
-    cliUpdate,
-    /Iva is ready, but the automatic update timer could not be activated/,
-  );
-  assert.doesNotMatch(cliUpdate, /timerFailure: "Iva updated/);
-  assert.match(
-    cliUpdate,
-    /const finalizeUpdate = async \(\): Promise<boolean> => \{[\s\S]*?commitThenRunPostCommit[\s\S]*?terminal\.fail\(text\.timerFailure\)[\s\S]*?process\.exitCode = 1;[\s\S]*?return false;/,
-  );
-  assert.equal(
-    cliUpdate.match(/if \(!\(await finalizeUpdate\(\)\)\) return;/g)?.length,
-    2,
   );
 });
 

@@ -62,35 +62,9 @@ export function classifyRoot(root: string): Install {
 }
 
 /**
- * A tree somebody develops in, told from an installation by its git history:
- * install.sh clones one branch and never commits into it, so an installation has
- * one local branch, nothing of its own on top, and is never a linked worktree.
- */
-function isDevelopmentCheckout(home: string): boolean {
-  const dot = lstatSync(join(home, ".git"), { throwIfNoEntry: false });
-  if (!dot) return false;
-  if (!dot.isDirectory()) return true; // a linked worktree: nobody installs one
-  const git = (...args: string[]): string => {
-    try {
-      return execFileSync("git", ["-C", home, ...args], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-    } catch {
-      return ""; // Not a repository this process can read: not one to protect.
-    }
-  };
-  const heads = git("for-each-ref", "--format=%(refname)", "refs/heads");
-  return (
-    heads.split("\n").filter(Boolean).length > 1 ||
-    Number(git("rev-list", "--count", "@{upstream}..HEAD")) > 0
-  );
-}
-
-/**
- * Only somebody's installation may be converted to the immutable layout. The
- * conversion retires the working tree it finds, so a checkout somebody develops
- * in is left on the in-place updater even when their shim points at it.
+ * An installation is a version, or the checkout our own shim runs: install.sh
+ * writes that shim and nothing else does. Every other checkout is somebody's
+ * working tree, and the updater leaves it alone.
  */
 export function isManagedInstall(
   install: Install,
@@ -98,7 +72,6 @@ export function isManagedInstall(
   node: string = process.execPath,
 ): boolean {
   if (install.kind === "version") return true;
-  if (isDevelopmentCheckout(install.home)) return false;
   const opened = openShim(shimPath);
   if (opened.kind !== "file") return false;
   try {

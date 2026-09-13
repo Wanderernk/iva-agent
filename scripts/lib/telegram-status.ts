@@ -1,10 +1,9 @@
 import { readFile, rm } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { modelSummary } from "./model-summary.ts";
 import { redactTelegramBody } from "./notice.ts";
-import { button, screenPayload } from "./telegram-buttons.ts";
+import { screenPayload } from "./telegram-buttons.ts";
 import { updaterTooOldMessage } from "./update-check.ts";
-import type { RestoreReport } from "./update-safety.ts";
 
 type UpdatePhase = "protect" | "fetch" | "build";
 type TelegramJob = {
@@ -47,7 +46,6 @@ type Reporter = {
     beforeVersion?: string;
     afterVersion: string;
     changedLocal?: boolean;
-    restoreReport?: RestoreReport;
   }): Promise<boolean>;
   dispose(): void;
 };
@@ -80,11 +78,6 @@ const COPY = {
       "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
     final: "✅ Iva updated",
     preserved: "Local changes: preserved",
-    conflicted: (count: number) =>
-      `⚠️ ${count} local file(s) conflicted with the update. The new core is active; your versions are stored safely.`,
-    preservedInactive:
-      "⚠️ Local customizations did not build. The new core is active; your changes are stored safely.",
-    review: "Review saved changes",
     failure: (version: string) =>
       `Iva is still running ${version}.\nYour settings and changes are preserved.\nRetry: /update`,
   },
@@ -107,11 +100,6 @@ const COPY = {
       "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
     final: "✅ Iva обновлена",
     preserved: "Локальные изменения: сохранены",
-    conflicted: (count: number) =>
-      `⚠️ Конфликт локальных файлов: ${count}. Новое ядро активно; ваши версии надёжно сохранены.`,
-    preservedInactive:
-      "⚠️ Локальные доработки не собрались. Новое ядро активно; ваши изменения надёжно сохранены.",
-    review: "Посмотреть сохранённые изменения",
     failure: (version: string) =>
       `Iva продолжает работать на ${version}.\nВаши настройки и изменения сохранены.\nПовторить: /update`,
   },
@@ -328,11 +316,9 @@ export function createTelegramUpdateReporter({
     async complete({
       beforeVersion,
       afterVersion,
-      restoreReport,
     }: {
       beforeVersion?: string;
       afterVersion: string;
-      restoreReport?: RestoreReport;
     }): Promise<boolean> {
       const model = modelSummary(env);
       const lines = [
@@ -342,31 +328,8 @@ export function createTelegramUpdateReporter({
           ? `${beforeVersion} → ${afterVersion}`
           : `${lang === "ru" ? "Версия" : "Version"}: ${afterVersion}`,
         `${lang === "ru" ? "Модель" : "Model"}: ${model.line}`,
+        copy.preserved,
       ];
-      lines.push(copy.preserved);
-      if (
-        restoreReport?.status === "conflicted" ||
-        restoreReport?.status === "preserved"
-      ) {
-        lines.push(
-          "",
-          restoreReport.status === "conflicted"
-            ? copy.conflicted(restoreReport.conflicts.length)
-            : copy.preservedInactive,
-        );
-        const bundleId = basename(restoreReport.recoveryDir);
-        const callbackData = `iva_update:conflicts:${bundleId}`;
-        // Кнопка — строка текста: callback_data всё та же, её ждёт handleUpdateCallback.
-        if (Buffer.byteLength(callbackData, "utf8") <= 64)
-          lines.push(
-            "",
-            `${button(copy.review, callbackData)} — ${
-              lang === "ru"
-                ? "показать, что не удалось перенести"
-                : "show what couldn't be carried over"
-            }`,
-          );
-      }
       return finish(lines.join("\n"));
     },
     dispose() {},
