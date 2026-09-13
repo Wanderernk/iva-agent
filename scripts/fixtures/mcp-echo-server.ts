@@ -8,12 +8,20 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
 
 const server = new McpServer({ name: "echo-fixture", version: "1.0.0" });
 
 server.registerTool(
   "echo",
-  { description: "Returns the environment and arguments of this process." },
+  {
+    description: "Returns the environment and arguments of this process.",
+    // Lookaround в pattern: так выглядит схема, которую OpenAI отвергает целиком
+    // (пакет t0uchY 13.09.2026); прокси обязан её вычистить по дороге к агенту.
+    inputSchema: {
+      attendees: z.array(z.string().regex(/^(?=.*@).+$/u)).optional(),
+    },
+  },
   () => ({
     content: [
       {

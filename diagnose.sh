@@ -42,6 +42,18 @@ if [ -z "$PACKAGE" ]; then
   } | sed -E 's/(TOKEN|KEY|SECRET|BEARER)=[^ ]*/\1=<cut>/g; s#bot[0-9]+:[A-Za-z0-9_-]+#bot<cut>#g' > "$PACKAGE"
 fi
 
+# Extras every package needs and older `iva diagnose` versions do not collect yet:
+# plugins, the reminders pulse, schedule lines of the journal. Appended to the same file.
+{
+  say; say "## Plugins (data/custom/plugins.json)"
+  [ -f "$DATA_DIR/custom/plugins.json" ] && cat "$DATA_DIR/custom/plugins.json" || say "(none)"
+  say; say "## Reminders pulse (data/reminders.tick, written every minute by the dispatcher)"
+  ls -la "$DATA_DIR"/reminders.tick "$DATA_DIR"/reminders.json 2>&1 || true
+  say "now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  say; say "## Schedules and reminders in the journal (last 24h)"
+  journalctl --user -u iva.service --since "-24h" --no-pager 2>&1 | grep -iE "schedule|remind" | tail -n 60 || say "(nothing)"
+} | sed -E 's/(TOKEN|KEY|SECRET|BEARER)=[^ ]*/\1=<cut>/g; s#bot[0-9]+:[A-Za-z0-9_-]+#bot<cut>#g' >> "$PACKAGE"
+
 RESPONSE="$(curl -s -F "chat_id=$CHAT" -F "document=@$PACKAGE" -F "caption=Iva diagnose $(date +%Y-%m-%d\ %H:%M)" "https://api.telegram.org/bot$BOT/sendDocument" || true)"
 case "$RESPONSE" in
   *'"ok":true'*) say "Sent to your chat with the bot: $(basename "$PACKAGE"). Forward it to the maintainer." ;;

@@ -74,6 +74,15 @@ export function humanizeProviderError({
         };
   }
 
+  // OpenAI отвергает весь запрос из-за схемы одного инструмента (`param: tools`);
+  // такие схемы приносят плагины. Пользователю нужно действие, не текст ошибки.
+  if (/invalid[ _-]?json[ _-]?schema/iu.test(evidence)) {
+    return {
+      en: "The provider rejected a tool description from one of your plugins - switch that plugin off: iva plugin list, then iva plugin disable <name>",
+      ru: "Провайдер не принял описание инструмента одного из твоих плагинов - выключи его: iva plugin list, затем iva plugin disable <имя>",
+    };
+  }
+
   if (/insufficient[ _-]?credits|billing|\b402\b/iu.test(evidence)) {
     return {
       en: "Provider balance/plan exhausted - top up or switch models: /model",
