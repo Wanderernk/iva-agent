@@ -757,13 +757,19 @@ export function writeJson(
 
 export type UpdateLock = { readonly path: string; release(): void };
 
-type LockOwner = { readonly pid?: number; readonly command?: string };
+type LockOwner = {
+  readonly pid?: number;
+  readonly command?: string;
+  readonly startedAt?: string;
+};
 
 function ownerOf(path: string): LockOwner {
   const owner = readJson(join(path, "owner.json"));
   return {
     pid: typeof owner.pid === "number" ? owner.pid : undefined,
     command: typeof owner.command === "string" ? owner.command : undefined,
+    startedAt:
+      typeof owner.startedAt === "string" ? owner.startedAt : undefined,
   };
 }
 
@@ -771,25 +777,34 @@ function ownerPid(path: string): number | undefined {
   return ownerOf(path).pid;
 }
 
-/**
- * Жив ли владелец замка. Одного `kill(pid, 0)` мало: после перезагрузки тот же номер
- * носит чужой процесс, и замок оборванного обновления держал бы установку вечно -
- * `iva update` отвечал бы «Обновление уже идёт», а повтор моста и repair.sh упирались
- * бы в него. Поэтому сверяется и команда, записанная владельцем. Спросить команду не
- * удалось (чужой пользователь, `ps` недоступен) - владелец считается живым: замок
- * чужого обновления не перешагивают по догадке.
- */
-function alive(owner: LockOwner): boolean {
-  const pid = owner.pid;
-  if (!pid) return false;
+/** Живой ли процесс: EPERM - чужой пользователь, а не смерть. */
+function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
+    return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
-  if (owner.command === undefined) return true;
-  const running = processCommand(pid).trim();
+}
+
+/**
+ * Тот ли это процесс, что брал замок. Спросить команду не удалось (чужой пользователь,
+ * `ps` недоступен) - считаем, что тот: чужое обновление не перешагивают по догадке.
+ */
+function sameCommand(owner: LockOwner & { readonly command: string }): boolean {
+  const running = processCommand(owner.pid ?? 0).trim();
   return running === "" || running === owner.command.trim();
+}
+
+/** Возраст замка: по времени его взятия, а если его нет - по mtime каталога. */
+function fresh(path: string, owner: LockOwner): boolean {
+  const takenAt = owner.startedAt ? Date.parse(owner.startedAt) : Number.NaN;
+  if (!Number.isNaN(takenAt)) return Date.now() - takenAt < STALE_MS;
+  try {
+    return Date.now() - statSync(path).mtimeMs < STALE_MS;
+  } catch {
+    return true; // A lock that cannot be read is not one to walk over.
+  }
 }
 
 /** Write down who holds the lock; only that process may drop it again. */
@@ -819,19 +834,21 @@ export function adoptUpdateLock(dataDir: string): UpdateLock {
 
 /**
  * Whether a lock that exists still counts. A lock whose owner is gone is stale at
- * once - a SIGKILLed update must not block the retry cleaning up after it - and
- * age is only the fallback for an owner that cannot be read.
+ * once - a SIGKILLed update must not block the retry cleaning up after it.
+ *
+ * Одного `kill(pid, 0)` мало: после перезагрузки тот же номер носит чужой процесс, и
+ * замок оборванного обновления держал бы установку вечно - `iva update` отвечал бы
+ * «Обновление уже идёт», повтор моста и repair.sh упирались бы в него, а лечилось бы
+ * это удалением `data/update.lock` руками. Поэтому у живого pid сверяется команда,
+ * которую владелец записал. Замок старого формата команды не несёт - его, как и
+ * нечитаемого владельца, судит возраст.
  */
 function held(path: string): boolean {
   const owner = ownerOf(path);
-  if (alive(owner)) return true;
-  if (owner.pid !== undefined) return false;
-  // No readable owner: age is all that is left to tell live from abandoned.
-  try {
-    return Date.now() - statSync(path).mtimeMs < STALE_MS;
-  } catch {
-    return true; // A lock that cannot be read is not one to walk over.
-  }
+  if (owner.pid === undefined) return fresh(path, owner);
+  if (!pidAlive(owner.pid)) return false;
+  if (owner.command === undefined) return fresh(path, owner);
+  return sameCommand({ ...owner, command: owner.command });
 }
 
 /**

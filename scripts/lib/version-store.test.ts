@@ -1280,3 +1280,40 @@ test("an update lock held by a live owner is not taken over", (t) => {
   mine?.release();
   assert.equal(updateRunning(data), false);
 });
+
+/**
+ * Замок старого формата - без записанной команды - судится возрастом: полугодовалый
+ * `owner.json` с pid, который сейчас носит системный процесс, не держит обновление.
+ * Именно эта комбинация блокировала установку насмерть (проба критика 13.09.2026).
+ */
+test("an update lock older than an hour with no command recorded is stale", (t) => {
+  const data = home(t);
+  const lock = join(data, "update.lock");
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(
+    join(lock, "owner.json"),
+    `${JSON.stringify({
+      pid: 1,
+      startedAt: new Date(Date.now() - 180 * 24 * 3600_000).toISOString(),
+    })}\n`,
+  );
+
+  assert.equal(updateRunning(data), false);
+  const taken = acquireUpdateLock(data);
+  assert.ok(taken, "a lock nobody has held for half a year must be free");
+  taken?.release();
+});
+
+/** А свежий замок того же старого формата - чужая работа, его не забирают. */
+test("a fresh update lock with no command recorded still counts", (t) => {
+  const data = home(t);
+  const lock = join(data, "update.lock");
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(
+    join(lock, "owner.json"),
+    `${JSON.stringify({ pid: 1, startedAt: new Date().toISOString() })}\n`,
+  );
+
+  assert.equal(updateRunning(data), true);
+  assert.equal(acquireUpdateLock(data), null);
+});
