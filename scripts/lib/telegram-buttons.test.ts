@@ -41,7 +41,7 @@ void test("classic: a tag without data or label yields no keyboard, text survive
   assert.match(screen.text, /текст/);
 });
 
-void test("blockButtons: «button — explanation» becomes a full-width row over a paragraph; a row of two is left alone", () => {
+void test("blockButtons: a lone «button — explanation» becomes a row over its paragraph; an explicit row is left alone", () => {
   const one = `${button("A", "a")} — что делает.`;
   assert.equal(
     blockButtons(one),
@@ -49,6 +49,43 @@ void test("blockButtons: «button — explanation» becomes a full-width row ove
   );
   const two = buttonRow([button("A", "a"), button("B", "b")]);
   assert.equal(blockButtons(two), two);
+});
+
+void test("two per row: consecutive button lines pair up in both renders, a styled button stays alone", () => {
+  const md = [
+    "# Меню",
+    "",
+    `${button("🧠 Модель", "m")} — провайдер и ключ.`,
+    "",
+    `${button("🩺 Доктор", "d")} — проверить установку.`,
+    "",
+    `${button("💾 Память", "p")} — что помнит.`,
+    "",
+    `${button("✖ Закрыть", "x", "danger")} — убрать меню.`,
+  ].join("\n");
+  const classic = classicScreen(md);
+  assert.deepEqual(
+    classic.reply_markup?.inline_keyboard.map((row) => row.map((b) => b.text)),
+    [["🧠 Модель", "🩺 Доктор"], ["💾 Память"], ["✖ Закрыть"]],
+  );
+  assert.match(
+    classic.text,
+    /🧠 Модель — провайдер и ключ\.\n🩺 Доктор — проверить установку\./,
+  );
+  const rich = blockButtons(md);
+  assert.equal(
+    rich.split("\n").filter((l) => l.startsWith("<tg-button-row")).length,
+    3,
+  );
+  assert.match(
+    rich,
+    /<tg-button-row>.*data="m".*data="d".*<\/tg-button-row>\n🧠 Модель — провайдер и ключ\. {2}\n🩺 Доктор — проверить установку\.\n\n<tg-button-row>/,
+  );
+  // Одиночная кнопка в ряду: подпись без повтора её имени, как раньше.
+  assert.match(
+    rich,
+    /<tg-button-row>.*data="p".*<\/tg-button-row>\nчто помнит\./,
+  );
 });
 
 void test("screenPayload: rich only when settings.json says so, classic otherwise", () => {

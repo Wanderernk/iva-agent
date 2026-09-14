@@ -104,11 +104,81 @@ function classicLine(line: string): string {
     .trimEnd();
 }
 
+/** Строка «кнопка — пояснение»: ровно один тег в начале, остальное - пояснение. */
+type Item = { tag: string; attrs: string; label: string; rest: string };
+
+const ITEM_RE =
+  /^(<tg-button(?=[\s>])([^>]*)>([\s\S]*?)<\/tg-button>)[ \t]*(?:[—–-][ \t]*)?(.*)$/i;
+
+function itemOf(line: string): Item | null {
+  const m = ITEM_RE.exec(line);
+  if (!m || BUTTON_RE.test(line.slice(m[1].length))) return null;
+  BUTTON_RE.lastIndex = 0;
+  return { tag: m[1], attrs: m[2], label: m[3], rest: m[4].trim() };
+}
+
+/** Кнопка со стилем стоит одна в ряду: «Закрыть» и «Обновить» не соседствуют с разделами. */
+const alone = (item: Item): boolean => /\bstyle="/i.test(item.attrs);
+
+/**
+ * Раскладка экрана: подряд идущие строки «кнопка — пояснение» собираются по две в ряд, как
+ * в меню до 0.4.2 (решение владельца 14.09.2026: «в две строки, не одна длинная»). Пустые
+ * строки между такими строками ряд не рвут. Всё остальное - как есть.
+ */
+function layout(markdown: string): (string | Item[])[] {
+  const out: (string | Item[])[] = [];
+  let run: Item[] = [];
+  let pending: string[] = [];
+  const flush = () => {
+    for (let i = 0; i < run.length;) {
+      if (alone(run[i]) || i + 1 >= run.length || alone(run[i + 1])) {
+        out.push([run[i]]);
+        i += 1;
+      } else {
+        out.push([run[i], run[i + 1]]);
+        i += 2;
+      }
+    }
+    run = [];
+  };
+  for (const raw of markdown.split("\n")) {
+    const line = raw.trim();
+    const item = line ? itemOf(line) : null;
+    if (item) {
+      run.push(item);
+      pending = [];
+      continue;
+    }
+    if (!line && run.length) {
+      pending.push(line);
+      continue;
+    }
+    flush();
+    out.push(...pending, line);
+    pending = [];
+  }
+  flush();
+  out.push(...pending);
+  return out;
+}
+
 export function classicScreen(markdown: string): ClassicScreen {
   const rows: ClassicButton[][] = [];
   const text: string[] = [];
-  for (const raw of markdown.split("\n")) {
-    const line = raw.trim();
+  for (const entry of layout(markdown)) {
+    if (typeof entry !== "string") {
+      const row = entry
+        .map((item) => classicButton(item.attrs, item.label))
+        .filter((b): b is ClassicButton => b !== null);
+      if (row.length) rows.push(row);
+      for (const item of entry) {
+        const b = classicButton(item.attrs, item.label);
+        const rest = classicLine(item.rest);
+        if (rest) text.push(b ? `${b.text} — ${rest}` : rest);
+      }
+      continue;
+    }
+    const line = entry;
     if (!line) {
       text.push("");
       continue;
@@ -121,17 +191,13 @@ export function classicScreen(markdown: string): ClassicScreen {
       continue;
     }
     if (/^<tg-button(?=[\s>])/i.test(line)) {
+      // Несколько тегов в одной строке: каждый своим рядом, текст между ними в подпись.
       const buttons = [...line.matchAll(BUTTON_RE)]
         .map((m) => classicButton(m[1], m[2]))
         .filter((b): b is ClassicButton => b !== null);
       for (const b of buttons) rows.push([b]);
-      const rest = classicLine(line.replace(BUTTON_RE, "")).replace(
-        /^\s*[—–-]\s*/,
-        "",
-      );
-      if (rest && buttons.length === 1)
-        text.push(`${buttons[0].text} — ${rest}`);
-      else if (rest) text.push(rest);
+      const rest = classicLine(line.replace(BUTTON_RE, ""));
+      if (rest) text.push(rest);
       continue;
     }
     if (/^\|.*\|$/.test(line)) {
@@ -228,16 +294,38 @@ export function escapeRichText(s: string): string {
  * Кнопка в строке текста (RichTextButton) на Android-клиентах лета 2026 рисуется криво:
  * подпись уезжает под пилюлю (скриншот пользователя 13.09.2026). Ряд-блок
  * (<tg-button-row>, RichBlockButtons) рендерится всеми клиентами одинаково, поэтому перед
- * отправкой каждая строка вида «<tg-button…>Подпись</tg-button> — пояснение» становится
- * рядом-блоком из одной кнопки на всю ширину и абзацем пояснения под ним. Строки, где
- * кнопка стоит не первой или их несколько, не трогаем. Решение владельца 13.09.2026.
+ * отправкой строки вида «<tg-button…>Подпись</tg-button> — пояснение» становятся
+ * рядами-блоками по две кнопки (компактные пилюли, не на всю ширину) и строками
+ * пояснений под рядом. Строки, где кнопка стоит не первой или их несколько, не трогаем.
+ * Решения владельца 13.09 и 14.09.2026.
  */
 export function blockButtons(markdown: string): string {
-  return markdown.replace(
-    /^(<tg-button(?=[\s>])[^>]*>[\s\S]*?<\/tg-button>)[ \t]*(?:[—–-][ \t]*)?(.*)$/gm,
-    (_m, tag: string, rest: string) =>
-      rest.trim() ? `${buttonRow([tag])}\n${rest.trim()}` : buttonRow([tag]),
-  );
+  const out: string[] = [];
+  for (const entry of layout(markdown)) {
+    if (typeof entry === "string") {
+      out.push(entry);
+      continue;
+    }
+    // Ряд из двух коротких кнопок, под ним подписи «кнопка — пояснение» по строке на
+    // каждую: пилюли компактные, текст рядом не переносится, Android рисует ряд ровно.
+    out.push(buttonRow(entry.map((item) => item.tag)));
+    const captions = entry
+      .filter((item) => item.rest)
+      .map((item) => {
+        const label = item.label.replace(/<[^>]+>/g, "").trim();
+        return entry.length > 1 && label
+          ? `${label} — ${item.rest}`
+          : item.rest;
+      });
+    // Две подписи - две строки одного абзаца (два пробела = перенос в rich markdown),
+    // и пустая строка после группы, чтобы следующий ряд не слипся с подписями.
+    if (captions.length) out.push(captions.join("  \n"));
+    out.push("");
+  }
+  return out
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /**
