@@ -316,6 +316,61 @@ test("the /update button leaves the lock to the update it launches", async (t) =
   assert.equal(readdirSync(jobs).length, 2);
 });
 
+test("/update --force starts a rebuild of the running version without asking upstream", async (t) => {
+  const jobs = join(dataDir, "update-jobs");
+  rmSync(jobs, { recursive: true, force: true });
+  const bin = join(dataDir, "bin-force");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "systemd-run"), "#!/bin/sh\nexit 0\n", {
+    mode: 0o755,
+  });
+  t.after(() => {
+    for (const path of [jobs, bin])
+      rmSync(path, { recursive: true, force: true });
+  });
+  const texts: string[] = [];
+  let inspected = 0;
+  const previousFetch = mutableGlobal.fetch;
+  const previousPath = process.env.PATH;
+  mutableGlobal.fetch = (_url, init) => {
+    const body = JSON.parse(init.body ?? "{}") as {
+      text?: unknown;
+      rich_message?: { markdown?: unknown };
+    };
+    const text = screenText(body);
+    if (text) texts.push(text);
+    return Promise.resolve({
+      json: () => Promise.resolve({ ok: true, result: { message_id: 10 } }),
+    });
+  };
+  process.env.PATH = bin;
+  try {
+    assert.equal(
+      await handleUpdateCheck(1, {
+        force: true,
+        inspectImpl: () => {
+          inspected += 1;
+          return Promise.reject(new Error("must not be asked"));
+        },
+        markNotifiedImpl: () => Promise.resolve(),
+        envImpl: () => Promise.resolve({}),
+      }),
+      true,
+    );
+  } finally {
+    mutableGlobal.fetch = previousFetch;
+    process.env.PATH = previousPath;
+  }
+  assert.equal(inspected, 0);
+  assert.match(texts[0] ?? "", /Rebuilding the current version/u);
+  assert.match(texts.at(-1) ?? "", /Starting the update/u);
+  const [name] = readdirSync(jobs);
+  const job = JSON.parse(readFileSync(join(jobs, name), "utf8")) as {
+    force?: unknown;
+  };
+  assert.equal(job.force, true, "the flag travels in the job file");
+});
+
 /** git in a directory, with an identity, so a commit needs no ambient config. */
 function git(cwd: string, args: readonly string[]): string {
   return execFileSync("git", [...args], {

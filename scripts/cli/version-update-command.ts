@@ -185,6 +185,15 @@ export async function resolveTarget(
   return { sha, version };
 }
 
+/** The job file of a `/update --force` from the chat carries the flag. */
+function jobAsksForce(job: unknown): boolean {
+  return (
+    typeof job === "object" &&
+    job !== null &&
+    (job as { force?: unknown }).force === true
+  );
+}
+
 /**
  * `iva update` on the immutable layout. This half only fetches and unpacks the new
  * version; it continues inside that version's own `scripts/update-finish.ts`, so
@@ -207,9 +216,6 @@ export function createVersionUpdateCommand(
     { requirePlugins = false }: { readonly requirePlugins?: boolean } = {},
   ): Promise<UpdateOutcome | null> {
     const verbose = args.includes("--verbose");
-    // Decided here and never travelling: a build of this release already on disk
-    // may not be reused.
-    const force = args.includes("--force");
     const jobAt = args.indexOf("--telegram-job");
     const env = runtime.readEnv();
     const language = env.AGENT_LANGUAGE || process.env.AGENT_LANGUAGE;
@@ -219,6 +225,10 @@ export function createVersionUpdateCommand(
       runtime.dataDirAbs(env),
       jobAt >= 0 ? (args[jobAt + 1] ?? "") : "",
     );
+    // Decided here and never travelling: a build of this release already on disk
+    // may not be reused. `/update --force` from the chat writes the flag into its
+    // job, so the retry of an interrupted run rebuilds too.
+    const force = args.includes("--force") || jobAsksForce(job?.job);
     const reporter = job
       ? reporterFor(job.job, env.TELEGRAM_BOT_TOKEN, env)
       : null;

@@ -628,7 +628,9 @@ async function handleControl(
   }
   // /update — check upstream; if newer, offer inline Update/Skip buttons. Out-of-band.
   if (cmd === "/update") {
-    return handleUpdateCheck(chatId);
+    return handleUpdateCheck(chatId, {
+      force: text.split(/\s+/).includes("--force"),
+    });
   }
   // /model, /think — provider/model/effort wizard (writes .env; applied on restart).
   if (cmd === "/model") {

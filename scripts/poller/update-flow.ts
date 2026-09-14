@@ -39,6 +39,8 @@ type UpdateCheckOptions = {
   }) => Promise<UpdateInfo>;
   markNotifiedImpl?: (dataDir: string, version: string) => Promise<void>;
   envImpl?: () => Promise<NodeJS.ProcessEnv>;
+  /** `/update --force`: rebuild the release that runs, with no question to upstream. */
+  force?: boolean;
 };
 type TelegramMessage = { message_id: number };
 type UpdateCallbackQuery = {
@@ -119,13 +121,19 @@ export async function handleUpdateCheck(
     inspectImpl = inspectUpstream,
     markNotifiedImpl = markVersionNotified,
     envImpl = () => readEnvFresh(ENV_PATH),
+    force = false,
   }: UpdateCheckOptions = {},
 ): Promise<boolean> {
   const status = (await reply(
     chatId,
-    tr("◇ Checking for updates", "◇ Проверяю обновления"),
+    force
+      ? tr("◇ Rebuilding the current version", "◇ Пересобираю текущую версию")
+      : tr("◇ Checking for updates", "◇ Проверяю обновления"),
   )) as TelegramMessage | null;
   if (!status || typeof status.message_id !== "number") return false;
+  // The same rebuild `iva update --force` does on the server, asked from the chat: no
+  // question to upstream, no offer to tap - the word was the confirmation.
+  if (force) return startSelfUpdate(chatId, status.message_id, { force });
   let info;
   try {
     // The same question the daily check asks, and on a converted installation the
@@ -261,6 +269,19 @@ export async function handleUpdateCallback(
     );
     return messageEditSucceeded(edited);
   }
+  return startSelfUpdate(chatId as string | number, messageId as number);
+}
+
+/**
+ * One update job, from the file the updater reports to, to the launch. The button
+ * and `/update --force` end here; `force` travels in the job file, not on the command
+ * line, so the retry after an interruption rebuilds exactly what was asked.
+ */
+async function startSelfUpdate(
+  chatId: string | number,
+  messageId: number,
+  { force = false }: { force?: boolean } = {},
+): Promise<boolean> {
   const jobId = randomBytes(8).toString("hex");
   // Asked, never taken: the updater this launches owns the lock from end to end.
   // A lock claimed here on its behalf would outlive the launch - this bridge does
@@ -268,8 +289,8 @@ export async function handleUpdateCallback(
   // one tap would answer "already running" to every update after it.
   if (updateRunning(DATA_DIR)) {
     const edited = await edit(
-      chatId as string | number,
-      messageId as number,
+      chatId,
+      messageId,
       tr("⚠️ An update is already running", "⚠️ Обновление уже идёт"),
     );
     return messageEditSucceeded(edited);
@@ -289,12 +310,13 @@ export async function handleUpdateCallback(
       locale: getLang(),
       startedAt: new Date().toISOString(),
       ...(currentAtStart ? { currentAtStart } : {}),
+      ...(force ? { force: true } : {}),
     }),
     { mode: 0o600 },
   );
   await edit(
-    chatId as string | number,
-    messageId as number,
+    chatId,
+    messageId,
     tr("◇ Starting the update", "◇ Запускаю обновление"),
   );
   const r = await launchSelfUpdate(jobId);
@@ -305,8 +327,8 @@ export async function handleUpdateCallback(
     const reason = r.msg.split("\n")[0].slice(0, 200);
     log("self-update launch failed:", r.msg || "(no output)");
     const failureNotice = await edit(
-      chatId as string | number,
-      messageId as number,
+      chatId,
+      messageId,
       `${tr("⚠️ Couldn't start the update", "⚠️ Не удалось запустить обновление")}${reason ? `\n\n${reason}` : ""}\n\n${tr("Run on the server: iva update", "Запустите на сервере: iva update")}`,
     );
     return messageEditSucceeded(failureNotice);

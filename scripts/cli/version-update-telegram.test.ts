@@ -265,6 +265,26 @@ test("an update that is already current answers and drops its job", async (t) =>
   assert.deepEqual(readdirSync(dirname(iva.jobPath)), []);
 });
 
+test("a job that carries force rebuilds the version that already runs", async (t) => {
+  const iva = world(t);
+  await iva.run();
+  const builtOnce = iva.lines().filter((line) => /Building Iva/u.test(line));
+  rmSync(iva.jobPath, { force: true });
+  writeFileSync(
+    iva.jobPath,
+    JSON.stringify({ chatId: 1, messageId: 101, locale: "en", force: true }),
+    { mode: 0o600 },
+  );
+
+  await iva.run();
+
+  // `/update --force` from the chat: the flag is in the job, not on the command
+  // line, and the second run builds again instead of answering "current".
+  const builtTwice = iva.lines().filter((line) => /Building Iva/u.test(line));
+  assert.equal(builtOnce.length, 1, iva.lines().join("\n"));
+  assert.equal(builtTwice.length, 2, iva.lines().join("\n"));
+});
+
 test("a failed update reports the failure and drops its job", async (t) => {
   const iva = world(t);
 
