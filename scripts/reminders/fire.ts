@@ -85,7 +85,13 @@ export async function runReminderFire(
 
   const tz = resolveTimeZone(env.ASSISTANT_TIMEZONE);
   const token = String(env.TELEGRAM_BOT_TOKEN ?? "").trim();
-  const chat = (dependencies.chat ?? notificationChat)(env);
+  // Куда: чат и тема, где напоминание попросили; строка без чата (старая схема, запрос не
+  // из Telegram) - чат владельца из настроек, как раньше.
+  const fallback = (dependencies.chat ?? notificationChat)(env);
+  const target =
+    row.chat ?? (fallback ? { id: fallback, threadId: null } : null);
+  const chat = target?.id ?? null;
+  const threadId = target?.threadId ?? undefined;
   const tr = await (dependencies.translator ?? noticeTranslator)(env);
 
   /** Итог ветки отправки для ветки агента: ушёл ли текст и записался ли факт. */
@@ -128,6 +134,7 @@ export async function runReminderFire(
     }
     const result = await send(token, chat, row.text, {
       retryTransient: true,
+      threadId,
       trace: { source: "reminder" },
     });
     const recorded = await recordFact({
@@ -211,6 +218,7 @@ export async function runReminderFire(
     }
     const result = await send(token, chat, reply, {
       retryTransient: true,
+      threadId,
       trace: { source: "reminder" },
     });
     if (!result.ok) {

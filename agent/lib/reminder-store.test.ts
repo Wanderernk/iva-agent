@@ -51,6 +51,7 @@ function row(over: Partial<Reminder> & { id: string }): Reminder {
   return {
     id: over.id,
     text: over.text ?? `напоминание ${over.id}`,
+    chat: over.chat ?? null,
     schedule: over.schedule ?? { kind: "at", atMs: over.nextRunAtMs ?? 1 },
     nextRunAtMs: over.nextRunAtMs ?? 1,
     createdAt: over.createdAt ?? 1,
@@ -175,6 +176,42 @@ test("повторяющаяся строка сама уезжает на сл�
   assert.deepEqual(
     nextFire.map((r) => r.id),
     ["cron"],
+  );
+});
+
+test("строка помнит чат и тему, а строка без поля чата читается с chat = null", async () => {
+  await add({
+    id: "topic",
+    text: "в теме",
+    chat: { id: "-100123", threadId: "835397" },
+    schedule: { kind: "at", atMs: 5 },
+  });
+  const [stored] = await list();
+  assert.deepEqual(stored?.chat, { id: "-100123", threadId: "835397" });
+
+  // Таблица, записанная до появления поля: ключа chat в строке нет вовсе.
+  const legacy = row({ id: "old", nextRunAtMs: 6 }) as unknown as Record<
+    string,
+    unknown
+  >;
+  delete legacy.chat;
+  await saveJsonAtomic(reminderFile(), {
+    schemaVersion: REMINDER_SCHEMA_VERSION,
+    rows: [legacy],
+  });
+  const [read] = await list();
+  assert.equal(read?.id, "old");
+  assert.equal(read?.chat, null);
+
+  // Кривой чат - ошибка строки, не тихий null.
+  await assert.rejects(
+    add({
+      id: "bad",
+      text: "x",
+      chat: { id: "", threadId: null },
+      schedule: { kind: "at", atMs: 7 },
+    }),
+    ReminderStoreError,
   );
 });
 

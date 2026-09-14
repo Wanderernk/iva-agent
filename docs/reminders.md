@@ -29,7 +29,7 @@ Everything is read in your timezone — the one Iva is configured with, not the 
 
 Two things at once, and neither waits for the other:
 
-- the code sends your text to the owner chat exactly as you dictated it — no model involved, so it works even when the model provider is down;
+- the code sends your text back to the chat and topic where you asked for it, exactly as you dictated it — no model involved, so it works even when the model provider is down;
 - Iva wakes up, checks the delivery with the reminder tool, and if the text did not go out she writes the message herself and says what broke.
 
 Nothing repeats. A row fires once: the moment it fires it is marked, and a repeating row moves on to its next time. There is no retry ladder, no window that removes a reminder hours later, and no warning per failure — the fact of the firing stays with the row: `fired_at`, `delivered` and the reason in `error`.
@@ -52,7 +52,7 @@ She used to be able to build her own timer: a transient system unit, a `crontab`
 
 ## Limits
 
-- **Owner chat only.** Other recipients — a forum topic, another person — are not supported.
+- **Back to where you asked.** A reminder returns to the chat and forum topic it was created in; another person as the recipient is not supported. Reminders created before 0.4.4 go to the owner chat from the settings.
 - **No more often than every ten minutes.** A repeating schedule tighter than that is refused: that is a monitoring job, not a reminder.
 - **Your timezone, one of them.** Everything is computed in the timezone Iva is configured with.
 - **A reminder is a message, not a task.** It fires and it is done (or, if repeating, moves to the next occurrence).

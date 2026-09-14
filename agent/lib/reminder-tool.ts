@@ -1,6 +1,6 @@
 // Общее для действий тула напоминаний: строка напоминания для модели и признак того, что
 // диспетчер жив. Читает таблицу и пульс тика, ничего не решает сам.
-import type { Reminder } from "./reminder-store.ts";
+import type { Reminder, ReminderChat } from "./reminder-store.ts";
 import { readTickPulse, REMINDER_TICK_STALE_MS } from "./reminder-tick.ts";
 import { formatZoned } from "./zoned-time.ts";
 
@@ -16,6 +16,31 @@ export interface ReminderView {
   /** Дошёл ли текст до чата: true/false, null — факта ещё нет. */
   readonly delivered: boolean | null;
   readonly error: string | null;
+}
+
+/**
+ * Чат и тема текущего хода из auth-контекста eve: мост Telegram кладёт их в атрибуты
+ * (`chat_id`, `message_thread_id`, agent/lib/telegram-inbound.ts). Ход не из Telegram
+ * (CLI, расписание) - null: тогда напоминание идёт в чат владельца из настроек.
+ */
+export function chatOfTurn(ctx: {
+  readonly session?: {
+    readonly auth?: {
+      readonly current?: { readonly attributes?: unknown } | null;
+    };
+  };
+}): ReminderChat | null {
+  const attributes = ctx.session?.auth?.current?.attributes;
+  if (attributes === null || typeof attributes !== "object") return null;
+  const { chat_id: id, message_thread_id: thread } = attributes as Record<
+    string,
+    unknown
+  >;
+  if (typeof id !== "string" || id.trim() === "") return null;
+  return {
+    id,
+    threadId: typeof thread === "string" && thread !== "" ? thread : null,
+  };
 }
 
 export function describeReminder(row: Reminder, tz: string): ReminderView {

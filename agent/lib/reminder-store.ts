@@ -31,9 +31,17 @@ export type ReminderStatus = "pending" | "fired";
 /** `at` — один точный срок; `cron` — повторяющееся расписание (cron-выражение пользователя). */
 export type ReminderSchedule =
   { kind: "at"; atMs: number } | { kind: "cron"; expr: string; tz: string };
+/** Куда возвращается напоминание: чат и тема, где его попросили. */
+export interface ReminderChat {
+  id: string;
+  threadId: string | null;
+}
+
 export interface Reminder {
   id: string;
   text: string;
+  /** null - строка старой схемы или запрос не из Telegram: тогда чат владельца из настроек. */
+  chat: ReminderChat | null;
   schedule: ReminderSchedule;
   nextRunAtMs: number;
   createdAt: number;
@@ -49,6 +57,7 @@ export interface Reminder {
 export type ReminderInput = {
   id: string;
   text: string;
+  chat?: ReminderChat | null;
   schedule: unknown;
   /** Обязателен для kind "cron", запрещён для kind "at". */
   nextRunAtMs?: number;
@@ -57,6 +66,7 @@ export type ReminderInput = {
 const ROW_KEYS = [
   "id",
   "text",
+  "chat",
   "schedule",
   "nextRunAtMs",
   "createdAt",
@@ -158,6 +168,27 @@ export function normalizeSchedule(input: unknown): ReminderSchedule {
 }
 
 /** Одна проверка формы строки и для add, и для загрузки файла. */
+/** Чат строки: null или {id, threadId}; чужая форма - ошибка строки, не тихий null. */
+function assertChat(
+  file: string,
+  idLabel: string,
+  value: unknown,
+): ReminderChat | null {
+  if (value === null || value === undefined) return null;
+  if (
+    !isPlainObject(value) ||
+    typeof value.id !== "string" ||
+    value.id.trim() === "" ||
+    (value.threadId !== null && typeof value.threadId !== "string")
+  )
+    badReminder(
+      file,
+      idLabel,
+      `chat must be null or {id, threadId}, got ${JSON.stringify(value)}`,
+    );
+  return { id: value.id, threadId: value.threadId };
+}
+
 function assertReminder(file: string, value: unknown): Reminder {
   if (!isPlainObject(value))
     fail(file, `reminder row must be an object, got ${JSON.stringify(value)}`);
@@ -237,6 +268,8 @@ function assertReminder(file: string, value: unknown): Reminder {
   return {
     id,
     text: value.text,
+    // Строки до этого поля чата не несут: им остаётся чат владельца из настроек.
+    chat: assertChat(file, idLabel, value.chat),
     schedule,
     nextRunAtMs: value.nextRunAtMs,
     createdAt: value.createdAt,
@@ -275,6 +308,7 @@ function migrateV1Row(
   return {
     id: value.id,
     text: value.text,
+    chat: null,
     schedule,
     nextRunAtMs: value.nextRunAtMs,
     createdAt: nowMs,
@@ -374,6 +408,7 @@ function buildReminder(
     if (
       key !== "id" &&
       key !== "text" &&
+      key !== "chat" &&
       key !== "schedule" &&
       key !== "nextRunAtMs"
     )
@@ -407,6 +442,7 @@ function buildReminder(
   return {
     id: input.id,
     text: input.text,
+    chat: assertChat(file, idLabel, input.chat ?? null),
     schedule,
     nextRunAtMs,
     createdAt: Date.now(),

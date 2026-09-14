@@ -13,8 +13,10 @@ import {
   normalizeSchedule,
   remove,
   type Reminder,
+  type ReminderChat,
 } from "../lib/reminder-store.ts";
 import {
+  chatOfTurn,
   describeReminder,
   schedulerStatus,
   toolFailure,
@@ -61,13 +63,15 @@ async function addReminder(
   { text, at, cron }: Input,
   tz: string,
   nowMs: number,
+  chat: ReminderChat | null,
 ): Promise<RemindAdded | RemindFailure> {
   if (text === undefined)
     return { ok: false as const, error: "action add needs text" };
   if ((at === undefined) === (cron === undefined))
     return { ok: false as const, error: "give exactly one of at or cron" };
-  const chatId = notificationChat(process.env);
-  if (!chatId)
+  // Напоминание возвращается туда, где его попросили (чат и тема хода). Без Telegram-хода
+  // остаётся чат владельца из настроек - и тогда он обязан быть.
+  if (chat === null && !notificationChat(process.env))
     return {
       ok: false as const,
       error:
@@ -84,6 +88,7 @@ async function addReminder(
     const row = await add({
       id,
       text,
+      chat,
       schedule: { kind: "at", atMs: resolveAt(at, nowMs, tz) },
     });
     return answer(row);
@@ -94,6 +99,7 @@ async function addReminder(
   const row = await add({
     id,
     text,
+    chat,
     schedule,
     nextRunAtMs: nextCronRunMs(schedule.expr, tz, nowMs),
   });
@@ -130,7 +136,7 @@ export default defineTool({
     'возвращает next_run_at, его и сообщи. list - {"action":"list"}: id, следующий срок, ' +
     "факт последнего срабатывания (fired_at, delivered, error) сутки после него. remove - " +
     '{"action":"remove","id":"r-1a2b3c"}, id только из list. Адресата не указывают: ' +
-    "приходит в чат владельца; в срок код сам пришлёт текст и разбудит тебя проверить " +
+    "приходит в тот чат и тему, где попросили; в срок код сам пришлёт текст и разбудит тебя проверить " +
     "доставку. Свой таймер шеллом (systemd-run, crontab, at, sleep, curl) запрещён и " +
     "заблокирован. scheduler.alive = false - скажи, что напоминание записано, но диспетчер " +
     "не работает.",
@@ -160,13 +166,13 @@ export default defineTool({
       ),
     id: z.string().min(1).optional().describe("remove: id из списка"),
   }),
-  async execute(input): Promise<RemindAnswer> {
+  async execute(input, ctx): Promise<RemindAnswer> {
     const tz = ownerTimeZone();
     const nowMs = Date.now();
     try {
       switch (input.action) {
         case "add":
-          return await addReminder(input, tz, nowMs);
+          return await addReminder(input, tz, nowMs, chatOfTurn(ctx));
         case "list":
           return await listReminders(tz, nowMs);
         case "remove":

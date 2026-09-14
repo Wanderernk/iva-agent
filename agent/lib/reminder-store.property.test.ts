@@ -43,6 +43,7 @@ function row(
   return {
     id,
     text: `напоминание ${id}`,
+    chat: null,
     schedule: { kind: "at", atMs: nextRunAtMs },
     nextRunAtMs,
     createdAt: nextRunAtMs,

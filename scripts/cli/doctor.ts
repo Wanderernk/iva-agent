@@ -915,7 +915,7 @@ function checkReminderPulse(
   ctx: DoctorContext,
   tick: ReminderTickModule,
 ): void {
-  const pulse = tick.readTickPulse();
+  const pulse = tick.readTickPulse(ctx.dataDirectory);
   if (pulse === null) {
     ctx.warn(
       "reminders: the dispatcher has not ticked yet — stored reminders will not fire (journalctl --user -u iva.service | grep reminders)",

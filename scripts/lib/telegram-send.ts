@@ -35,6 +35,8 @@ type PostAck = OutboxAck & {
 export type TelegramSendOptions = {
   readonly caption?: boolean;
   readonly retryTransient?: boolean;
+  /** Тема форума (message_thread_id), когда сообщение идёт в тему группы. */
+  readonly threadId?: string;
   readonly sleep?: Sleep;
   readonly fetchImpl?: FetchImpl;
   /**
@@ -197,6 +199,7 @@ export async function sendTelegramHtml(
   {
     caption = false,
     retryTransient = false,
+    threadId,
     sleep = realSleep,
     fetchImpl = fetch,
     trace,
@@ -205,7 +208,7 @@ export async function sendTelegramHtml(
   const transport = messageTransport(
     chat,
     poster(bot, retryTransient, fetchImpl, sleep),
-    {},
+    threadId ? { message_thread_id: threadId } : {},
   );
   try {
     const { ok, fellBack, error } = await traceOutbox(

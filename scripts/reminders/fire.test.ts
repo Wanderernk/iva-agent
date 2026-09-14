@@ -39,13 +39,19 @@ type SendCall = {
   readonly bot: string;
   readonly chat: string;
   readonly text: string;
+  readonly threadId?: string;
 };
 type SendAck = { ok: boolean; fellBack: boolean; error: string };
 
 function makeSend(script: readonly SendAck[] = []) {
   const calls: SendCall[] = [];
-  const send = (bot: string, chat: string, md: unknown): Promise<SendAck> => {
-    calls.push({ bot, chat, text: String(md) });
+  const send = (
+    bot: string,
+    chat: string,
+    md: unknown,
+    options?: { readonly threadId?: string },
+  ): Promise<SendAck> => {
+    calls.push({ bot, chat, text: String(md), threadId: options?.threadId });
     return Promise.resolve(
       script[calls.length - 1] ?? { ok: true, fellBack: false, error: "" },
     );
@@ -99,6 +105,28 @@ void test("обе ветки отработали: текст ушёл, аген
   assert.equal(row?.delivered, true);
   assert.equal(row?.error, null);
   assert.equal(row?.status, "fired");
+});
+
+void test("напоминание из темы группы возвращается в ту же тему, а не в чат владельца", async () => {
+  await add({
+    id: "t1",
+    text: "узнать задачи",
+    chat: { id: "-100777", threadId: "835397" },
+    schedule: { kind: "at", atMs: NOW },
+  });
+  const { fireDue } = await import("#lib/reminder-store.ts");
+  await fireDue(NOW, 10);
+  const { calls, send } = makeSend();
+
+  assert.equal(
+    await runReminderFire("t1", deps({ send, runTurn: turn("completed", "") })),
+    0,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].chat, "-100777");
+  assert.equal(calls[0].threadId, "835397");
+  const [row] = await list();
+  assert.equal(row?.delivered, true);
 });
 
 void test("отправка упала: delivered=false с причиной, агент всё равно разбужен", async () => {

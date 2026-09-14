@@ -35,8 +35,8 @@ export const REMINDER_TICK_STALE_MS = 3 * 60_000;
 /** Потолок ребёнка: ход агента останавливается на восьмой минуте, отправка — быстрее. */
 export const REMINDER_FIRE_TIMEOUT_MS = 10 * 60_000;
 
-export function tickPulseFile(): string {
-  return join(dataDir(), "reminders.tick");
+export function tickPulseFile(dir: string = dataDir()): string {
+  return join(dir, "reminders.tick");
 }
 
 /** Пульс: mtime — единственное, что важно; содержимое нужно человеку, читающему файл. */
@@ -44,10 +44,14 @@ export function touchTickPulse(nowMs: number): void {
   writeFileSync(tickPulseFile(), `${nowMs}\n`, { mode: 0o600 });
 }
 
-/** Когда тик бился в последний раз; null — файла нет, то есть тик ещё не проходил. */
-export function readTickPulse(): number | null {
+/**
+ * Когда тик бился в последний раз; null — файла нет, то есть тик ещё не проходил.
+ * Каталог данных - явный параметр для процессов, чей cwd не корень установки (doctor
+ * из diagnose.sh): иначе пульс искался не там и доктор врал «ещё не тикал» (14.09.2026).
+ */
+export function readTickPulse(dir?: string): number | null {
   try {
-    return statSync(tickPulseFile()).mtimeMs;
+    return statSync(tickPulseFile(dir)).mtimeMs;
   } catch {
     return null;
   }

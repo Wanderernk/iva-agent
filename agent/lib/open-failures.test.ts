@@ -40,6 +40,7 @@ function reminder(overrides: Partial<Reminder> = {}): Reminder {
   return {
     id: "r1",
     text: "позвонить",
+    chat: null,
     schedule: { kind: "cron", expr: "0 9 * * *", tz: "UTC" },
     nextRunAtMs: NOW,
     createdAt: NOW - 2 * HOUR,
