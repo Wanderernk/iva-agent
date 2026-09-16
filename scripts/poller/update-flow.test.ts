@@ -43,6 +43,7 @@ const { handleUpdateCallback, handleUpdateCheck, removeStaleUpdateJobs } =
         }>;
         markNotifiedImpl?: (dataDir: string, version: string) => Promise<void>;
         envImpl?: () => Promise<NodeJS.ProcessEnv>;
+        force?: boolean;
       },
     ) => Promise<boolean>;
     removeStaleUpdateJobs: () => Promise<void>;

@@ -664,8 +664,10 @@ function checkWorkflowStore(ctx: DoctorContext): void {
     const running = workflow.runs.running ?? 0;
     const report = `workflow store: ${formatWorkflowStore(workflow)}`;
     if (running > WORKFLOW_RUNNING_LIMIT) {
+      // The remedy is named here: without it the owner's agent reads «exceeds 5»,
+      // finds no way to cancel a run, and reports «no standard means» (16.09.2026).
       ctx.warn(
-        `${report} — running count ${running} exceeds ${WORKFLOW_RUNNING_LIMIT}`,
+        `${report} — running count ${running} exceeds ${WORKFLOW_RUNNING_LIMIT}; runs the agent no longer serves are stale, not live: iva reset quarantines them and restarts`,
       );
     } else {
       ctx.ok(report);

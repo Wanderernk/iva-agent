@@ -688,6 +688,50 @@ test("doctor keeps workflow counts when one run file is unreadable", async (t) =
   );
 });
 
+test("doctor names iva reset when stale running workflows pile up", async (t) => {
+  const root = await sandbox(t);
+  writeFileSync(join(root, ".env"), "present=true\n");
+  const store = join(root, ".eve", ".workflow-data");
+  mkdirSync(join(store, "runs"), { recursive: true });
+  for (let index = 0; index < 7; index++)
+    writeFileSync(
+      join(store, `runs/run-${index}.json`),
+      '{"status":"running"}',
+    );
+  const events: Array<[string, string]> = [];
+  const systemd = createSystemdControl({
+    run: () => ({ code: 1, out: "" }),
+  });
+  const runtime: CliRuntime = {
+    ...createCliRuntime(root),
+    UNIT_DIR: join(root, "units"),
+    SERVICES: [],
+    TIMERS: [],
+    C: NO_COLOR,
+    ok: (message) => events.push(["ok", message]),
+    warn: (message) => events.push(["warn", message]),
+    bad: (message) => events.push(["bad", message]),
+    readEnv: completeEnv,
+    dataDirAbs: () => join(root, "data"),
+    hasSystemd: () => true,
+    systemd,
+    cap: () => ({ code: 1, out: "", err: "" }),
+  };
+
+  await createDoctorCommand(runtime, lifecycle(), {
+    nodeVersion: "24.19.0",
+    log: () => undefined,
+    exit: () => undefined,
+  })();
+
+  const [line] = events.filter(([, message]) =>
+    message.startsWith("workflow store"),
+  );
+  assert.equal(line?.[0], "warn");
+  assert.match(line?.[1] ?? "", /running count 7 exceeds 5/u);
+  assert.match(line?.[1] ?? "", /iva reset/u);
+});
+
 test("doctor accepts a custom embedding endpoint for hybrid memory search", async (t) => {
   const root = await sandbox(t);
   writeFileSync(join(root, ".env"), "present=true\n");
