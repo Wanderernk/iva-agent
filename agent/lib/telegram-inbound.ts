@@ -692,6 +692,34 @@ export async function runTelegramInbound(
         ],
       });
     }
+    if (cmd === "/remind") {
+      appendDaily("[text]", cmdText);
+      await effects.startTyping();
+      return withPre({
+        auth: buildAuth(message),
+        context: [
+          rest
+            ? tr(`Set a reminder: ${rest}`, `Поставь напоминание: ${rest}`)
+            : tr(
+                "Ask what to remind about and when.",
+                "Спроси, о чём и когда напомнить.",
+              ),
+        ],
+      });
+    }
+    if (cmd === "/contacts") {
+      appendDaily("[text]", cmdText);
+      await effects.startTyping();
+      return withPre({
+        auth: buildAuth(message),
+        context: [
+          tr(
+            "Show my contacts (look through the contacts cards).",
+            "Покажи мои контакты (посмотри карточки контактов).",
+          ),
+        ],
+      });
+    }
     if (cmd === "/digest") {
       appendDaily("[text]", cmdText);
       await effects.startTyping();
