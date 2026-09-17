@@ -1,4 +1,5 @@
-import { writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [mode, dataDir, botId = "71020", guardDirectory, guardIdentity] =
@@ -12,7 +13,12 @@ process.env.ASSISTANT_DATA_DIR = dataDir;
 process.env.TELEGRAM_BOT_TOKEN = `${botId}:test-token`;
 if (mode === "write-on-signal") {
   process.on("SIGUSR1", () => {
-    writeFileSync(join(dataDir, "active-writer"), `${process.pid}\n`);
+    // The name appears only once the bytes are all there: the staging name is not the
+    // one the test looks for, and the rename is atomic inside the directory.
+    const writer = join(dataDir, "active-writer");
+    const staged = join(dataDir, `.active-writer.tmp-${randomUUID()}`);
+    writeFileSync(staged, `${process.pid}\n`);
+    renameSync(staged, writer);
   });
 }
 

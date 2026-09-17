@@ -166,3 +166,41 @@ test("инструкции не префиксуют vault/ пути, котор
     `read_file резолвит путь от корня vault — префикс vault/ даёт ENOENT:\n${offenders.join("\n")}`,
   );
 });
+
+// T24 v3: неверная настройка вольта — отказ ok:false с текстом резолвера, не исключение.
+test("тулы возвращают ok:false на пустом ASSISTANT_VAULT_DIR", async () => {
+  const previous = process.env.ASSISTANT_VAULT_DIR;
+  process.env.ASSISTANT_VAULT_DIR = "";
+  try {
+    const read = settled(
+      await readFileTool.execute(
+        { path: "CORE.md" },
+        testToolContext("read_file"),
+      ),
+    ) as { ok?: boolean; error?: string };
+    assert.equal(read.ok, false);
+    assert.match(String(read.error), /ASSISTANT_VAULT_DIR/);
+
+    // Существующий файл: только его карточный гард зовёт резолвер (новый путь — нет).
+    const write = settled(
+      await writeFile.execute(
+        { path: CARD, content: "x" },
+        testToolContext("write_file"),
+      ),
+    ) as { ok?: boolean; error?: string };
+    assert.equal(write.ok, false);
+    assert.match(String(write.error), /ASSISTANT_VAULT_DIR/);
+
+    const search = settled(
+      await memorySearch.execute(
+        { query: "Иван" },
+        testToolContext("memory_search"),
+      ),
+    ) as { ok?: boolean; error?: string };
+    assert.equal(search.ok, false);
+    assert.match(String(search.error), /ASSISTANT_VAULT_DIR/);
+  } finally {
+    if (previous === undefined) delete process.env.ASSISTANT_VAULT_DIR;
+    else process.env.ASSISTANT_VAULT_DIR = previous;
+  }
+});

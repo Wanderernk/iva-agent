@@ -392,6 +392,40 @@ test("turn.failed claims notification before an overlapping session.failed can p
   assert.equal(callsSince(before, "sendMessage").length, 1);
 });
 
+test("two failed turns of one session within a minute both post", async () => {
+  const chatId = "707";
+  const sessionId = "two-turns-session";
+  setChatStatus(chatKeyOf(chatId), {
+    status: "running",
+    sessionId,
+    turnId: "turn_0",
+  });
+  const before = apiCalls.length;
+
+  await emitTurnFailed(
+    {
+      code: "MODEL_CALL_FAILED",
+      details: { errorId: "err-1" },
+      message: "Upstream request failed",
+      sequence: 0,
+      turnId: "turn_0",
+    },
+    { chatId, sessionId },
+  );
+  await emitTurnFailed(
+    {
+      code: "MODEL_CALL_FAILED",
+      details: { errorId: "err-2" },
+      message: "Upstream request failed",
+      sequence: 1,
+      turnId: "turn_1",
+    },
+    { chatId, sessionId },
+  );
+
+  assert.equal(callsSince(before, "sendMessage").length, 2);
+});
+
 // Уведомление о сбое собирается из runtime-контента (текст провайдера, errorId), и до
 // Bot API оно доходит через шов канала (noticeSender). Планты — под generic_key и под
 // формат телеграм-токена; проверяем то, что реально ушло в теле запроса.

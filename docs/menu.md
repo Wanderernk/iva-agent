@@ -10,6 +10,7 @@ The menu lives in the long-poll bridge, not the agent. That has three consequenc
 ⚙️ Settings
 [🧠 Model]     [🤔 Thinking]
 [🔍 Search]    [🌐 Language]
+[💬 Rich replies] [🎤 Voice]
 [🎭 Character] [💾 Memory]
 [📡 Userbot]   [🔗 Google]
 [⏰ Timers]    [🔔 Notices]
@@ -32,6 +33,8 @@ Most changes take effect the moment you tap. A few reach into the running agent 
 | 💾 Memory                   | From Iva's next message — she distills your answers into `CORE.md`          |
 | 🧠 Model / 🤔 Thinking      | On restart — the wizard offers it                                           |
 | 🔍 Search (provider or key) | On restart — the tool reads keys from the environment                       |
+| 💬 Rich replies             | On restart — the mode is read as the agent starts                           |
+| 🎤 Voice (key or language)  | On restart — the transcriber reads both from the environment                |
 
 ## Language
 
@@ -79,6 +82,14 @@ While a prompt is waiting for a **secret**, nothing you send slips past to the m
 
 The **🔍 Search** screen lists the four providers — Tavily, Brave, Exa, Parallel — with a ✓ on the active `SEARCH_PROVIDER` and a 🔑/🔒 badge showing whether its key is present (a boolean; the key itself is never shown). Tap a provider that already has a key and the menu switches `SEARCH_PROVIDER` and offers a restart. Tap one without a key and you drop into key intake, with a link to where the key lives; on success the key and the provider are written together. **🔁 Change key** re-enters the current provider's key. Because `web_search` reads the environment, a provider or key change takes effect on the next `iva.service` restart — which the screen offers. Free tiers and the comparison table: [providers.md](providers.md).
 
+## Rich replies
+
+The **💬 Rich replies** screen is the switch for `TELEGRAM_RICH_REPLIES`. On **Auto** (the default) a reply carrying a table, a task list, a fold (`<details>`) or a block formula goes out as a Telegram rich message and renders natively; on **Plain text** every reply stays on the ordinary HTML/plain path. The menu, Stop and update buttons work either way — only a button Iva writes inside a reply needs the rich path, and on the plain path it reaches the chat as its literal tag. The mode is read as the agent starts, so the screen offers the same `iva.service` restart. A value in `.env` that is neither `auto` nor `never` stops the agent from starting; the screen names it and lets you pick one of the two.
+
+## Voice
+
+The **🎤 Voice** screen holds the Deepgram key that transcribes voice notes, video circles and audio files, plus the recognition language. It says whether `DEEPGRAM_API_KEY` is set (and that voice notes are not transcribed without it), and shows the current `DEEPGRAM_LANGUAGE`: **Auto** detects the language per message, while **Русский**, **English** and **Oʻzbek** pin a single one if auto-detection trips on your mix. **🔑 Set the key** takes the key in the next message and deletes it from the chat, exactly like the search key. Both values come from the environment, so the screen offers a restart. Free tier: [providers.md](providers.md).
+
 ## Userbot
 
 A status card built from the shared CLI/Telegram health probe plus the presence of your Telegram API credentials, then the next step in context:
@@ -102,7 +113,7 @@ The **🔗 Google** screen checks for `~/.config/gws/client_secret.json`. Missin
 
 Three read-only screens.
 
-- **⏰ Timers** — the `iva-*` (and `xfeed-daily`) systemd timers with their next run, plus the open-task count from `data/tasks.json`.
+- **⏰ Timers** — the eve schedule board with the last success of each in-process schedule, the nearest reminders with the dispatcher pulse, the `iva-*` (and `xfeed-daily`) systemd timers with their next run, and the open-task count from `data/tasks.json`.
 - **🧩 Skills** — every installed skill with a one-line description, paged.
 - **📊 Status** — one card: version, provider · model · thinking, search provider and key badge, language, userbot state, Google, and today's token usage (the same figure as `/usage`). **🔄 Refresh** re-reads everything. Thinking levels are selectable for OpenAI subscriptions and for the OpenAI-compatible Ollama Cloud and OpenCode Go APIs; the latter expose the common `low` / `medium` / `high` contract.
 

@@ -182,6 +182,203 @@ test("every brain alert goes through the throttle and carries both locales", () 
   assert.match(source, /Supersede пропустил нечитаемые карточки\./u);
 });
 
+// Щель B-6: отчёт-не-объект шаг уже валит, а запись ЧУЖОЙ формы внутри списка
+// отфильтровывалась в ноль — шаг зелёный, алерт гасится, владелец ничего не узнаёт.
+// Сегодня supersede.py эмитит ровно три причины, поэтому гвард стоит на границе разбора.
+for (const [what, entry, field] of [
+  [
+    "чужие имена полей",
+    { file: "cards/private-name.md", why: "нипочему" },
+    "path",
+  ],
+  ["нет пути", { reason: "read_error" }, "path"],
+  ["путь не строка", { path: 42, reason: "read_error" }, "path"],
+  [
+    "неизвестная причина",
+    { path: "cards/x.md", reason: "moon_phase" },
+    "reason",
+  ],
+  ["запись не объект", "cards/x.md", "is not an object"],
+] as const) {
+  test(`Supersede report entry with ${what} fails the step instead of counting zero`, (t) => {
+    const home = mkdtempSync(join(tmpdir(), "iva-supersede-shape-"));
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    const vault = join(home, "vault");
+    const dataDir = join(home, "data");
+    const bin = join(home, "bin");
+    mkdirSync(join(vault, "cards"), { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(vault, "CORE.md"), "# CORE\n");
+    writeFileSync(
+      join(vault, "cards", "ok.md"),
+      "---\ntype: note\n---\n\n# Ok\n\nfacts\n",
+    );
+
+    const uv = join(bin, "uv");
+    writeFileSync(
+      uv,
+      `#!/bin/sh
+/bin/mkdir -p .graph
+printf '%s\\n' '${JSON.stringify({ skipped: [entry] })}' > .graph/supersede-report.json
+exit 0
+`,
+    );
+    chmodSync(uv, 0o755);
+
+    const run = spawnSync(process.execPath, ["scripts/memory/brain.ts"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: {
+        PATH: bin,
+        ASSISTANT_VAULT_DIR: vault,
+        ASSISTANT_DATA_DIR: dataDir,
+        ASSISTANT_TIMEZONE: "UTC",
+        AGENT_LANGUAGE: "en",
+      },
+    });
+
+    assert.equal(run.status, 1, run.stderr);
+    assert.match(
+      run.stderr,
+      new RegExp(`supersede report entry 0 .*${field}`, "u"),
+      run.stderr,
+    );
+    // Шаг именно провален: он назван в общем алерте ночи, а не просто промолчал.
+    assert.match(
+      run.stderr,
+      /Nightly memory care failed at: [^.]*supersede/u,
+      run.stderr,
+    );
+    // Ноль пропущенных карточек больше не объявляется: шаг провален, а не чист.
+    assert.doesNotMatch(
+      run.stderr,
+      /Supersede skipped unreadable Cards\./u,
+      run.stderr,
+    );
+    // Путь карточки — данные владельца, в журнал он не идёт, как и у соседних проверок.
+    assert.doesNotMatch(run.stderr, /private-name/u, run.stderr);
+  });
+}
+
+test("a failed supersede step suppresses neither the missed Cards nor the fence alert", (t) => {
+  // Провальный шаг ничего не гасит: счёт пропущенных карточек заведомо неполон, значит и
+  // «эти карточки уже учтены» сказать нельзя — карточка с незакрытым фенсом обязана
+  // остаться в алерте фенса, иначе владелец про неё не узнает вовсе.
+  const home = mkdtempSync(join(tmpdir(), "iva-supersede-failed-skip-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const vault = join(home, "vault");
+  const dataDir = join(home, "data");
+  const bin = join(home, "bin");
+  mkdirSync(join(vault, "cards"), { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(vault, "CORE.md"), "# CORE\n");
+  writeFileSync(
+    join(vault, "cards", "unreadable.md"),
+    "---\ntype: note\n---\n```\nnever closed\n",
+  );
+
+  // Валидная запись (карточка с фенсом) плюс чужая: шаг провален, разбор неполон.
+  const skipped = [
+    { path: "cards/unreadable.md", reason: "malformed_frontmatter" },
+    { file: "cards/private-name.md", why: "нипочему" },
+  ];
+  const uv = join(bin, "uv");
+  writeFileSync(
+    uv,
+    `#!/bin/sh
+/bin/mkdir -p .graph
+printf '%s\\n' '${JSON.stringify({ skipped })}' > .graph/supersede-report.json
+exit 0
+`,
+  );
+  chmodSync(uv, 0o755);
+
+  const run = spawnSync(process.execPath, ["scripts/memory/brain.ts"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: {
+      PATH: bin,
+      ASSISTANT_VAULT_DIR: vault,
+      ASSISTANT_DATA_DIR: dataDir,
+      ASSISTANT_TIMEZONE: "UTC",
+      AGENT_LANGUAGE: "en",
+    },
+  });
+
+  assert.equal(run.status, 1, run.stderr);
+  assert.match(
+    run.stderr,
+    /Nightly memory care failed at: [^.]*supersede/u,
+    run.stderr,
+  );
+  // Алерта про пропущенные карточки нет: шаг провален, а не чист.
+  assert.doesNotMatch(
+    run.stderr,
+    /Supersede skipped unreadable Cards\./u,
+    run.stderr,
+  );
+  // Провальный шаг не гасит и алерт фенса: карточка из неполного списка остаётся в нём.
+  assert.match(
+    run.stderr,
+    /Cards with an unclosed ``` fence: 1\./u,
+    run.stderr,
+  );
+  assert.match(run.stderr, /cards\/unreadable\.md/u, run.stderr);
+  // Чужая запись в журнал не течёт.
+  assert.doesNotMatch(run.stderr, /private-name/u, run.stderr);
+});
+
+test("a reason that looks like a path is never printed in the journal", (t) => {
+  // Значение reason печатается, только если оно похоже на причину supersede.py
+  // (/^[a-z0-9_]{1,40}$/): чужой путь в журнал не уезжает.
+  const home = mkdtempSync(join(tmpdir(), "iva-supersede-reason-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const vault = join(home, "vault");
+  const dataDir = join(home, "data");
+  const bin = join(home, "bin");
+  mkdirSync(join(vault, "cards"), { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(vault, "CORE.md"), "# CORE\n");
+  writeFileSync(
+    join(vault, "cards", "ok.md"),
+    "---\ntype: note\n---\n\n# Ok\n\nfacts\n",
+  );
+
+  const uv = join(bin, "uv");
+  writeFileSync(
+    uv,
+    `#!/bin/sh
+/bin/mkdir -p .graph
+printf '%s\\n' '${JSON.stringify({ skipped: [{ path: "cards/x.md", reason: "../../etc/passwd" }] })}' > .graph/supersede-report.json
+exit 0
+`,
+  );
+  chmodSync(uv, 0o755);
+
+  const run = spawnSync(process.execPath, ["scripts/memory/brain.ts"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: {
+      PATH: bin,
+      ASSISTANT_VAULT_DIR: vault,
+      ASSISTANT_DATA_DIR: dataDir,
+      ASSISTANT_TIMEZONE: "UTC",
+      AGENT_LANGUAGE: "en",
+    },
+  });
+
+  assert.equal(run.status, 1, run.stderr);
+  assert.match(
+    run.stderr,
+    /supersede report entry 0 has an unknown "reason"/u,
+    run.stderr,
+  );
+  assert.doesNotMatch(run.stderr, /passwd/u, run.stderr);
+});
+
 test("Supersede skip report raises one actionable throttled Alert without Card data", (t) => {
   const home = mkdtempSync(join(tmpdir(), "iva-supersede-alert-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -285,6 +482,75 @@ exit 0
   );
 });
 
+test("nightly brain repairs title links before measuring health", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-brain-graph-fix-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const vault = join(home, "vault");
+  const dataDir = join(home, "data");
+  const bin = join(home, "bin");
+  mkdirSync(join(vault, "cards"), { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(vault, "CORE.md"), "# CORE\n");
+  writeFileSync(
+    join(vault, "cards", "dev-tools.md"),
+    "# Рубрика инструментов\n",
+  );
+  // Схема именно в vault: тогда шаг получает предсказуемый путь схемы.
+  writeFileSync(join(vault, "schema.json"), JSON.stringify({ node_types: {} }));
+
+  const callLog = join(home, "uv-calls.log");
+  const uv = join(bin, "uv");
+  writeFileSync(
+    uv,
+    `#!/bin/sh
+printf '%s\\n' "$*" >> '${callLog}'
+/bin/mkdir -p .graph
+printf '%s\\n' '${JSON.stringify({ skipped: [] })}' > .graph/supersede-report.json
+exit 0
+`,
+  );
+  chmodSync(uv, 0o755);
+
+  const result = spawnSync(process.execPath, ["scripts/memory/brain.ts"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: {
+      PATH: bin,
+      ASSISTANT_VAULT_DIR: vault,
+      ASSISTANT_DATA_DIR: dataDir,
+      ASSISTANT_TIMEZONE: "UTC",
+      AGENT_LANGUAGE: "en",
+    },
+  });
+
+  const calls = readFileSync(callLog, "utf8").split("\n").filter(Boolean);
+  const enforce = calls.findIndex((call) => call.includes("enforce.py"));
+  const fix = calls.findIndex((call) => call.includes("graph.py fix"));
+  const health = calls.findIndex((call) => call.includes("graph.py health"));
+  const detail = `${result.stdout}${result.stderr}`;
+  assert.notEqual(enforce, -1, detail);
+  assert.ok(fix !== -1, detail);
+  assert.notEqual(health, -1, detail);
+  assert.equal(
+    calls.filter((call) => call.includes("graph.py fix")).length,
+    1,
+    "graph.fix runs exactly once",
+  );
+  const fixCall = calls[fix];
+  assert.ok(fixCall, detail);
+  assert.match(fixCall, /--apply/u);
+  assert.match(fixCall, /--as-of \d{4}-\d{2}-\d{2}/u);
+  assert.ok(
+    fixCall.includes(join(vault, "schema.json")),
+    `graph.fix must carry the schema path, got: ${fixCall}`,
+  );
+  assert.ok(
+    enforce < fix && fix < health,
+    `expected enforce < graph.fix < graph.health, got: ${calls.join(" | ")}`,
+  );
+});
+
 // ── Установка со сломанным agent/ ────────────────────────────────────────────────────────
 // Brain копируется на «остров»: свой package.json без алиаса #lib и без каталога agent/.
 // loadCardTools() там падает, cards === null — то есть проверить размер ядра и просканировать
@@ -310,6 +576,7 @@ function runBrainWithoutTree(
   mkdirSync(join(island, "scripts/memory"), { recursive: true });
   mkdirSync(join(island, "scripts/lib"), { recursive: true });
   mkdirSync(join(island, "packages/data-dir"), { recursive: true });
+  mkdirSync(join(island, "packages/vault-dir"), { recursive: true });
   mkdirSync(join(island, "packages/timezone"), { recursive: true });
   writeFileSync(
     join(island, "package.json"),
@@ -326,6 +593,7 @@ function runBrainWithoutTree(
     "notice.ts",
     "notification-chat.ts",
     "timezone.ts",
+    "vault-boundary.ts",
   ])
     copyFileSync(
       join(ROOT, "scripts/lib", name),
@@ -340,6 +608,11 @@ function runBrainWithoutTree(
     copyFileSync(
       join(ROOT, "packages/timezone", name),
       join(island, "packages/timezone", name),
+    );
+  for (const name of ["index.ts", "package.json"])
+    copyFileSync(
+      join(ROOT, "packages/vault-dir", name),
+      join(island, "packages/vault-dir", name),
     );
 
   const vault = join(home, "vault");

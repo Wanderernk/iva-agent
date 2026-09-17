@@ -20,6 +20,8 @@ import {
   VERSION_DIRECTORY_PATTERN,
 } from "../../packages/data-dir/index.ts";
 import { parseEnvText } from "./env-file.ts";
+import { processCommand } from "./process-command.ts";
+import { resolveVaultDir } from "../../packages/vault-dir/index.ts";
 
 const INCOMPLETE = ".iva-incomplete";
 const SETTLED = "active.json";
@@ -112,7 +114,7 @@ export function layoutFor(home: string) {
     versions: join(home, "versions"),
     current: join(home, "current"),
     data: resolveDataDir(home, values.ASSISTANT_DATA_DIR),
-    vault: stateDir(home, values.ASSISTANT_VAULT_DIR, "vault"),
+    vault: resolveVaultDir(home, values.ASSISTANT_VAULT_DIR),
     env,
     // Already parsed to find the state directories; handed back so the updater does not
     // read and parse the same file again to check one more value.
@@ -156,7 +158,10 @@ function isoTimestamp(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
     return new Date(value).toISOString() === value;
-  } catch {
+  } catch (error) {
+    console.error(
+      `version-store: не смог разобрать timestamp ${JSON.stringify(value)}: ${String(error)}`,
+    );
     return false;
   }
 }
@@ -752,13 +757,28 @@ export function writeJson(
 
 export type UpdateLock = { readonly path: string; release(): void };
 
-function ownerPid(path: string): number | undefined {
-  const pid = readJson(join(path, "owner.json")).pid;
-  return typeof pid === "number" ? pid : undefined;
+type LockOwner = {
+  readonly pid?: number;
+  readonly command?: string;
+  readonly startedAt?: string;
+};
+
+function ownerOf(path: string): LockOwner {
+  const owner = readJson(join(path, "owner.json"));
+  return {
+    pid: typeof owner.pid === "number" ? owner.pid : undefined,
+    command: typeof owner.command === "string" ? owner.command : undefined,
+    startedAt:
+      typeof owner.startedAt === "string" ? owner.startedAt : undefined,
+  };
 }
 
-function alive(pid: number | undefined): boolean {
-  if (!pid) return false;
+function ownerPid(path: string): number | undefined {
+  return ownerOf(path).pid;
+}
+
+/** Живой ли процесс: EPERM - чужой пользователь, а не смерть. */
+function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -767,10 +787,34 @@ function alive(pid: number | undefined): boolean {
   }
 }
 
+/**
+ * Тот ли это процесс, что брал замок. Спросить команду не удалось (чужой пользователь,
+ * `ps` недоступен) - считаем, что тот: чужое обновление не перешагивают по догадке.
+ */
+function sameCommand(owner: LockOwner & { readonly command: string }): boolean {
+  const running = processCommand(owner.pid ?? 0).trim();
+  return running === "" || running === owner.command.trim();
+}
+
+/** Возраст замка: по времени его взятия, а если его нет - по mtime каталога. */
+function fresh(path: string, owner: LockOwner): boolean {
+  const takenAt = owner.startedAt ? Date.parse(owner.startedAt) : Number.NaN;
+  if (!Number.isNaN(takenAt)) return Date.now() - takenAt < STALE_MS;
+  try {
+    return Date.now() - statSync(path).mtimeMs < STALE_MS;
+  } catch {
+    return true; // A lock that cannot be read is not one to walk over.
+  }
+}
+
 /** Write down who holds the lock; only that process may drop it again. */
 function own(path: string): UpdateLock {
   const startedAt = new Date().toISOString();
-  writeJson(join(path, "owner.json"), { pid: process.pid, startedAt });
+  writeJson(join(path, "owner.json"), {
+    pid: process.pid,
+    startedAt,
+    command: processCommand(process.pid).trim(),
+  });
   return {
     path,
     // Never another process's lock: a handoff ends with the successor holding it.
@@ -790,19 +834,21 @@ export function adoptUpdateLock(dataDir: string): UpdateLock {
 
 /**
  * Whether a lock that exists still counts. A lock whose owner is gone is stale at
- * once - a SIGKILLed update must not block the retry cleaning up after it - and
- * age is only the fallback for an owner that cannot be read.
+ * once - a SIGKILLed update must not block the retry cleaning up after it.
+ *
+ * Одного `kill(pid, 0)` мало: после перезагрузки тот же номер носит чужой процесс, и
+ * замок оборванного обновления держал бы установку вечно - `iva update` отвечал бы
+ * «Обновление уже идёт», повтор моста и repair.sh упирались бы в него, а лечилось бы
+ * это удалением `data/update.lock` руками. Поэтому у живого pid сверяется команда,
+ * которую владелец записал. Замок старого формата команды не несёт - его, как и
+ * нечитаемого владельца, судит возраст.
  */
 function held(path: string): boolean {
-  const pid = ownerPid(path);
-  if (alive(pid)) return true;
-  if (pid !== undefined) return false;
-  // No readable owner: age is all that is left to tell live from abandoned.
-  try {
-    return Date.now() - statSync(path).mtimeMs < STALE_MS;
-  } catch {
-    return true; // A lock that cannot be read is not one to walk over.
-  }
+  const owner = ownerOf(path);
+  if (owner.pid === undefined) return fresh(path, owner);
+  if (!pidAlive(owner.pid)) return false;
+  if (owner.command === undefined) return fresh(path, owner);
+  return sameCommand({ ...owner, command: owner.command });
 }
 
 /**

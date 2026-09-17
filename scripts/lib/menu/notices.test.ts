@@ -19,13 +19,10 @@ const screen = loaded.default as Screen;
 
 after(() => rmSync(dataDir, { recursive: true, force: true }));
 
-type Button = { text: string; callback_data: string };
-type View = { text: string; rows: Button[][] };
+type View = { text: string };
 type MenuState = { page: number };
 type MenuContext = {
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screenId: string) => Button[];
   show: (state: MenuState, screenId: string) => Promise<void>;
 };
 type Screen = {
@@ -55,10 +52,6 @@ function readSettingsFile(): Record<string, unknown> {
 function makeContext(lang: string, redrawn: string[] = []): MenuContext {
   return {
     tr: (english, russian) => (lang === "ru" ? russian : english),
-    btn: (text, callbackData) => ({ text, callback_data: callbackData }),
-    backRow: (screenId) => [
-      { text: "Back", callback_data: `iva_menu:${screenId}:o` },
-    ],
     show: (_state, screenId) => {
       redrawn.push(screenId);
       return Promise.resolve();
@@ -66,8 +59,15 @@ function makeContext(lang: string, redrawn: string[] = []): MenuContext {
   };
 }
 
-const labels = (view: View) =>
-  view.rows.flat().map((button) => [button.text, button.callback_data]);
+// Кнопка — тег в markdown: подпись и data достаём из строки.
+const buttonsOf = (text: string): Array<[string, string]> =>
+  [
+    ...text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
+
+const labels = (view: View) => buttonsOf(view.text);
 
 test("both toggles render off on a fresh installation, in either language", () => {
   rmSync(settingsPath, { force: true });
@@ -81,7 +81,7 @@ test("both toggles render off on a fresh installation, in either language", () =
   assert.deepEqual(labels(russian), [
     ["○ Отчёты памяти", "iva_menu:ntc:set:rep:1"],
     ["○ Утренний дайджест", "iva_menu:ntc:set:dig:1"],
-    ["Back", "iva_menu:r:o"],
+    ["‹ Меню", "iva_menu:r:o"],
   ]);
 
   const english = screen.render({ page: 0 }, makeContext("en"));
@@ -90,7 +90,7 @@ test("both toggles render off on a fresh installation, in either language", () =
   assert.deepEqual(labels(english), [
     ["○ Memory reports", "iva_menu:ntc:set:rep:1"],
     ["○ Morning digest", "iva_menu:ntc:set:dig:1"],
-    ["Back", "iva_menu:r:o"],
+    ["‹ Menu", "iva_menu:r:o"],
   ]);
   assert.equal(screen.parent, "r");
 });
@@ -104,7 +104,7 @@ test("a switched-on toggle is ticked and offers the way back off", () => {
   assert.deepEqual(labels(screen.render({ page: 0 }, makeContext("ru"))), [
     ["✓ Отчёты памяти", "iva_menu:ntc:set:rep:0"],
     ["✓ Утренний дайджест", "iva_menu:ntc:set:dig:0"],
-    ["Back", "iva_menu:r:o"],
+    ["‹ Меню", "iva_menu:r:o"],
   ]);
 });
 

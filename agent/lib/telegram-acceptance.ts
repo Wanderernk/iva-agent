@@ -196,7 +196,10 @@ async function metadataFromRequest(request: Request): Promise<RequestMetadata> {
           ? body.update_id
           : null,
     };
-  } catch {
+  } catch (error) {
+    console.error(
+      `[telegram] не разобрал тело входящего запроса, dedup по update_id выключен: ${String(error)}`,
+    );
     return { receipt: null, reroute: null, updateId: null };
   }
 }

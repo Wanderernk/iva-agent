@@ -14,13 +14,13 @@ import {
   quizSummary,
   personaMarkdown,
 } from "../quiz.ts";
+import { resolveVaultDir } from "../../../packages/vault-dir/index.ts";
+import { button, buttonRow } from "./buttons.ts";
 
 const SID = "chr";
 const PARENT = "r";
 
 type Lang = "en" | "ru";
-type Button = { text: string; callback_data: string };
-type View = { text: string; rows: Button[][] };
 type QuizState = { i: number; answers: number[]; code: string | null };
 type MenuState = {
   data: { quiz?: QuizState };
@@ -29,23 +29,21 @@ type MenuState = {
 type MenuContext = {
   getLang: () => string;
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screen: string) => Button[];
   show: (state: MenuState, screen: string) => Promise<void>;
   flows: {
-    screen: (state: MenuState, text: string, rows: Button[][]) => Promise<void>;
+    screen: (state: MenuState, text: string) => Promise<void>;
   };
 };
 
-function errorMessage(error: unknown): string {
-  return (error as { readonly message: string }).message;
+function backLine(ctx: MenuContext): string {
+  return `${button(ctx.tr("‹ Menu", "‹ Меню"), `iva_menu:${PARENT}:o`)} — ${ctx.tr(
+    "back to the settings.",
+    "вернуться в настройки.",
+  )}`;
 }
 
-// vault/PERSONA.md: каталог = ASSISTANT_VAULT_DIR ?? "vault", относительный — от cwd
-// (как канал agent/channels/telegram.ts:182; оба процесса стартуют из /home/shima/iva).
-function vaultDir() {
-  const raw = process.env.ASSISTANT_VAULT_DIR ?? "vault";
-  return raw.startsWith("/") ? raw : join(process.cwd(), raw);
+function errorMessage(error: unknown): string {
+  return (error as { readonly message: string }).message;
 }
 
 // Экран одного вопроса «i/10» + 4 кнопки-ответа (2×2, индекс = позиция в QUIZ_ANSWERS).
@@ -59,64 +57,56 @@ function renderQuestion(st: MenuState, ctx: MenuContext) {
   const q = QUIZ[i];
   const a = QUIZ_ANSWERS[lang] ?? QUIZ_ANSWERS.ru;
   const text = [
-    ctx.tr(
-      `🎭 Character · ${i + 1}/${QUIZ.length}`,
-      `🎭 Характер · ${i + 1}/${QUIZ.length}`,
-    ),
-    "",
+    `# ${ctx.tr(`🎭 Character · ${i + 1}/${QUIZ.length}`, `🎭 Характер · ${i + 1}/${QUIZ.length}`)}`,
     q.text[lang] ?? q.text.ru,
-  ].join("\n");
-  const rows = [
-    [
-      ctx.btn(a[0], `iva_menu:${SID}:q:${i}:0`),
-      ctx.btn(a[1], `iva_menu:${SID}:q:${i}:1`),
-    ],
-    [
-      ctx.btn(a[2], `iva_menu:${SID}:q:${i}:2`),
-      ctx.btn(a[3], `iva_menu:${SID}:q:${i}:3`),
-    ],
-    ctx.backRow(PARENT),
-  ];
-  return ctx.flows.screen(st, text, rows);
+    buttonRow([
+      button(a[0], `iva_menu:${SID}:q:${i}:0`),
+      button(a[1], `iva_menu:${SID}:q:${i}:1`),
+      button(a[2], `iva_menu:${SID}:q:${i}:2`),
+      button(a[3], `iva_menu:${SID}:q:${i}:3`),
+    ]),
+    backLine(ctx),
+  ].join("\n\n");
+  return ctx.flows.screen(st, text);
 }
 
-// Экран портрета: сводка архетипа + [Принять]/[Пройти заново].
+// Экран портрета: сводка архетипа + [Принять]/[Пройти заново] с пояснениями.
 function renderPortrait(st: MenuState, ctx: MenuContext) {
   const code = st.data.quiz?.code;
-  const rows = [
-    [
-      ctx.btn(ctx.tr("✅ Accept", "✅ Принять"), `iva_menu:${SID}:apply`),
-      ctx.btn(ctx.tr("↻ Retake", "↻ Пройти заново"), `iva_menu:${SID}:redo`),
-    ],
-    ctx.backRow(PARENT),
-  ];
-  return ctx.flows.screen(
-    st,
+  const text = [
+    `# ${ctx.tr("🎭 Iva's character", "🎭 Характер Ивы")}`,
     quizSummary(code ?? "", ctx.getLang() === "en" ? "en" : "ru"),
-    rows,
-  );
+    `${button(ctx.tr("✅ Accept", "✅ Принять"), `iva_menu:${SID}:apply`, "success")} — ${ctx.tr(
+      "write this character in and use it from the next message.",
+      "записать этот характер и применять со следующего сообщения.",
+    )}`,
+    `${button(ctx.tr("↻ Retake", "↻ Пройти заново"), `iva_menu:${SID}:redo`)} — ${ctx.tr(
+      "answer the 10 questions again.",
+      "ответить на 10 вопросов заново.",
+    )}`,
+    backLine(ctx),
+  ].join("\n\n");
+  return ctx.flows.screen(st, text);
 }
 
 export default {
   parent: PARENT,
 
   // Заход на экран (verb o) — интро-предупреждение. Квиз стартует по кнопке go.
-  render(st: MenuState, ctx: MenuContext): View {
+  render(st: MenuState, ctx: MenuContext) {
     const text = [
-      ctx.tr("🎭 Iva's character", "🎭 Характер Ивы"),
-      "",
+      `# ${ctx.tr("🎭 Iva's character", "🎭 Характер Ивы")}`,
       ctx.tr(
         "This is NOT a test of you — it sets what you want Iva to be like. 10 statements, answer yes / rather yes / rather no / no. At the end you'll get a portrait out of 16 archetypes and decide whether to apply it.",
         "Это НЕ тест тебя — это настройка того, какой ты хочешь видеть иву. 10 утверждений, отвечай да / скорее да / скорее нет / нет. В конце получишь портрет из 16 архетипов и решишь, применять ли его.",
       ),
-    ].join("\n");
-    return {
-      text,
-      rows: [
-        [ctx.btn(ctx.tr("Start", "Начать"), `iva_menu:${SID}:go`)],
-        ctx.backRow(PARENT),
-      ],
-    };
+      `${button(ctx.tr("Start", "Начать"), `iva_menu:${SID}:go`)} — ${ctx.tr(
+        "answer the 10 questions.",
+        "ответить на 10 вопросов.",
+      )}`,
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   },
 
   async on(verb: string, args: string[], st: MenuState, ctx: MenuContext) {
@@ -144,8 +134,8 @@ export default {
     if (verb === "apply") {
       const code = st.data.quiz?.code;
       if (!code) return ctx.show(st, SID); // нечего применять — вернуться в интро
-      const dir = vaultDir();
       try {
+        const dir = resolveVaultDir(process.cwd());
         await writeFileAtomic(
           join(dir, "PERSONA.md"),
           personaMarkdown(code, ctx.getLang()),
@@ -154,20 +144,18 @@ export default {
         const message = errorMessage(error);
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             `Couldn't write the character file: ${message}`,
             `Не удалось записать файл характера: ${message}`,
-          ),
-          [ctx.backRow(PARENT)],
+          )}\n\n${backLine(ctx)}`,
         );
       }
       return ctx.flows.screen(
         st,
-        ctx.tr(
+        `${ctx.tr(
           "Character saved. It applies from your next message.",
           "Характер сохранён. Применится со следующего сообщения.",
-        ),
-        [ctx.backRow(PARENT)],
+        )}\n\n${backLine(ctx)}`,
       );
     }
     return ctx.show(st, SID);

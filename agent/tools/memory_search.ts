@@ -7,6 +7,8 @@ import { join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { embedTexts, cosine, hasEmbeddingKey } from "../lib/embeddings.js";
 import { cardIndex, cardTitle } from "../lib/card-index.js";
+import { resolveVaultDir } from "@iva/vault-dir";
+import { vaultDirErrorText } from "../lib/vault-error.ts";
 
 // node:sqlite — встроенный модуль (Node 24+). В ESM нет глобального require, поэтому
 // поднимаем его через createRequire; грузим лениво внутри bm25Search (с fallback, если нет).
@@ -18,7 +20,6 @@ const nodeRequire = createRequire(import.meta.url);
 // (его пишет autograph graph.py каждую ночь). Деградирует мягко: любой сбой движка →
 // подстрочный fallback, ход НЕ падает.
 
-const VAULT = () => process.env.ASSISTANT_VAULT_DIR || "vault";
 const IGNORE_DIRS = new Set([
   ".git",
   "node_modules",
@@ -87,7 +88,7 @@ export interface LoadedDocs {
 }
 
 export async function loadDocs(scopeDirs: string[]): Promise<LoadedDocs> {
-  const vault = VAULT();
+  const vault = resolveVaultDir(process.cwd());
   // scope приходит в тул свободными строками — их пишет МОДЕЛЬ, а её может завести
   // содержимое чужого сообщения. join(vault, "../..") уводил обход за пределы vault:
   // поиск читал бы .env, ключи и чужие репозитории, а куски их строк уезжали бы модели
@@ -147,8 +148,12 @@ export async function loadDocs(scopeDirs: string[]): Promise<LoadedDocs> {
       continue;
     }
     cacheStats.fileReads++;
-    const { fm, meta, body } = cardIndex(text);
     const rel = relative(vault, file).split(sep).join("/");
+    // Карточку, которую владелец сломал руками, пропускаем поимённо: одна кривая
+    // кавычка не имеет права отменить поиск по всем остальным.
+    const indexed = cardIndex(text, rel);
+    if (indexed === null) continue;
+    const { fm, meta, body } = indexed;
     const doc: Doc = {
       path: rel,
       title: cardTitle(rel) || rel,
@@ -226,12 +231,15 @@ function isVectorIndex(value: unknown): value is Record<string, number[]> {
 function loadGraph(): GraphNodes {
   const path =
     process.env.ASSISTANT_GRAPH_PATH ||
-    join(VAULT(), ".graph", "vault-graph.json");
+    join(resolveVaultDir(process.cwd()), ".graph", "vault-graph.json");
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (!isRecord(parsed)) return {};
     return isGraphNodes(parsed.nodes) ? parsed.nodes : {};
-  } catch {
+  } catch (error) {
+    console.error(
+      `[memory] не смог прочитать граф vault (${path}): ${String(error)}`,
+    );
     return {};
   }
 }
@@ -274,13 +282,16 @@ function bfsDistances(
 function loadEmbedIndex(): Record<string, number[]> | null {
   try {
     const raw = readFileSync(
-      join(VAULT(), ".index", "embeddings.json"),
+      join(resolveVaultDir(process.cwd()), ".index", "embeddings.json"),
       "utf8",
     );
     const parsed: unknown = JSON.parse(raw);
     if (!isRecord(parsed)) return null;
     return isVectorIndex(parsed.vectors) ? parsed.vectors : null;
-  } catch {
+  } catch (error) {
+    console.error(
+      `[memory] не смог прочитать индекс эмбеддингов: ${String(error)}`,
+    );
     return null;
   }
 }
@@ -431,7 +442,29 @@ function naiveSearch(docs: Doc[], tokens: string[]): string[] {
   return scored.map((x) => x.path);
 }
 
-export async function searchMemory({
+// Потолок запроса: цена поиска растёт с числом уникальных слов (каждый токен проходит по
+// всем карточкам), и запрос в 100 000 токенов держал ход 14-25 с. Отказ явный — модель
+// разобьёт запрос сама; тихое усечение молча меняло бы ответ на другой вопрос.
+const MAX_QUERY_TOKENS = 64;
+const MAX_QUERY_CHARS = 4000;
+
+function rejectLongQuery(detail: string): {
+  count: number;
+  engine: string;
+  hits: Hit[];
+  note: string;
+} {
+  return {
+    count: 0,
+    engine: "rejected",
+    hits: [],
+    note:
+      `Запрос слишком длинный (${detail}): потолок ${MAX_QUERY_TOKENS} слов и ` +
+      `${MAX_QUERY_CHARS} знаков — разбей запрос на несколько коротких`,
+  };
+}
+
+async function searchMemoryInner({
   query,
   limit,
   scope,
@@ -439,10 +472,21 @@ export async function searchMemory({
   query: string;
   limit?: number;
   scope?: string[];
-}): Promise<{ count: number; engine?: string; hits: Hit[]; note?: string }> {
+}): Promise<{
+  count: number;
+  engine?: string;
+  hits: Hit[];
+  note?: string;
+  ok?: boolean;
+  error?: string;
+}> {
   {
-    const topN = limit ?? 12;
+    if (query.length > MAX_QUERY_CHARS)
+      return rejectLongQuery(`${query.length} знаков`);
     const tokens = contentTokens(query);
+    if (tokens.length > MAX_QUERY_TOKENS)
+      return rejectLongQuery(`${tokens.length} слов`);
+    const topN = limit ?? 12;
     const { docs, signature } = await loadDocs(
       scope && scope.length ? scope : DEFAULT_DIRS,
     );
@@ -459,7 +503,8 @@ export async function searchMemory({
         ranked = naiveSearch(docs, tokens);
         engine = "naive-empty-bm25";
       }
-    } catch {
+    } catch (error) {
+      console.error(`[memory] BM25 упал, ищу наивно: ${String(error)}`);
       ranked = naiveSearch(docs, tokens);
       engine = "naive-fallback";
     }
@@ -569,28 +614,58 @@ export async function searchMemory({
 
 export default defineTool({
   description:
-    "Поиск по долговременной памяти (vault: карточки и саммари). BM25-ранжирование + graph-реранк. " +
-    "Используй ПЕРВЫМ на вопросы «что я знаю про X», «как звали…», «когда мы решили…» — вместо ручного " +
-    "grep. Возвращает топ-совпадения { file, score, status, confidence, snippet }; затем открывай " +
-    "1–3 лучших через read_file. status: superseded и confidence: INFERRED — читай осторожно (см. MAP).",
+    "Поиск по долговременной памяти (карточки и саммари) вместо grep — первым делом " +
+    "на «что я знаю про X», «как звали…», «когда решили…». Возвращает " +
+    "{ file, score, status, confidence, snippet }; открывай 1–3 лучших через read_file; " +
+    "superseded/INFERRED — осторожно.",
   inputSchema: z.object({
-    query: z
-      .string()
-      .min(1)
-      .describe("Запрос в свободной форме (слова/имена/темы)"),
+    query: z.string().min(1).describe("Запрос: слова/имена/темы (до 64 слов)"),
     limit: z
       .number()
       .int()
       .min(1)
       .max(20)
       .optional()
-      .describe("Сколько хитов вернуть (по умолчанию 8)"),
+      .describe("Хитов (по умолчанию 8)"),
     scope: z
       .array(z.string())
       .optional()
       .describe(
-        "Поддиректории vault для поиска (по умолчанию cards+summaries+weekly/monthly/yearly)",
+        "Поддиректории vault (по умолчанию cards, summaries, weekly/monthly/yearly)",
       ),
   }),
   execute: searchMemory,
 });
+
+/**
+ * Точка входа тула: неверная настройка каталога вольта — отказ `ok:false` с текстом
+ * резолвера, а не исключение на границе фреймворка.
+ */
+export async function searchMemory(input: {
+  query: string;
+  limit?: number;
+  scope?: string[];
+}): Promise<{
+  count: number;
+  engine?: string;
+  hits: Hit[];
+  note?: string;
+  ok?: boolean;
+  error?: string;
+}> {
+  try {
+    return await searchMemoryInner(input);
+  } catch (error) {
+    const text = vaultDirErrorText(error);
+    if (text !== null)
+      return {
+        count: 0,
+        engine: "rejected",
+        hits: [],
+        note: text,
+        ok: false,
+        error: text,
+      };
+    throw error;
+  }
+}

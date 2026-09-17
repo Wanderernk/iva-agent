@@ -5,6 +5,7 @@ autograph graph — vault graph analysis, link repair, backlinks, orphans.
 Commands:
   graph.py health <vault-dir> [schema.json] [--as-of YYYY-MM-DD] — health score + report
   graph.py fix <vault-dir> [schema.json] [--apply] [--as-of YYYY-MM-DD] — fix broken links
+    (repairs unique path/stem/H1-title targets; ambiguous H1 titles are listed, not touched)
   graph.py backlinks <vault-dir> <target>           — incoming links
   graph.py orphans <vault-dir>                      — files with no incoming links
 
@@ -25,9 +26,11 @@ from collections import defaultdict
 from common import (
     load_schema, parse_frontmatter, walk_vault, rel_path,
     extract_wikilinks, infer_domain, get_domain_map, IGNORE_DIRS,
-    build_link_index, normalize_link_target, resolve_link_target, is_hub_path,
+    build_link_index, normalize_link_target, normalize_title,
+    resolve_link_target, is_hub_path,
     read_card, write_card
 )
+from enforce import _outside_fences
 
 EMBED_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.pdf', '.mp3', '.mp4', '.webp',
               '.ogg', '.opus', '.m4a', '.wav'}
@@ -126,6 +129,7 @@ def build_graph(vault_dir: Path, schema: dict, today: date | None = None) -> dic
     all_links = []      # (source, raw_target, resolved_target)
     broken_links = []   # (source, raw_target)
     future_links = []   # (source, raw_target)
+    title_links = []    # (source, raw_target), resolved by H1 only
 
     for md in files:
         rp = rel_path(md, vault_dir)
@@ -148,10 +152,14 @@ def build_graph(vault_dir: Path, schema: dict, today: date | None = None) -> dic
         links = extract_wikilinks(body if body else content)
         for target, display in links:
             target_clean = normalize_link_target(target)
-            resolved, _ = resolve_link_target(target_clean, link_index)
+            resolved, strategy = resolve_link_target(target_clean, link_index)
             if resolved:
                 outgoing.append(resolved)
                 all_links.append((rp_noext, target_clean, resolved))
+                # Такая ссылка не битая, но её цель — заголовок: H1 поменяется, и
+                # ссылка порвётся. fix доводит её до пути (title_link_list).
+                if strategy == 'unique_title':
+                    title_links.append((rp_noext, target_clean))
             elif any(target.lower().endswith(ext) for ext in EMBED_EXTS):
                 # A Markdown note may legitimately end in an attachment-like suffix
                 # (voice.ogg.md). Resolution must win before the embed exemption.
@@ -263,6 +271,7 @@ def build_graph(vault_dir: Path, schema: dict, today: date | None = None) -> dic
         'dead_end_list': sorted(dead_ends),
         'broken_link_list': [{'source': s, 'target': t} for s, t in broken_links],
         'future_link_list': [{'source': s, 'target': t} for s, t in future_links],
+        'title_link_list': [{'source': s, 'target': t} for s, t in title_links],
         'nodes': {k: {'domain': v['domain'], 'type': v['type'], 'has_description': v['has_description'],
                        'managed': v['managed'], 'outgoing': v['outgoing'], 'incoming': v['incoming']}
                   for k, v in nodes.items()},
@@ -321,6 +330,10 @@ class HealthHistoryCorrupt(RuntimeError):
     """The health history exists but cannot be safely extended."""
 
 
+class LinkRepairError(RuntimeError):
+    """A link was promised as fixable and the rewrite did not happen."""
+
+
 def _valid_history_entry(value) -> bool:
     if not isinstance(value, dict):
         return False
@@ -359,8 +372,8 @@ def _write_history_durable(hist_path: Path, history: list) -> None:
         raise
 
 
-def update_history(vault_dir: Path, stats: dict):
-    """Append to health-history.json (max 90 entries)."""
+def update_history(vault_dir: Path, stats: dict, as_of: date) -> None:
+    """Upsert the health-history entry for as_of (max 90 entries)."""
     hist_path = vault_dir / '.graph' / 'health-history.json'
     try:
         raw = hist_path.read_bytes()
@@ -376,34 +389,147 @@ def update_history(vault_dir: Path, stats: dict):
                 or not all(_valid_history_entry(entry) for entry in history)):
             raise HealthHistoryCorrupt(
                 'health history is corrupt; left unchanged')
-    history.append({
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        **stats
-    })
+    # Одна запись на дату: ручной прогон того же дня заменяет результат, а не
+    # добавляет второй. Старые дубли за эту дату уходят вместе с ним.
+    entry = {'date': as_of.isoformat(), **stats}
+    dates = [existing['date'] for existing in history]
+    if entry['date'] in dates:
+        first = dates.index(entry['date'])
+        history = [existing for index, existing in enumerate(history)
+                   if existing['date'] != entry['date'] or index == first]
+        history[first] = entry
+    else:
+        history.append(entry)
     history = history[-90:]  # keep last 90
     _write_history_durable(hist_path, history)
 
 
 # ─── FIX BROKEN LINKS ─────────────────────────────────────
-def fix_broken_links(vault_dir: Path, graph: dict, apply: bool = False) -> list:
-    """Suggest and optionally apply fixes for broken links."""
+# Дневной транскрипт — дословная запись дня, в расписании её не правит никто.
+PROTECTED_SOURCE_PREFIX = 'summaries/'
+
+
+def _protected_spans(text: str) -> list[tuple[int, int, str]]:
+    """Character ranges a link repair leaves alone: code and append-only ## History."""
+    lines = text.split('\n')
+    outside = _outside_fences(lines)
+    spans = []
+    offsets = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line) + 1
+    in_history = False
+    for index, line in enumerate(lines):
+        start = offsets[index]
+        if not outside[index]:
+            spans.append((start, start + len(line), 'code'))
+            continue
+        if re.match(r'^## History[ \t]*$', line):
+            in_history = True
+        elif in_history and line.startswith('## '):
+            in_history = False
+        if in_history:
+            spans.append((start, start + len(line), 'history'))
+            continue
+        for inline in re.finditer(r'`[^`\n]+`', line):
+            spans.append((start + inline.start(), start + inline.end(), 'code'))
+    return spans
+
+
+def _protected_reason(offset: int, spans: list) -> str | None:
+    """Why the link at offset must not be touched, or None when it is fair game."""
+    for start, end, reason in spans:
+        if start <= offset < end:
+            return reason
+    return None
+
+
+def _link_pattern(target: str) -> re.Pattern:
+    """The token forms the resolver accepts around one target: spaces, vault/, .md."""
+    return re.compile(
+        r'\[\[[ \t]*(?:vault/)?' + re.escape(normalize_link_target(target))
+        + r'(?:\.md)?[ \t]*(?P<anchor>#[^\]|]+)?(?P<alias>\|[^\]]+)?\]\]'
+    )
+
+
+def fix_broken_links(vault_dir: Path, graph: dict, apply: bool = False) -> tuple[list, int, list, list]:
+    """Suggest and optionally apply fixes for broken links.
+
+    Returns (fixes, applied, ambiguous, skipped). Ambiguous H1 titles are reported with
+    their candidates and left untouched — guessing one of them would rewrite a Card
+    wrongly. Daily transcripts, the append-only ## History section and code are not
+    repair candidates at all: they are skipped and named, never promised as Fixable.
+    """
     link_index = build_link_index(vault_dir)
 
+    # Единственный список стратегий, которые fix имеет право применить: ровно один
+    # кандидат. ambiguous_* сюда не попадают никогда.
+    allowed = ('unique_suffix', 'unique_stem', 'unique_title')
+
     fixes = []
+    ambiguous = []
+    skipped = []
+
+    # Карточка читается один раз: и спаны защиты, и замена смотрят на те же байты.
+    cards: dict[str, tuple[str, list] | None] = {}
+
+    def card_of(source: str):
+        if source not in cards:
+            path = vault_dir / f'{source}.md'
+            content = read_card(path) if path.exists() else None
+            cards[source] = (
+                None if content is None else (content, _protected_spans(content)))
+        return cards[source]
+
+    def candidate(source: str, target: str, resolved: str, strategy: str) -> None:
+        """Кладёт ссылку в fixes или в skipped — третьего исхода нет."""
+        if source.startswith(PROTECTED_SOURCE_PREFIX):
+            skipped.append({'source': source, 'target': target, 'reason': 'summaries'})
+            return
+        card = card_of(source)
+        if card is None:
+            skipped.append({'source': source, 'target': target, 'reason': 'unreadable'})
+            return
+        text, spans = card
+        reasons = [_protected_reason(match.start(), spans)
+                   for match in _link_pattern(target).finditer(text)]
+        # Ссылка целиком под защитой — не кандидат. Если хотя бы одно её вхождение
+        # в свободном тексте, чинится именно оно, а защищённые остаются как были.
+        if reasons and all(reason is not None for reason in reasons):
+            skipped.append({'source': source, 'target': target, 'reason': reasons[0]})
+            return
+        fixes.append({
+            'source': source,
+            'old': target,
+            'new': resolved,
+            'strategy': strategy
+        })
+
     for bl in graph['broken_link_list']:
         src = bl['source']
         target = bl['target']
         resolved, strategy = resolve_link_target(target, link_index)
-        if resolved and strategy in ('unique_suffix', 'unique_stem'):
-            fixes.append({
+        if resolved and strategy in allowed:
+            candidate(src, target, resolved, strategy)
+        elif strategy == 'ambiguous_title':
+            ambiguous.append({
                 'source': src,
-                'old': target,
-                'new': resolved,
-                'strategy': strategy
+                'target': target,
+                'candidates': link_index['ambiguous_title'][
+                    normalize_title(normalize_link_target(target))]
             })
+
+    # Ссылка по заголовку резолвится, поэтому в битых её нет. Путь вместо заголовка
+    # переживёт правку H1, и fix — тот проход, который доводит её до канонической формы.
+    for tl in graph.get('title_link_list', []):
+        resolved, strategy = resolve_link_target(tl['target'], link_index)
+        if resolved and strategy in allowed:
+            candidate(tl['source'], tl['target'], resolved, strategy)
 
     if apply:
         applied = 0
+        rewritten: set[tuple[str, str]] = set()
         for fix in fixes:
             src_path = vault_dir / (fix['source'] + '.md')
             if not src_path.exists():
@@ -413,18 +539,33 @@ def fix_broken_links(vault_dir: Path, graph: dict, apply: bool = False) -> list:
             content = read_card(src_path)
             if content is None:
                 continue
-            pattern = re.compile(
-                r'\[\[' + re.escape(normalize_link_target(fix['old'])) + r'(?P<anchor>#[^\]|]+)?(?P<alias>\|[^\]]+)?\]\]'
-            )
-            if pattern.search(content):
-                content = pattern.sub(
-                    lambda m: f"[[{fix['new']}{m.group('anchor') or ''}{m.group('alias') or ''}]]",
-                    content
-                )
+            # Замена ищет те же формы токена, что принимает резолвер, и считает именно
+            # переписанные ссылки: две ссылки на одну цель различаются anchor/alias
+            # и обе попадают под общий токен цели. Защищённые вхождения не трогаем.
+            spans = _protected_spans(content)
+            count = 0
+
+            def replace(match, _fix=fix, _spans=spans):
+                nonlocal count
+                if _protected_reason(match.start(), _spans) is not None:
+                    return match.group(0)
+                count += 1
+                return (f"[[{_fix['new']}{match.group('anchor') or ''}"
+                        f"{match.group('alias') or ''}]]")
+
+            content = _link_pattern(fix['old']).sub(replace, content)
+            if count:
                 write_card(src_path, content)
-                applied += 1
-        return fixes, applied
-    return fixes, 0
+                applied += count
+                rewritten.add((fix['source'], fix['old']))
+        # Fixable обещает починку: обещанная и не переписанная ссылка — отказ, а не тишина.
+        missed = sorted({(fix['source'], fix['old']) for fix in fixes} - rewritten)
+        if missed:
+            raise LinkRepairError(
+                'link repair promised a fix and rewrote nothing: '
+                + ', '.join(f'{source}: [[{target}]]' for source, target in missed))
+        return fixes, applied, ambiguous, skipped
+    return fixes, 0, ambiguous, skipped
 
 
 # ─── BACKLINKS ─────────────────────────────────────────────
@@ -535,6 +676,10 @@ def main():
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
+    # Дата графа и дата записи истории — одна и та же: без --as-of это сегодня по
+    # TZ процесса, а не момент записи.
+    if as_of is None:
+        as_of = _local_today()
 
     if cmd == 'health':
         graph = build_graph(vault_dir, schema, today=as_of)
@@ -548,7 +693,7 @@ def main():
         (out_dir / 'report.md').write_text(
             generate_report(stats, graph['domains']))
         try:
-            update_history(vault_dir, stats)
+            update_history(vault_dir, stats, as_of)
         except HealthHistoryCorrupt as error:
             print(f"Error: {error}", file=sys.stderr)
             sys.exit(1)
@@ -582,12 +727,23 @@ def main():
     elif cmd == 'fix':
         graph = build_graph(vault_dir, schema, today=as_of)
         apply = '--apply' in args
-        fixes, applied = fix_broken_links(vault_dir, graph, apply=apply)
+        try:
+            fixes, applied, ambiguous, skipped = fix_broken_links(
+                vault_dir, graph, apply=apply)
+        except LinkRepairError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            sys.exit(1)
         mode = 'APPLIED' if apply else 'DRY RUN'
         print(f"\n  Broken links: {len(graph['broken_link_list'])}")
         print(f"  Fixable:      {len(fixes)}")
         if apply:
             print(f"  Applied:      {applied}")
+        print(f"  Ambiguous:    {len(ambiguous)}  (left as is)")
+        for a in ambiguous[:20]:
+            print(f"    {a['source']}: [[{a['target']}]] -> {', '.join(a['candidates'])}")
+        print(f"  Skipped (protected): {len(skipped)}")
+        for s in skipped[:20]:
+            print(f"    {s['source']}: [[{s['target']}]] ({s['reason']})")
         for f in fixes[:20]:
             print(f"    {f['source']}: {f['old']} → {f['new']}")
 

@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [dataDir, mode = "hang", guardDirectory, guardIdentity] =
@@ -57,11 +58,15 @@ Object.defineProperty(globalThis, "fetch", {
           "utf8",
         ),
       };
-      writeFileSync(
-        join(dataDir, `first-bot-api-${process.pid}`),
-        `${JSON.stringify(evidence)}\n`,
-        { flag: "wx" },
+      // The name appears only once the bytes are all there: the staging name is not the
+      // one the tests look for, and the rename is atomic inside the directory.
+      const evidenceFile = join(dataDir, `first-bot-api-${process.pid}`);
+      const staged = join(
+        dataDir,
+        `.first-bot-api-${process.pid}.tmp-${randomUUID()}`,
       );
+      writeFileSync(staged, `${JSON.stringify(evidence)}\n`, { flag: "wx" });
+      renameSync(staged, evidenceFile);
       process.stdout.write(
         `${JSON.stringify({ event: "BOT_API", pid: process.pid })}\n`,
       );

@@ -232,7 +232,14 @@ const deliverNotified = new Set();
 async function notifyDeliverProblem(kind: string, status: unknown) {
   if (deliverNotified.has(kind)) return;
   const target = process.env.TELEGRAM_DIGEST_CHAT_ID || [...ALLOWED][0];
-  if (!target) return;
+  if (!target) {
+    log(
+      "deliver notification skipped:",
+      kind,
+      "- no target (TELEGRAM_DIGEST_CHAT_ID / TELEGRAM_ALLOWED_USER_IDS)",
+    );
+    return;
+  }
   const text =
     kind === "config"
       ? tr(

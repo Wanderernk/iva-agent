@@ -14,6 +14,7 @@ process.env.ASSISTANT_VAULT_DIR = join(root, "vault");
 process.env.ASSISTANT_TIMEZONE = "UTC";
 process.env.AGENT_LANGUAGE = "en";
 process.env.TELEGRAM_BOT_TOKEN = "1:test-token";
+process.env.DEEPGRAM_API_KEY = "dg-test";
 const modulePath = fileURLToPath(
   new URL("./telegram-media.ts", import.meta.url),
 );
@@ -231,6 +232,29 @@ await test("голосовое с провалившейся транскрип�
   assert.match(part.context[0], /transcription failed/u);
   assert.doesNotMatch(part.context[0], /documents/u);
   assert.equal(calls.sent.length, 0);
+});
+
+// Ключа Deepgram нет (шаг мастера пропущен): провайдера не зовём, подводка ведёт в /menu → Голос.
+await test("голосовое без ключа Deepgram: провайдер не зовётся, подводка про /menu → Voice", async (t) => {
+  stubDownload(t);
+  const saved = process.env.DEEPGRAM_API_KEY;
+  delete process.env.DEEPGRAM_API_KEY;
+  t.after(() => {
+    process.env.DEEPGRAM_API_KEY = saved;
+  });
+  const { calls, effects } = harness();
+
+  const part = await media.processMediaPart(
+    effects,
+    { message_id: 9 },
+    voice(),
+  );
+
+  assert.equal(calls.transcribed, 0);
+  assert.equal(part.kind, "context");
+  assert.match(part.context[0], /transcription is not set up/u);
+  assert.match(part.context[0], /\/menu → 🎤 Voice/u);
+  assert.doesNotMatch(part.context[0], /documents/u);
 });
 
 // Провайдер может не упасть, а вернуть пустую строку — путь тот же.

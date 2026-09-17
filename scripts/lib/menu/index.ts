@@ -8,12 +8,17 @@
 //
 // Грамматика callback_data: "iva_menu:<sid>:<verb>[:<arg>[:<arg>]]" — ASCII, только
 // enum/индексы, <=64 байта (тот же принцип, что m:<index> в /model). Никаких user data.
-// sid: r srch lang chr core ub gws cron ntc sk st turn svc (+псевдо mdl/thk — хендофф в визарды).
+// sid: r srch rich voice lang chr core ub gws cron ntc sk st turn svc (+псевдо mdl/thk — хендофф в визарды).
 // verbs: o(навигация) x(закрыть) pg:<n> rf(обновить) + data-вербы экрана (set key rs go
 // q:<i>:<v> skip fin redo apply do).
 
 import { getLang } from "#lib/i18n.ts";
 import type { TelegramFlowState } from "../tg-flow.ts";
+import {
+  button,
+  type RichButton,
+  type RichButtonStyle,
+} from "../telegram-buttons.ts";
 import type {
   TelegramCallbackQuery as CallbackQuery,
   TelegramId,
@@ -24,6 +29,8 @@ import { isPrivateTelegramChat } from "#lib/telegram-private-chat.ts";
 
 import root from "./root.ts";
 import search from "./search.ts";
+import rich from "./rich.ts";
+import voice from "./voice.ts";
 import lang from "./lang.ts";
 import character from "./character.ts";
 import core from "./core.ts";
@@ -37,6 +44,9 @@ import turnPolicy from "./turn-policy.ts";
 import service from "./service.ts";
 
 type MaybePromise<T> = T | Promise<T>;
+// Старый ряд экрана: пока экраны не переписаны на rich (D3), они отдают движку
+// "{text, callback_data}"; ряд доезжает до текста через legacyRows в tg-flow.
+// ctx.btn уже возвращает rich-строку — в старом ряду её место держит тип RichButton.
 type MenuButton = { text: string; callback_data: string };
 type MenuAwaitText = { kind: string; secret: boolean; [key: string]: unknown };
 type MenuState = TelegramFlowState;
@@ -84,9 +94,13 @@ type MenuContext = {
   lang: string;
   tr: (english: string, russian: string) => string;
   getLang: () => string;
-  btn: (text: string, callbackData: string) => MenuButton;
+  btn: (
+    text: string,
+    callbackData: string,
+    style?: RichButtonStyle,
+  ) => RichButton;
   show: (state: MenuState, screen: string) => Promise<void>;
-  backRow: (screen: string) => MenuButton[];
+  backRow: (screen: string) => RichButton[];
 };
 type MenuCallbackEvent = {
   updateId: number;
@@ -95,7 +109,10 @@ type MenuCallbackEvent = {
   messageId: number;
   userId: string;
 };
-type MenuView = { text: string; rows: Array<MenuButton[]> };
+// text — markdown rich-сообщения; кнопки экран ставит в него сам (button()). Пока экран
+// отдаёт старый rows, движок сам дописывает его в текст шимом legacyRows — поле rows
+// уйдёт, когда D3 перепишет экраны.
+type MenuView = { text: string; rows?: Array<MenuButton[]> };
 type MenuScreen = {
   render?: (
     state: MenuState,
@@ -156,6 +173,8 @@ function telegramCallOk(value: unknown): boolean {
 export const SCREENS = {
   r: root,
   srch: search,
+  rich,
+  voice,
   lang,
   chr: character,
   core,
@@ -191,7 +210,7 @@ export function createMenu({
     lang: "ru",
     tr: (en, ru) => (ctx.lang === "ru" ? ru : en),
     getLang: () => ctx.lang,
-    btn: (text, data) => ({ text, callback_data: data }),
+    btn: (text, data, style) => button(text, data, style),
     // Переключить экран и перерисовать. Страницу НЕ сбрасывает — этим управляет вызывающий
     // (движок сбрасывает page на o-верб; экраны, зовущие show для под-экранов, — сами).
     show: async (st, sid) => {
@@ -208,9 +227,26 @@ export function createMenu({
     ],
   };
 
+  // sid → экран ТОЛЬКО по своим ключам таблицы экранов: иначе sid из Object.prototype
+  // (constructor, toString, __proto__, valueOf) находит наследованное значение и мусор
+  // из кнопки считается живым экраном.
+  function screenAt(sid: unknown): MenuScreen | undefined {
+    if (typeof sid !== "string" || !Object.hasOwn(screens, sid))
+      return undefined;
+    return screens[sid] as MenuScreen | undefined;
+  }
+
+  // Обработчик ввода экрана — тоже только по своему ключу: унаследованный
+  // Object.constructor функцией является, обработчиком ввода — нет.
+  function textHandlerAt(mod: MenuScreen | undefined, kind: string) {
+    const texts = mod?.texts;
+    if (!texts || !Object.hasOwn(texts, kind)) return undefined;
+    const handler: unknown = texts[kind];
+    return typeof handler === "function" ? texts[kind] : undefined;
+  }
+
   async function renderScreen(st: MenuState) {
-    const screen = typeof st.screen === "string" ? st.screen : "";
-    const mod = screens[screen] as MenuScreen | undefined;
+    const mod = screenAt(st.screen);
     if (!mod || typeof mod.render !== "function") return;
     const view = await mod.render(st, ctx);
     if (!view) return;
@@ -228,10 +264,41 @@ export function createMenu({
     const chatId = cq.message?.chat?.id;
     const userId = String(cq.from?.id ?? "");
     const messageId = cq.message?.message_id;
+    ctx.lang = getLang();
+    // Мёртвый экран: тост «устарело» уходит прямо в ack (второй answerCallbackQuery
+    // Telegram уже не примет), а меню ниже открывается заново на корне. Верб x — закрытие,
+    // у него свой финальный текст, тост там противоречил бы ему.
+    let staleToast: string | null = null;
+    let foreignAwait = false;
+    if (typeof cq.data === "string" && cq.data.startsWith(PREFIX)) {
+      const early = parse(cq.data);
+      const handoff = early.sid === "mdl" || early.sid === "thk";
+      const known = handoff || Boolean(screenAt(early.sid));
+      if (!known && early.verb !== "x")
+        staleToast = ctx.tr(
+          "Menu expired — shown again.",
+          "Меню устарело — открыто заново.",
+        );
+      // Ожидание ввода принадлежит тому flow, который его поставил: визард /model//think
+      // ждёт свой секрет в СВОЁМ сообщении. Меню не забирает ни это ожидание, ни общий
+      // слот — иначе ключ ушёл бы обычной доставкой в eve и остался в чате. Тап гасим
+      // тостом и больше ничего не делаем; хендофф mdl/thk и закрытие x идут своей
+      // дорогой и слот не портят.
+      const slot = chatId === undefined ? null : flows.get(chatId, userId);
+      foreignAwait = Boolean(
+        slot && slot.flow !== "menu" && isMenuAwaitText(slot.awaitText),
+      );
+      if (foreignAwait && !handoff && early.verb !== "x")
+        staleToast = ctx.tr(
+          "Finish the input you started, or send /menu again.",
+          "Заверши начатый ввод или отправь /menu заново.",
+        );
+    }
     // Гасим спиннер кнопки СРАЗУ (mirror handleWizardCallback :562) — дальше можно не спешить.
-    await tg("answerCallbackQuery", { callback_query_id: cq.id }).catch(
-      () => {},
-    );
+    await tg("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      ...(staleToast ? { text: staleToast } : {}),
+    }).catch(() => {});
     if (!isPrivateTelegramChat(cq.message?.chat)) return true;
     // Не-allowlisted тап глотаем ПОСЛЕ ack (mirror :563): флоу существует только у того,
     // кто прошёл гейт /menu, поэтому чужой тап и так не имеет стейта — но глушим явно.
@@ -240,7 +307,6 @@ export function createMenu({
     if (typeof cq.data !== "string" || !cq.data.startsWith(PREFIX)) return true;
     if (chatId === undefined || messageId === undefined) return true;
 
-    ctx.lang = getLang();
     const { sid, verb, args } = parse(cq.data);
     const event =
       Number.isSafeInteger(sourceUpdateId) && typeof cq.id === "string"
@@ -264,7 +330,8 @@ export function createMenu({
       return true;
     }
 
-    // Закрытие: снять стейт + убрать клавиатуру. editMessageText без reply_markup её снимает.
+    // Закрытие: снять стейт и переписать сообщение финальным текстом — он идёт без кнопок,
+    // и кнопки прежнего экрана (они были частью его текста) исчезают вместе с ним.
     if (verb === "x") {
       const st = flows.get(chatId, userId);
       const closed = ctx.tr("Menu closed.", "Меню закрыто.");
@@ -277,25 +344,68 @@ export function createMenu({
         await tg("editMessageText", {
           chat_id: chatId,
           message_id: messageId,
-          text: closed,
+          rich_message: { markdown: closed },
         }).catch(() => {});
       }
       return true;
     }
 
+    // Ждущий чужой flow (см. ранний тост): слот не наш, ожидание не наше — выходим.
+    if (foreignAwait) return true;
+
     let st = flows.get(chatId, userId);
     const fresh = Boolean(st && st.flow === "menu" && st.msgId === messageId);
+    const mod = screenAt(sid);
+    // Ждущий ввод переезжает на усыновляемое сообщение только внутри СВОЕГО flow и только
+    // к экрану, который его принимает своим texts[kind]. Чужой flow сюда не доходит
+    // (выход выше), совпадение имени kind владением не считается.
+    const keptAwait =
+      !fresh &&
+      NAV_VERBS.has(verb) &&
+      st?.flow === "menu" &&
+      isMenuAwaitText(st.awaitText)
+        ? st.awaitText
+        : null;
+    const carriesAwait =
+      keptAwait !== null && textHandlerAt(mod, keptAwait.kind) !== undefined;
+    // Мёртвый sid (кнопка из прошлой раскладки меню, мусор в callback_data) и ожидание,
+    // которое экрану-получателю обработать нечем: меню открывается заново на корне, тост
+    // «устарело» для мёртвого экрана уже ушёл в ack. Живое menu-состояние при этом НЕ
+    // вытесняется и его ожидание НЕ переезжает: корень рисуется в том сообщении, которым
+    // меню владеет, а ожидание снимается, как на любом нав-вербе. Иначе стейт вместе с
+    // awaitText уехал бы на чужой экран, обработчика этому ожиданию там нет — и следующее
+    // ОБЫЧНОЕ сообщение перехватывалось бы как креденшл (secret:true — ещё и удалялось
+    // из чата) вместо доставки в eve.
+    if (!mod || (keptAwait !== null && !carriesAwait)) {
+      const target =
+        st && st.flow === "menu"
+          ? st
+          : flows.start(chatId, userId, "menu", {
+              screen: "r",
+              page: 0,
+              msgId: messageId,
+            });
+      flows.touch(target);
+      target.awaitText = null;
+      target.page = 0;
+      await ctx.show(target, "r");
+      return true;
+    }
+    let adopted = false;
     if (!fresh) {
       if (NAV_VERBS.has(verb)) {
-        // Усыновить сообщение: создать стейт, привязанный к тапнутому message_id, и отрендерить.
+        // Усыновить сообщение: создать стейт, привязанный к тапнутому message_id,
+        // и отрендерить. Ожидание ввода вытесненного стейта забираем с собой, когда этот
+        // экран им владеет: иначе следующий секрет прошёл бы мимо перехвата и ушёл в eve.
         st = flows.start(chatId, userId, "menu", {
           screen: sid,
           page: 0,
           msgId: messageId,
+          ...(carriesAwait ? { awaitText: keptAwait } : {}),
         });
+        adopted = true;
       } else {
-        const mod = screens[sid] as MenuScreen | undefined;
-        if (event && typeof mod?.recover === "function") {
+        if (event && typeof mod.recover === "function") {
           const recovered = await mod.recover(verb, args, event, ctx);
           if (recovered !== undefined) return recovered;
         }
@@ -304,10 +414,12 @@ export function createMenu({
         await tg("editMessageText", {
           chat_id: chatId,
           message_id: messageId,
-          text: ctx.tr(
-            "Menu expired — send /menu",
-            "Меню устарело — отправь /menu заново",
-          ),
+          rich_message: {
+            markdown: ctx.tr(
+              "Menu expired — send /menu",
+              "Меню устарело — отправь /menu заново",
+            ),
+          },
         }).catch(() => {});
         return true;
       }
@@ -318,7 +430,8 @@ export function createMenu({
     // Любой возврат/обновление экрана (‹ Назад, ‹ Меню, Отмена=o, пагинация, refresh) снимает
     // ждущий ввод: иначе следующее ОБЫЧНОЕ сообщение перехватится как креденшл (secret:true —
     // ещё и удалится из чата). Ручная чистка в search.render остаётся как защита в глубину.
-    if (NAV_VERBS.has(verb)) active.awaitText = null;
+    // Усыновление — не отказ от ввода: awaitText, забранный у вытесненного стейта, живёт дальше.
+    if (NAV_VERBS.has(verb) && !adopted) active.awaitText = null;
 
     if (verb === "o") {
       active.page = 0;
@@ -341,8 +454,7 @@ export function createMenu({
     // отрисовать (ctx.show / flows.screen / awaitText). Ошибки экрана НЕ роняют мост:
     // onCallback вызывается из моста через .catch (см. handleControl-интеграцию).
     active.screen = sid;
-    const mod = screens[sid] as MenuScreen | undefined;
-    if (mod && typeof mod.on === "function") {
+    if (typeof mod.on === "function") {
       const handled = await mod.on(verb, args, active, ctx, event ?? undefined);
       if (handled === "retry") return "retry";
       if (handled === false) return false;
@@ -400,11 +512,8 @@ export function createMenu({
         );
       }
     }
-    const screen = typeof st.screen === "string" ? st.screen : "";
-    const handler = (screens[screen] as MenuScreen | undefined)?.texts?.[
-      a.kind
-    ];
-    if (typeof handler !== "function") {
+    const handler = textHandlerAt(screenAt(st.screen), a.kind);
+    if (handler === undefined) {
       await flows.end(
         st,
         ctx.tr(
@@ -419,8 +528,11 @@ export function createMenu({
   }
 
   // /menu: заводит свежий стейт и рисует root. opts.msgId (опц.) — редактировать существующее
-  // сообщение вместо нового (напр. возврат из визарда). Двойной /menu заменяет стейт и
-  // best-effort снимает клавиатуру со старого меню — мёртвое сообщение не зовёт на протухшие тапы.
+  // сообщение вместо нового (напр. возврат из визарда). Двойной /menu заменяет стейт; старое
+  // сообщение кнопок не теряет — бот снимал их editMessageReplyMarkup'ом, а rich-кнопка живёт
+  // в самом тексте и без переписывания всего экрана не снимается. Тапы по старому меню
+  // само-лечатся и без этого шага: нав-вербы усыновляют сообщение, data-вербы отвечают
+  // «меню устарело», закрытие x редактирует именно это сообщение (см. onCallback).
   async function open(
     chatId: TelegramId,
     userId: TelegramId,
@@ -428,14 +540,6 @@ export function createMenu({
   ) {
     ctx.lang = getLang();
     const uid = String(userId);
-    const prev = flows.get(chatId, uid);
-    if (prev && prev.flow === "menu" && prev.msgId) {
-      await tg("editMessageReplyMarkup", {
-        chat_id: chatId,
-        message_id: prev.msgId,
-        reply_markup: { inline_keyboard: [] },
-      }).catch(() => {});
-    }
     const st = flows.start(chatId, uid, "menu", {
       screen: "r",
       page: 0,

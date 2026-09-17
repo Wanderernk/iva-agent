@@ -5,7 +5,6 @@
 import { createInterface } from "node:readline/promises";
 import { createReadStream, existsSync, openSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -17,7 +16,12 @@ import {
   generateAssistantBearer,
   isAssistantBearer,
 } from "../lib/assistant-auth.ts";
-import { writeEnvAtomicSync } from "../lib/env-file.ts";
+import {
+  envValueRejection,
+  formatEnvLine,
+  parseEnvText,
+  writeEnvAtomicSync,
+} from "../lib/env-file.ts";
 import {
   authFilePath,
   readAuth,
@@ -30,31 +34,34 @@ import {
   validateModelSelection,
 } from "../lib/model-validation.ts";
 import {
-  CATALOG,
   catalogProvider,
   fetchModels,
-  normalizeBaseUrl,
   providerBase,
   providerEnvKeys,
 } from "../lib/model-catalog.ts";
 import { keptSetupWritePlan } from "../lib/setup-keep.ts";
-import { validateTimeZone } from "../lib/timezone.ts";
-import { resolveMemorySearchMode } from "../lib/memory-mode.ts";
+import { isEntrypoint } from "../lib/version-layout.ts";
+import { isYesAnswer, menuChoice } from "./answers.ts";
 import { resolveDataDir } from "../lib/data-dir.ts";
 import { openrouterErrReason } from "./openrouter.ts";
+import {
+  askKeysSettings,
+  askProviderSettings,
+  askTelegramSettings,
+  askVaultAndPort,
+  C,
+  writeSetupEnv,
+  type AskRequiredOptions,
+  type Env,
+  type SetupContext,
+  type TelegramBot,
+  type TelegramUser,
+  type ThrownSetupError,
+} from "./steps.ts";
 
-type Env = Record<string, string>;
-type Validator = (value: string) => Promise<string | null>;
-type AskRequiredOptions = {
-  help?: string;
-  existing?: string;
-  validate?: Validator;
-};
-type TelegramUser = { id: string; name: string };
 // These response types document the happy path without changing the former
 // JavaScript property-access behaviour for malformed provider responses.
 type ModelListResponse = { data?: Array<{ id: string }> };
-type TelegramBot = { username?: string };
 type TelegramGetMeResponse = {
   ok?: boolean;
   description?: string;
@@ -76,7 +83,6 @@ type TelegramUpdatesResponse = {
   description?: string;
   result?: TelegramUpdate[];
 };
-type ThrownSetupError = { code?: string; auth?: unknown; message: string };
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 // The configuration this run starts from. Normally the live .env of the installation;
@@ -107,6 +113,7 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const OPENCODE_MODELS = [
   "deepseek-v4-pro",
   "deepseek-v4-flash",
+  "deepseek-v4.1-flash",
   "kimi-k3",
   "kimi-k2.7-code",
   "glm-5.2",
@@ -115,14 +122,6 @@ const OPENCODE_MODELS = [
   "grok-4.5",
 ];
 
-const C = {
-  g: "\x1b[32m",
-  y: "\x1b[33m",
-  c: "\x1b[36m",
-  b: "\x1b[1m",
-  r: "\x1b[31m",
-  x: "\x1b[0m",
-};
 const TOTAL = 5;
 
 // UI language (en|ru) — also becomes the agent's default reply language (AGENT_LANGUAGE).
@@ -147,13 +146,63 @@ function promptInput(): NodeJS.ReadableStream {
 }
 const rl = createInterface({ input: promptInput(), output: process.stdout });
 
-const ask = async (q: string, def = "") => {
-  const a = (await rl.question(def ? `${q} [${def}]: ` : `${q}: `)).trim();
-  return a || def;
+// Почему `.env` не примет это значение, словами владельца - или null.
+const envComplaint = (value: string): string | null => {
+  const rejection = envValueRejection(value);
+  if (!rejection) return null;
+  const problem = {
+    newline: t("a line break", "перенос строки"),
+    control: t(
+      "a hidden control character (check the paste)",
+      "невидимый управляющий символ (проверьте вставку)",
+    ),
+    "non-ascii": t(
+      "a character outside the Latin alphabet",
+      "символ вне латиницы",
+    ),
+    special: t("one of # \" ' ` \\", "один из знаков # \" ' ` \\"),
+    "edge-space": t(
+      "a space at the start or end",
+      "пробел в начале или в конце",
+    ),
+  }[rejection];
+  return t(
+    `The value has ${problem}. The service and the iva command would read it differently, so .env cannot hold it — enter it without that character.`,
+    `В значении ${problem}. Сервис и команда iva прочитали бы его по-разному, поэтому .env такое не хранит — введите значение без этого знака.`,
+  );
+};
+
+// Один вопрос мастера. `existing` - значение из текущего .env: показывается маской и
+// подставляется по Enter. Проверяется ИТОГОВОЕ значение, а не только набранное: иначе
+// негодное значение, уже лежащее в файле, доживает до записи и роняет прогон на
+// последнем шаге, унося все ответы владельца.
+const ask = async (q: string, def = "", existing = "") => {
+  // Негодное значение из существующего .env не предлагается по Enter: иначе вопрос
+  // зациклится (Enter → отказ → тот же вопрос). Говорим о нём один раз и спрашиваем
+  // заново с чистого листа.
+  const carried = existing || def;
+  const carriedComplaint = carried ? envComplaint(carried) : null;
+  if (carriedComplaint) {
+    console.log(
+      `${C.y}  ⚠ ${t("The value in .env cannot stay", "Значение из .env оставить нельзя")}: ${carriedComplaint}${C.x}\n`,
+    );
+    existing = "";
+    def = "";
+  }
+  for (;;) {
+    const typed = (
+      await rl.question(def ? `${q} [${def}]: ` : `${q}: `)
+    ).trim();
+    const a =
+      existing && (!typed || typed.endsWith(KEEP())) ? existing : typed || def;
+    const complaint = envComplaint(a);
+    if (!complaint) return a;
+    console.log(`${C.y}  ⚠ ${complaint}${C.x}\n`);
+  }
 };
 const askYesNo = async (q: string, def = false) => {
-  const a = (await ask(`${q} (${def ? "Y/n" : "y/N"})`)).toLowerCase();
-  return a ? a.startsWith("y") : def;
+  const a = await ask(`${q} (${def ? "Y/n" : "y/N"})`);
+  return a ? isYesAnswer(a) : def;
 };
 
 // Free-port selection: ask for the desired port, check availability with the same Probe as
@@ -226,8 +275,7 @@ async function askRequired(
 ) {
   for (;;) {
     if (help) console.log(help);
-    let a = await ask(label, existing ? mask(existing) : "");
-    if (existing && (!a || a.endsWith(KEEP()))) a = existing;
+    let a = await ask(label, existing ? mask(existing) : "", existing);
     a = (a || "").trim();
     if (!a) {
       console.log(
@@ -250,17 +298,11 @@ async function askRequired(
   }
 }
 
-function parseEnv(text: string): Env {
-  const env: Env = {};
-  for (const line of text.split("\n")) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-    if (m) env[m[1]] = m[2].replace(/^["']|["']$/g, "");
-  }
-  return env;
-}
 async function loadExistingEnv(): Promise<Env> {
   try {
-    return parseEnv(await readFile(SOURCE_ENV_PATH, "utf8"));
+    // parseEnvText, а не своя регулярка: мастер обязан судить о существующей
+    // настройке по тому значению, которое получит запущенный агент.
+    return parseEnvText(await readFile(SOURCE_ENV_PATH, "utf8"));
   } catch (error) {
     if ((error as ThrownSetupError | null | undefined)?.code === "ENOENT")
       return {};
@@ -320,10 +362,28 @@ async function writeEnv(out: Env): Promise<void> {
     ...order.filter((k) => out[k] != null),
     ...Object.keys(out).filter((k) => !order.includes(k)),
   ];
-  writeEnvAtomicSync(
-    ENV_PATH,
-    keys.map((k) => `${k}=${out[k]}`).join("\n") + "\n",
-  );
+  // Строку, которую мастер сочинил сам, он обязан записать в безопасном подмножестве -
+  // это и проверяется при каждом вопросе. Но в .env попадает и то, что уже лежало там
+  // до нас: чужой ключ вроде `my.key`, значение с кириллицей, краевым пробелом или
+  // переносом строки. Дословно такую строку не записать: значение с переносом строки
+  // разваливается надвое, и вторая половина становится настоящей переменной, которой
+  // владелец не задавал (так подменялся ASSISTANT_DATA_DIR). Поэтому строка не пишется
+  // вовсе, а ключ называется вслух - молча терять строку владельца нельзя. Уронить
+  // весь прогон на последнем шаге и потерять все ответы хуже и того, и другого.
+  const lines: string[] = [];
+  for (const k of keys) {
+    try {
+      lines.push(formatEnvLine(k, String(out[k])));
+    } catch {
+      console.log(
+        `${C.y}  ⚠ ${t(
+          `Dropped ${k} from the existing .env: the service and the iva command would read it differently. Set it again by hand if you need it.`,
+          `${k} не перенесён из существующего .env: сервис и команда iva прочитали бы его по-разному. Задайте его заново вручную, если он нужен.`,
+        )}${C.x}`,
+      );
+    }
+  }
+  writeEnvAtomicSync(ENV_PATH, lines.join("\n") + "\n");
 }
 
 async function ollamaModels(key: string): Promise<string[]> {
@@ -512,16 +572,51 @@ async function pickFromList(
   return items[idx];
 }
 
-async function main() {
+export async function main(entryUrl = import.meta.url): Promise<void> {
+  if (!isEntrypoint(entryUrl)) return;
   const existing = await loadExistingEnv();
   const out = { ...existing };
   out.ASSISTANT_BEARER = isAssistantBearer(existing.ASSISTANT_BEARER)
     ? existing.ASSISTANT_BEARER.trim()
     : generateAssistantBearer();
 
-  // ── Language: UI + agent's default reply language ─────────────────
-  // install.sh asks for the language FIRST and passes it through the environment (AGENT_LANGUAGE) —
-  // in that case don't ask again. On a standalone `npm run setup` the env is empty → we ask.
+  await askLanguage(out, existing);
+
+  // Already configured? Don't walk every step — ask once.
+  const config = existingConfiguration(existing);
+  if (!config.cat0)
+    console.log(
+      `\n${C.y}  ⚠ ${t(
+        `MODEL_PROVIDER is invalid (${config.prov0}) — Iva won't start until you pick one below.`,
+        `MODEL_PROVIDER невалиден (${config.prov0}) — Iva не стартует, пока не выберешь провайдера ниже.`,
+      )}${C.x}`,
+    );
+  if (config.isComplete) {
+    if (!(await keepCurrentConfiguration(existing, out, config))) {
+      rl.close();
+      return;
+    }
+  } else {
+    printFreshSetupIntro();
+  }
+
+  const provider = await askProviderChoice(config.prov0);
+  out.MODEL_PROVIDER = provider;
+
+  const state = { existing, out, provider };
+  const ctx = createSetupContext();
+  await askProviderSettings(state, ctx);
+  await askKeysSettings(state, ctx);
+  await askTelegramSettings(state, ctx);
+  await askVaultAndPort(state, ctx);
+  await writeSetupEnv(state, ctx, STAGING_CONFIG);
+  rl.close();
+}
+
+// ── Language: UI + agent's default reply language ─────────────────
+// install.sh asks for the language FIRST and passes it through the environment (AGENT_LANGUAGE) —
+// in that case don't ask again. On a standalone `npm run setup` the env is empty → we ask.
+async function askLanguage(out: Env, existing: Env): Promise<void> {
   const envLang = (process.env.AGENT_LANGUAGE || "").toLowerCase();
   if (envLang === "en" || envLang === "ru") {
     LANG = envLang;
@@ -533,21 +628,30 @@ async function main() {
       "  Choose / Выбор (1/2)",
       existing.AGENT_LANGUAGE === "ru" ? "2" : "1",
     );
-    LANG = langChoice.trim() === "2" ? "ru" : "en";
+    LANG = menuChoice(langChoice) === 2 ? "ru" : "en";
   }
   out.AGENT_LANGUAGE = LANG;
   console.log(
     `  → ${t("Iva will reply in English by default.", "Iva будет отвечать по-русски по умолчанию.")}`,
   );
+}
 
-  // Already configured? Don't walk every step — ask once.
-  // Провайдер берётся ТОЧНЫМ именем из общего каталога — того же, на который смотрят рантайм
-  // и доктор. Неизвестное имя (опечатка `ollmaa`) не сходится ни с одним ключом: раньше карты
-  // промахивались, API-ключ выпадал из REQUIRED, мастер объявлял сломанный .env настроенным и
-  // выходил — а это тот самый мастер, к которому отказ агента и отправляет (issue #161).
-  // `??`, не `||`: `MODEL_PROVIDER=` в .env — это заданное пустое значение, и рантайм,
-  // доктор, статус и апдейт его отвергают. Схлопни его здесь в ollama — и единственный
-  // экран, который умеет починить, снова объявил бы сломанный .env настроенным.
+type ExistingConfiguration = {
+  readonly prov0: string;
+  readonly cat0: ReturnType<typeof catalogProvider>;
+  readonly provModel: string;
+  readonly provKey: string | null;
+  readonly isComplete: boolean;
+};
+
+// Провайдер берётся ТОЧНЫМ именем из общего каталога — того же, на который смотрят рантайм
+// и доктор. Неизвестное имя (опечатка `ollmaa`) не сходится ни с одним ключом: раньше карты
+// промахивались, API-ключ выпадал из REQUIRED, мастер объявлял сломанный .env настроенным и
+// выходил — а это тот самый мастер, к которому отказ агента и отправляет (issue #161).
+// `??`, не `||`: `MODEL_PROVIDER=` в .env — это заданное пустое значение, и рантайм,
+// доктор, статус и апдейт его отвергают. Схлопни его здесь в ollama — и единственный
+// экран, который умеет починить, снова объявил бы сломанный .env настроенным.
+function existingConfiguration(existing: Env): ExistingConfiguration {
   const prov0 = existing.MODEL_PROVIDER ?? "ollama";
   const cat0 = catalogProvider(prov0);
   const provModel = cat0?.modelVar ?? "OLLAMA_MODEL";
@@ -556,7 +660,6 @@ async function main() {
   const provKey = cat0?.keyVar ?? null;
   const REQUIRED = [
     ...(cat0 ? providerEnvKeys(cat0) : []),
-    "DEEPGRAM_API_KEY",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_USER_IDS",
   ];
@@ -566,66 +669,75 @@ async function main() {
     Boolean(cat0) &&
     loggedInCodex &&
     REQUIRED.every((k) => (existing[k] || "").trim());
-  if (!cat0)
-    console.log(
-      `\n${C.y}  ⚠ ${t(
-        `MODEL_PROVIDER is invalid (${prov0}) — Iva won't start until you pick one below.`,
-        `MODEL_PROVIDER невалиден (${prov0}) — Iva не стартует, пока не выберешь провайдера ниже.`,
-      )}${C.x}`,
-    );
-  if (isComplete) {
-    console.log(
-      `\n${C.b}${C.g}  ${t("Iva is already configured:", "Iva уже настроена:")}${C.x}`,
-    );
-    console.log(`  • ${t("Provider", "Провайдер")}: ${prov0}`);
-    console.log(`  • ${t("Model", "Модель")}:    ${existing[provModel]}`);
-    console.log(
-      `  • ${t("Bot", "Бот")}:       @${existing.TELEGRAM_BOT_USERNAME || "?"}`,
-    );
-    console.log(
-      `  • ${t("Access", "Доступ")}:    ${existing.TELEGRAM_ALLOWED_USER_IDS}`,
-    );
-    console.log(
-      `  • Deepgram:  ${existing.DEEPGRAM_LANGUAGE || "multi"}   ·   TZ: ${existing.ASSISTANT_TIMEZONE || "?"}`,
-    );
-    if (
-      !(await askYesNo(
-        `\n  ${t("Reconfigure from scratch?", "Перенастроить заново?")}`,
-        false,
-      ))
-    ) {
-      if (keptSetupWritePlan(existing, out) === "validate-and-write") {
-        await validateModelSelection({
-          provider: prov0,
-          model: existing[provModel],
-          key: provKey ? existing[provKey] || undefined : undefined,
-          dataDir: dataDirAbs(existing),
-          ...(cat0 ? { base: providerBase(cat0, existing) } : {}),
-        });
-        await writeEnv(out);
-      }
-      console.log(
-        `${C.g}  ${t("Keeping current settings — nothing to enter.", "Оставляю текущие настройки как есть — ничего вводить не нужно.")}${C.x}`,
-      );
-      rl.close();
-      return;
-    }
+  return { prov0, cat0, provModel, provKey, isComplete };
+}
+
+/**
+ * Полная настройка: один вопрос вместо шагов. True — владелец перенастраивается, wizard
+ * идёт дальше; false — настройки оставлены как есть (с проверкой и записью, если план
+ * это требует), и wizard завершён.
+ */
+async function keepCurrentConfiguration(
+  existing: Env,
+  out: Env,
+  config: ExistingConfiguration,
+): Promise<boolean> {
+  console.log(
+    `\n${C.b}${C.g}  ${t("Iva is already configured:", "Iva уже настроена:")}${C.x}`,
+  );
+  console.log(`  • ${t("Provider", "Провайдер")}: ${config.prov0}`);
+  console.log(`  • ${t("Model", "Модель")}:    ${existing[config.provModel]}`);
+  console.log(
+    `  • ${t("Bot", "Бот")}:       @${existing.TELEGRAM_BOT_USERNAME || "?"}`,
+  );
+  console.log(
+    `  • ${t("Access", "Доступ")}:    ${existing.TELEGRAM_ALLOWED_USER_IDS}`,
+  );
+  console.log(
+    `  • Deepgram:  ${existing.DEEPGRAM_LANGUAGE || "multi"}   ·   TZ: ${existing.ASSISTANT_TIMEZONE || "?"}`,
+  );
+  if (
+    await askYesNo(
+      `\n  ${t("Reconfigure from scratch?", "Перенастроить заново?")}`,
+      false,
+    )
+  ) {
     console.log(
       `\n  ${t("Going step by step.", "Идём по шагам.")} ${C.y}${t("Enter at each step keeps the current value.", "Enter на каждом шаге оставит текущее значение.")}${C.x}`,
     );
-  } else {
-    console.log(
-      `\n${C.b}${C.g}  ${t("Iva setup — entering secrets step by step", "Настройка Iva — вводим секреты по шагам")}${C.x}`,
-    );
-    console.log(
-      `  ${t("Takes a couple of minutes. For each key I'll tell you where to get it and check it on the spot.", "Займёт пару минут. Для каждого ключа подскажу, где его взять, и проверю на месте.")}`,
-    );
-    console.log(
-      `  ${C.y}${t("The script won't exit until you've entered every required secret.", "Скрипт не завершится, пока вы не введёте все обязательные секреты.")}${C.x}`,
-    );
+    return true;
   }
+  if (keptSetupWritePlan(existing, out) === "validate-and-write") {
+    await validateModelSelection({
+      provider: config.prov0,
+      model: existing[config.provModel],
+      key: config.provKey ? existing[config.provKey] || undefined : undefined,
+      dataDir: dataDirAbs(existing),
+      ...(config.cat0 ? { base: providerBase(config.cat0, existing) } : {}),
+    });
+    await writeEnv(out);
+  }
+  console.log(
+    `${C.g}  ${t("Keeping current settings — nothing to enter.", "Оставляю текущие настройки как есть — ничего вводить не нужно.")}${C.x}`,
+  );
+  return false;
+}
 
-  // ── Step 1: model provider + model ────────────────────────────────
+/** Свежая настройка: что сейчас будет. */
+function printFreshSetupIntro(): void {
+  console.log(
+    `\n${C.b}${C.g}  ${t("Iva setup — entering secrets step by step", "Настройка Iva — вводим секреты по шагам")}${C.x}`,
+  );
+  console.log(
+    `  ${t("Takes a couple of minutes. For each key I'll tell you where to get it and check it on the spot.", "Займёт пару минут. Для каждого ключа подскажу, где его взять, и проверю на месте.")}`,
+  );
+  console.log(
+    `  ${C.y}${t("The script won't exit until you've entered every required secret.", "Скрипт не завершится, пока вы не введёте все обязательные секреты.")}${C.x}`,
+  );
+}
+
+// ── Step 1: model provider + model ────────────────────────────────
+async function askProviderChoice(prov0: string): Promise<string> {
   head(
     1,
     t("Provider and model — Iva's brain", "Провайдер и модель — мозг Iva"),
@@ -650,728 +762,58 @@ async function main() {
   );
   const provDef =
     { opencode: "2", codex: "3", openrouter: "4", custom: "5" }[prov0] || "1";
-  const provChoice = (
-    await ask(`  ${t("Provider", "Провайдер")} (1/2/3/4/5)`, provDef)
-  ).trim();
-  const provider =
-    provChoice === "2"
-      ? "opencode"
-      : provChoice === "3"
-        ? "codex"
-        : provChoice === "4"
-          ? "openrouter"
-          : provChoice === "5"
-            ? "custom"
-            : "ollama";
-  out.MODEL_PROVIDER = provider;
-
-  if (provider === "ollama") {
-    console.log(
-      `\n  ${t("Ollama key", "Ключ Ollama")}: ${C.c}https://ollama.com/settings/keys${C.x} (Settings → Keys → Create key)`,
-    );
-    let models: string[] = [];
-    out.OLLAMA_API_KEY = await askRequired(
-      `  ${t("Paste the Ollama key", "Вставьте ключ Ollama")}`,
-      {
-        existing: process.env.OLLAMA_API_KEY || existing.OLLAMA_API_KEY || "",
-        validate: async (k) => {
-          try {
-            models = await ollamaModels(k);
-            return null;
-          } catch (error) {
-            const caught = error as ThrownSetupError;
-            return caught.auth
-              ? t(
-                  "Ollama rejected the key. Copy it again (no spaces).",
-                  "Ollama не принял ключ. Скопируйте заново (без пробелов).",
-                )
-              : t(
-                  `couldn't verify: ${caught.message}`,
-                  `не смог проверить: ${caught.message}`,
-                );
-          }
-        },
-      },
-    );
-    console.log(
-      `\n  ${t("Models available", "Доступно моделей")}: ${models.length}. ${t("I recommend", "Рекомендую")} ${C.g}deepseek-v4-pro${C.x}.`,
-    );
-    out.OLLAMA_MODEL = await pickFromList(
-      models,
-      out.OLLAMA_MODEL,
-      "deepseek-v4-pro",
-    );
-    console.log(
-      `\n  ${t("Vision model (photos)", "Vision-модель (фото)")}: ${t("describes incoming pictures — the text model above is usually blind.", "описывает входящие картинки — текстовая модель выше обычно их не видит.")} ${t("I recommend", "Рекомендую")} ${C.g}${CATALOG.ollama.visionDef ?? ""}${C.x}.`,
-    );
-    out.OLLAMA_VISION_MODEL = await pickFromList(
-      models,
-      out.OLLAMA_VISION_MODEL,
-      CATALOG.ollama.visionDef ?? "",
-    );
-    out.OLLAMA_CONTEXT_WINDOW = out.OLLAMA_CONTEXT_WINDOW || "131072";
-    console.log(`  → ${t("model", "модель")}: ${C.g}${out.OLLAMA_MODEL}${C.x}`);
-    console.log(`  → vision: ${C.g}${out.OLLAMA_VISION_MODEL}${C.x}`);
-  } else if (provider === "opencode") {
-    console.log(
-      `\n  ${t("OpenCode key", "Ключ OpenCode")}: ${C.c}https://opencode.ai/auth${C.x} ${t("(subscribe to Go → copy the API key).", "(подпишитесь на Go → скопируйте API key).")}`,
-    );
-    out.OPENCODE_API_KEY = await askRequired(
-      `  ${t("Paste the OpenCode API key", "Вставьте OpenCode API key")}`,
-      {
-        existing:
-          process.env.OPENCODE_API_KEY || existing.OPENCODE_API_KEY || "",
-        validate: opencodeCheck,
-      },
-    );
-    const models = await opencodeModels(out.OPENCODE_API_KEY);
-    console.log(
-      `\n  ${t("OpenCode Go models", "Модели OpenCode Go")}: ${models.length}. ${t("I recommend", "Рекомендую")} ${C.g}deepseek-v4-pro${C.x}.`,
-    );
-    // Strip the stale prefix from older .env files so the current model pre-selects from the bare list.
-    const curModel = (out.OPENCODE_MODEL || "").replace(/^opencode-go\//, "");
-    out.OPENCODE_MODEL = await pickFromList(
-      models,
-      curModel,
-      "deepseek-v4-pro",
-    );
-    console.log(
-      `\n  ${t("Vision model (photos)", "Vision-модель (фото)")}: ${t("describes incoming pictures — the text model above is usually blind.", "описывает входящие картинки — текстовая модель выше обычно их не видит.")} ${t("I recommend", "Рекомендую")} ${C.g}${CATALOG.opencode.visionDef ?? ""}${C.x}.`,
-    );
-    // Тот же срез устаревшего префикса, что и у текстовой модели выше.
-    const curVision = (out.OPENCODE_VISION_MODEL || "").replace(
-      /^opencode-go\//,
-      "",
-    );
-    out.OPENCODE_VISION_MODEL = await pickFromList(
-      models,
-      curVision,
-      CATALOG.opencode.visionDef ?? "",
-    );
-    out.OPENCODE_CONTEXT_WINDOW = out.OPENCODE_CONTEXT_WINDOW || "131072";
-    console.log(
-      `  → ${t("model", "модель")}: ${C.g}${out.OPENCODE_MODEL}${C.x}`,
-    );
-    console.log(`  → vision: ${C.g}${out.OPENCODE_VISION_MODEL}${C.x}`);
-  } else if (provider === "openrouter") {
-    console.log(
-      `\n  ${t("OpenRouter key", "Ключ OpenRouter")}: ${C.c}https://openrouter.ai/keys${C.x} ${t("(Create Key → copy sk-or-…).", "(Create Key → скопируйте sk-or-…).")}`,
-    );
-    out.OPENROUTER_API_KEY = await askRequired(
-      `  ${t("Paste the OpenRouter key", "Вставьте ключ OpenRouter")}`,
-      {
-        existing:
-          process.env.OPENROUTER_API_KEY || existing.OPENROUTER_API_KEY || "",
-        validate: openrouterKeyCheck,
-      },
-    );
-    // 300+ моделей — пикер не подходит. Инструкция: откуда взять слаг и в каком виде, + живой тест.
-    console.log(
-      `\n  ${t("Now the model.", "Теперь модель.")} ${t("Open", "Откройте")} ${C.c}https://openrouter.ai/models${C.x}, ${t("pick a model and copy its slug", "выберите модель и скопируйте её слаг")}`,
-    );
-    console.log(
-      `  ${t("— the id under the name, form", "— id под названием, вид")} ${C.g}vendor/model${C.x} (${t("e.g.", "напр.")} ${C.g}anthropic/claude-sonnet-4.5${C.x}, ${C.g}openai/gpt-5.1${C.x}, ${C.g}google/gemini-2.5-pro${C.x}).`,
-    );
-    console.log(
-      `  ${C.y}${t("I'll send a live test (incl. tool/function calling, which Iva needs) — so a wrong or chat-only model can't slip through and leave the bot mute.", "Сразу отправлю живой тест (включая поддержку инструментов — она нужна Iva) — чтобы кривая или chat-only модель не проскочила и бот не остался немым.")}${C.x}`,
-    );
-    for (;;) {
-      const m = (
-        await ask(
-          `  ${t("OpenRouter model slug", "Слаг модели OpenRouter")}`,
-          out.OPENROUTER_MODEL || "",
-        )
-      ).trim();
-      if (!m) {
-        console.log(
-          `${C.y}  ⚠ ${t("Required — paste a slug from openrouter.ai/models.", "Обязательно — вставьте слаг с openrouter.ai/models.")}${C.x}\n`,
-        );
-        continue;
-      }
-      process.stdout.write(
-        `  ${t("testing the model answers…", "проверяю, что модель отвечает…")} `,
-      );
-      const err = await openrouterModelCheck(out.OPENROUTER_API_KEY, m);
-      if (err) {
-        console.log(
-          `${C.r}${t("not ok", "не ок")}${C.x}\n${C.y}  ⚠ ${err}${C.x}\n`,
-        );
-        continue;
-      }
-      console.log(
-        `${C.g}${t("ok — the model answered", "ок — модель ответила")}${C.x}`,
-      );
-      out.OPENROUTER_MODEL = m;
-      break;
-    }
-    // Vision — отдельный слаг: выбранная текстовая модель может быть text-only.
-    // Живого теста тут нет (мастер не шлёт картинку) — только дефолт и то, что вписали.
-    const visionDef = CATALOG.openrouter.visionDef ?? "";
-    console.log(
-      `\n  ${t("Vision model (photos)", "Vision-модель (фото)")}: ${t("a slug that accepts images, any vendor.", "слаг модели, принимающей картинки, любого вендора.")} ${t("Enter keeps", "Enter оставит")} ${C.g}${visionDef}${C.x}.`,
-    );
-    out.OPENROUTER_VISION_MODEL =
-      (
-        await ask(
-          `  ${t("OpenRouter vision slug", "Слаг vision-модели OpenRouter")}`,
-          out.OPENROUTER_VISION_MODEL || visionDef,
-        )
-      ).trim() || visionDef;
-    out.OPENROUTER_CONTEXT_WINDOW = out.OPENROUTER_CONTEXT_WINDOW || "131072";
-    console.log(
-      `  → ${t("model", "модель")}: ${C.g}${out.OPENROUTER_MODEL}${C.x}`,
-    );
-    console.log(`  → vision: ${C.g}${out.OPENROUTER_VISION_MODEL}${C.x}`);
-  } else if (provider === "custom") {
-    // Свой OpenAI-совместимый эндпоинт. Курировать нечего: адрес и модель знает только
-    // владелец, поэтому спрашиваем их, а список моделей пробуем живым GET /models.
-    console.log(
-      `\n  ${t("Your own OpenAI-compatible endpoint: a proxy, vLLM, LiteLLM or a vendor plan.", "Свой OpenAI-совместимый эндпоинт: прокси, vLLM, LiteLLM или вендорская подписка.")}`,
-    );
-    console.log(
-      `  ${t("Address in full, with the /v1-style suffix", "Адрес целиком, вместе с суффиксом вида /v1")}: ${C.g}https://api.example.com/v1${C.x}`,
-    );
-    for (;;) {
-      const base = normalizeBaseUrl(
-        await ask(
-          `  ${t("Endpoint base URL", "Базовый адрес эндпоинта")}`,
-          out.CUSTOM_BASE_URL || "",
-        ),
-      );
-      if (base) {
-        out.CUSTOM_BASE_URL = base;
-        break;
-      }
-      console.log(
-        `${C.y}  ⚠ ${t("Needs a full http(s) address, e.g. https://api.example.com/v1.", "Нужен полный http(s)-адрес, напр. https://api.example.com/v1.")}${C.x}\n`,
-      );
-    }
-    console.log(
-      `\n  ${t("API key — Enter to skip if the endpoint needs none (self-hosted usually doesn't).", "API-ключ — Enter, если эндпоинт его не требует (свой сервер обычно не требует).")}`,
-    );
-    const customKeyExisting =
-      process.env.CUSTOM_API_KEY || existing.CUSTOM_API_KEY || "";
-    let customKey = await ask(
-      `  ${t("Custom API key", "API-ключ эндпоинта")}`,
-      customKeyExisting ? mask(customKeyExisting) : "",
-    );
-    if (customKeyExisting && (!customKey || customKey.endsWith(KEEP())))
-      customKey = customKeyExisting;
-    out.CUSTOM_API_KEY = (customKey || "").trim();
-    // GET /models спецификацией не гарантирован: нет каталога — берём id из рук владельца.
-    let customModels: string[] = [];
-    try {
-      customModels = await fetchModels(
-        "custom",
-        out.CUSTOM_API_KEY || undefined,
-        { base: out.CUSTOM_BASE_URL },
-      );
-    } catch (error) {
-      console.log(
-        `  ${C.y}${t("couldn't read the model list", "не смог прочитать список моделей")}: ${(error as ThrownSetupError).message}${C.x}`,
-      );
-    }
-    if (customModels.length) {
-      console.log(
-        `\n  ${t("Models available", "Доступно моделей")}: ${customModels.length}.`,
-      );
-      out.CUSTOM_MODEL = await pickFromList(
-        customModels,
-        out.CUSTOM_MODEL || "",
-        customModels[0],
-      );
-    } else {
-      for (;;) {
-        const id = (
-          await ask(
-            `  ${t("Model id, exactly as the provider names it", "ID модели, ровно как называет её провайдер")}`,
-            out.CUSTOM_MODEL || "",
-          )
-        ).trim();
-        if (id) {
-          out.CUSTOM_MODEL = id;
-          break;
-        }
-        console.log(
-          `${C.y}  ⚠ ${t("Required — this endpoint has no default model.", "Обязательно — дефолтной модели у этого эндпоинта нет.")}${C.x}\n`,
-        );
-      }
-    }
-    console.log(
-      `\n  ${t("Vision model (photos)", "Vision-модель (фото)")}: ${t("a fallback only — a chat model that reads images is asked directly. Enter — skip.", "только запасной путь: модель чата, которая видит картинки, спрашивается напрямую. Enter — пропустить.")}`,
-    );
-    out.CUSTOM_VISION_MODEL = (
-      await ask(
-        `  ${t("Custom vision model id", "ID vision-модели эндпоинта")}`,
-        out.CUSTOM_VISION_MODEL || "",
-      )
-    ).trim();
-    out.CUSTOM_CONTEXT_WINDOW = out.CUSTOM_CONTEXT_WINDOW || "131072";
-    console.log(`  → ${t("model", "модель")}: ${C.g}${out.CUSTOM_MODEL}${C.x}`);
-  } else {
-    // codex — вход по подписке OpenAI (OAuth), без API-ключа. Токен → data/codex-auth.json.
-    const dataDir = dataDirAbs({ ...existing, ...out });
-    let auth = readAuth(dataDir);
-    if (auth) {
-      console.log(
-        `\n  ${C.g}${t("Already signed in", "Вход уже выполнен")}${auth.planType ? ` (${t("plan", "план")}: ${auth.planType})` : ""}.${C.x} ${t("Re-login: iva login", "Перелогиниться: iva login")}`,
-      );
-    } else {
-      console.log(
-        `\n  ${t("Sign in to your OpenAI (ChatGPT) subscription. No API key — auth like the codex CLI.", "Вход по подписке OpenAI (ChatGPT). Без API-ключа — авторизация как у codex CLI.")}`,
-      );
-      const useBrowser = await askYesNo(
-        `  ${t("Sign in via a browser on THIS machine? (No = by link + code, best for a headless VPS)", "Войти через браузер на ЭТОЙ машине? (Нет = по ссылке и коду, для headless-VPS)")}`,
-        false,
-      );
-      while (!auth) {
-        try {
-          auth = useBrowser
-            ? await runBrowserLogin({
-                dataDir,
-                lang: LANG,
-                log: (m) => console.log(m),
-              })
-            : await runDeviceCodeLogin({
-                dataDir,
-                lang: LANG,
-                log: (m) => console.log(m),
-              });
-          console.log(
-            `  ${C.g}${t("signed in", "вход выполнен")}${auth.planType ? ` — ${t("plan", "план")}: ${auth.planType}` : ""}${C.x}`,
-          );
-        } catch (error) {
-          const caught = error as ThrownSetupError;
-          console.log(
-            `  ${C.r}${t("sign-in failed", "не удалось войти")}: ${caught.message}${C.x}`,
-          );
-          if (
-            !(await askYesNo(
-              `  ${t("Try again?", "Попробовать снова?")}`,
-              true,
-            ))
-          )
-            break;
-        }
-      }
-    }
-    // Список моделей подписки — тянем с бэкенда (как ollama/opencode). Fallback — ручной ввод.
-    let models: string[] = [];
-    if (auth) {
-      try {
-        models = await listCodexModels({ dataDir });
-      } catch (error) {
-        const caught = error as ThrownSetupError;
-        console.log(
-          `  ${C.y}${t("couldn't fetch the model list", "не смог получить список моделей")}: ${caught.message}${C.x}`,
-        );
-      }
-    }
-    if (models.length) {
-      console.log(
-        `\n  ${t("Models available", "Доступно моделей")}: ${models.length}.`,
-      );
-      out.CODEX_MODEL = await pickFromList(
-        models,
-        out.CODEX_MODEL || "",
-        models[0],
-      );
-    } else {
-      out.CODEX_MODEL = await ask(
-        `  ${t("Codex model id", "ID модели Codex")}`,
-        out.CODEX_MODEL || "gpt-5.1",
-      );
-    }
-    out.CODEX_CONTEXT_WINDOW = out.CODEX_CONTEXT_WINDOW || "272000";
-    console.log(`  → ${t("model", "модель")}: ${C.g}${out.CODEX_MODEL}${C.x}`);
-  }
-  console.log(
-    `  ${C.y}${t("Don't inflate the context window:", "Окно контекста не завышайте:")}${C.x} ${t("compaction computes its threshold from it; an inflated window risks overflow.", "компактация считает порог от него; завышенное окно = риск переполнения.")}`,
+  const provChoice = menuChoice(
+    await ask(`  ${t("Provider", "Провайдер")} (1/2/3/4/5)`, provDef),
   );
-
-  // ── Step 2: Deepgram (voice/video) ────────────────────────────────
-  head(
-    2,
-    t(
-      "Deepgram — voice and video transcription",
-      "Deepgram — расшифровка голоса и видео",
-    ),
-  );
-  console.log(
-    `  ${t("Where to get the key", "Где взять ключ")}: ${C.c}https://console.deepgram.com${C.x}`,
-  );
-  console.log(
-    `    1) ${t("sign up (free starter credit)", "зарегистрируйтесь (дают бесплатный стартовый кредит)")}`,
-  );
-  console.log("    2) API Keys → Create a New API Key");
-  console.log(`    3) ${t("copy the key", "скопируйте ключ")}`);
-  out.DEEPGRAM_API_KEY = await askRequired(
-    `  ${t("Paste the Deepgram API key", "Вставьте Deepgram API key")}`,
-    {
-      existing: process.env.DEEPGRAM_API_KEY || existing.DEEPGRAM_API_KEY || "",
-      validate: deepgramCheck,
-    },
-  );
-  out.DEEPGRAM_LANGUAGE = await ask(
-    `  ${t("Recognition language (multi = auto ru/uz/en)", "Язык распознавания (multi = авто ru/uz/en)")}`,
-    out.DEEPGRAM_LANGUAGE || "multi",
-  );
-
-  // ── Web search: provider + key ────────────────────────────────────
-  // Without a key for the chosen provider web_search is off (DuckDuckGo gives a captcha from a server IP).
-  console.log(
-    `\n  ${C.b}${t("Web search", "Веб-поиск")}${C.x} — ${t("so Iva can search the internet (Enter on the key — skip, search stays off).", "чтобы Iva искала в интернете (Enter на ключе — пропустить, поиск будет выключен).")}`,
-  );
-  const SEARCH = [
-    {
-      id: "tavily",
-      key: "TAVILY_API_KEY",
-      url: "https://app.tavily.com",
-      note: t(
-        "free ~1000/mo, no card, has answer ★",
-        "free ~1000/мес, без карты, есть answer ★",
-      ),
-    },
-    {
-      id: "exa",
-      key: "EXA_API_KEY",
-      url: "https://dashboard.exa.ai",
-      note: t("free ~20k/mo, no card", "free ~20k/мес, без карты"),
-    },
-    {
-      id: "parallel",
-      key: "PARALLEL_API_KEY",
-      url: "https://platform.parallel.ai",
-      note: t("starter credits, no card", "стартовые кредиты, без карты"),
-    },
-    {
-      id: "brave",
-      key: "BRAVE_API_KEY",
-      url: "https://api-dashboard.search.brave.com",
-      note: t(
-        "card required (verification), ~$5/mo credit",
-        "нужна карта (идентификация), ~$5/мес кредит",
-      ),
-    },
-  ];
-  SEARCH.forEach((s, i) =>
-    console.log(
-      `   ${i + 1}. ${s.id}  ${C.c}${s.url}${C.x}  ${C.y}(${s.note})${C.x}`,
-    ),
-  );
-  const curSearch = existing.SEARCH_PROVIDER || out.SEARCH_PROVIDER || "tavily";
-  const defIdx = Math.max(
-    0,
-    SEARCH.findIndex((s) => s.id === curSearch),
-  );
-  const chSearch = await ask(
-    `  ${t("Search provider (number)", "Провайдер поиска (номер)")}`,
-    String(defIdx + 1),
-  );
-  let si = parseInt(chSearch, 10) - 1;
-  if (isNaN(si) || si < 0 || si >= SEARCH.length) si = defIdx;
-  const sprov = SEARCH[si];
-  out.SEARCH_PROVIDER = sprov.id;
-  console.log(
-    `  ${t("Key for", "Ключ")} ${sprov.id}: ${C.c}${sprov.url}${C.x}${sprov.id === "brave" ? `  ${C.y}${t("(card required)", "(потребуется карта)")}${C.x}` : ""}. ${t("Enter — skip.", "Enter — пропустить.")}`,
-  );
-  const keyExisting =
-    process.env[sprov.key] || existing[sprov.key] || out[sprov.key] || "";
-  let kv = await ask(
-    `  ${sprov.id} API key`,
-    keyExisting ? mask(keyExisting) : "",
-  );
-  if (keyExisting && (!kv || kv.endsWith(KEEP()))) kv = keyExisting;
-  out[sprov.key] = (kv || "").trim();
-
-  // ── Enhanced memory (optional hybrid plugin) ──────────────────────
-  // База (BM25 + граф связей) уже включена всегда, бесплатно, без ключа. Здесь — только
-  // opt-in на семантический hybrid, который стоит внешнего ключа.
-  console.log(
-    `\n  ${t("Enhanced memory (hybrid search) — optional", "Улучшенная память (hybrid-поиск) — по желанию")}`,
-  );
-  console.log(
-    `  ${C.y}${t(
-      "Base search (BM25 + link graph) is already on — free, no key. Hybrid adds semantic search via ONE external key (~cents/mo), better for a large vault or fuzzy/cross-language queries.",
-      "Базовый поиск (BM25 + граф связей) уже включён — бесплатно, без ключа. Hybrid добавляет семантику через ОДИН внешний ключ (~центы/мес), лучше для большого вольта и нечётких/межъязычных запросов.",
-    )}${C.x}`,
-  );
-  if (
-    await askYesNo(
-      `  ${t("Enable hybrid memory?", "Включить hybrid-память?")}`,
-      existing.MEMORY_SEARCH_MODE === "hybrid",
-    )
-  ) {
-    const EMB = [
-      {
-        id: "jina",
-        key: "JINA_API_KEY",
-        url: "https://jina.ai/embeddings",
-        note: t("no-train, EU, ~$0.02/1M", "no-train, EU, ~$0.02/1M"),
-      },
-      {
-        id: "deepinfra",
-        key: "DEEPINFRA_API_KEY",
-        url: "https://deepinfra.com/dash/api_keys",
-        note: t("cheapest, BGE-M3", "дешевле всех, BGE-M3"),
-      },
-    ];
-    EMB.forEach((e, i) =>
-      console.log(
-        `   ${i + 1}. ${e.id}  ${C.c}${e.url}${C.x}  ${C.y}(${e.note})${C.x}`,
-      ),
-    );
-    const chEmb = await ask(
-      `  ${t("Embedding provider (number)", "Провайдер эмбеддингов (номер)")}`,
-      existing.DEEPINFRA_API_KEY && !existing.JINA_API_KEY ? "2" : "1",
-    );
-    let ei = parseInt(chEmb, 10) - 1;
-    if (isNaN(ei) || ei < 0 || ei >= EMB.length) ei = 0;
-    const eprov = EMB[ei];
-    const eExisting =
-      process.env[eprov.key] || existing[eprov.key] || out[eprov.key] || "";
-    console.log(
-      `  ${t("Key for", "Ключ")} ${eprov.id}: ${C.c}${eprov.url}${C.x}. ${t("Enter — skip.", "Enter — пропустить.")}`,
-    );
-    let ek = await ask(
-      `  ${eprov.id} API key`,
-      eExisting ? mask(eExisting) : "",
-    );
-    if (eExisting && (!ek || ek.endsWith(KEEP()))) ek = eExisting;
-    out[eprov.key] = (ek || "").trim();
-    out.MEMORY_SEARCH_MODE = resolveMemorySearchMode(true, out);
-    if (out.MEMORY_SEARCH_MODE === "hybrid") {
-      console.log(
-        `  ${C.y}${t("Index will build on the next nightly maintenance (or run: node scripts/memory/embed-index.ts).", "Индекс соберётся при ближайшем ночном обслуживании (или вручную: node scripts/memory/embed-index.ts).")}${C.x}`,
-      );
-    } else {
-      console.log(
-        `  ${C.y}${t("No key — hybrid skipped. Memory search stays on free BM25. Enable later: iva config.", "Ключа нет — hybrid пропущен. Поиск памяти остаётся на бесплатном BM25. Включить позже: iva config.")}${C.x}`,
-      );
-    }
-  } else {
-    out.MEMORY_SEARCH_MODE = resolveMemorySearchMode(false, out);
-  }
-
-  // ── Step 3: Telegram bot ──────────────────────────────────────────
-  head(
-    3,
-    t(
-      "Telegram bot — how you talk to Iva",
-      "Telegram-бот — через него вы говорите с Iva",
-    ),
-  );
-  console.log(
-    `  ${t("Create a bot via @BotFather in Telegram:", "Создайте бота у @BotFather в Telegram:")}`,
-  );
-  console.log(
-    `    1) ${t("open a chat with @BotFather", "откройте чат с @BotFather")}`,
-  );
-  console.log(`    2) ${t("send /newbot", "отправьте /newbot")}`);
-  console.log(
-    `    3) ${t("set the bot's name and username", "задайте имя и username бота")}`,
-  );
-  console.log(
-    `    4) ${t("copy the token like 123456789:ABCdef...", "скопируйте token вида 123456789:ABCdef...")}`,
-  );
-  let me: TelegramBot | null | undefined = null;
-  out.TELEGRAM_BOT_TOKEN = await askRequired(
-    `  ${t("Paste the Bot token", "Вставьте Bot token")}`,
-    {
-      existing: existing.TELEGRAM_BOT_TOKEN || "",
-      validate: async (token) => {
-        try {
-          me = await telegramGetMe(token);
-          return null;
-        } catch (error) {
-          const caught = error as ThrownSetupError;
-          return t(
-            `Telegram rejected the token (${caught.message}). Copy it again from @BotFather.`,
-            `Telegram не принял токен (${caught.message}). Скопируйте заново у @BotFather.`,
-          );
-        }
-      },
-    },
-  );
-  const telegramBot = me as TelegramBot | null | undefined;
-  out.TELEGRAM_BOT_USERNAME =
-    telegramBot?.username ||
-    out.TELEGRAM_BOT_USERNAME ||
-    (await ask(
-      `  ${t("Bot username (without @)", "Username бота (без @)")}`,
-      existing.TELEGRAM_BOT_USERNAME || "",
-    ));
-  if (telegramBot?.username)
-    console.log(`  → ${t("bot", "бот")}: ${C.g}@${telegramBot.username}${C.x}`);
-  out.TELEGRAM_WEBHOOK_SECRET_TOKEN =
-    existing.TELEGRAM_WEBHOOK_SECRET_TOKEN || randomBytes(24).toString("hex");
-
-  // ── Step 4: trusted users (loop until ≥1 ID) ──────────────────────
-  head(
-    4,
-    t(
-      "Access — who the bot answers at all",
-      "Доступ — кому бот вообще отвечает",
-    ),
-  );
-  console.log(
-    `  ${C.y}${t("IMPORTANT:", "ВАЖНО:")}${C.x} ${t("Iva answers ONLY trusted Telegram IDs.", "Iva отвечает ТОЛЬКО доверенным Telegram ID.")}`,
-  );
-  console.log(
-    `  ${t("Without at least one ID the bot stays silent to everyone (that's how your data is protected).", "Без хотя бы одного ID бот промолчит всем (так ваши данные защищены).")}`,
-  );
-  const ids = new Set(
-    (existing.TELEGRAM_ALLOWED_USER_IDS || "")
-      .split(/[,\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-  while (ids.size === 0) {
-    console.log(
-      `\n  ${t("Let's find your ID.", "Определим ваш ID.")} ${C.c}${t(`Open Telegram, find @${out.TELEGRAM_BOT_USERNAME || "your_bot"} and send it any message`, `Откройте Telegram, найдите @${out.TELEGRAM_BOT_USERNAME || "своего_бота"} и напишите ему любое сообщение`)}${C.x} ${t('(e.g. "hi").', "(напр. «привет»).")}`,
-    );
-    await ask(
-      `  ${t("Sent the bot a message? press Enter", "Написали боту? нажмите Enter")}`,
-    );
-    try {
-      const found = await fetchTelegramUserIds(out.TELEGRAM_BOT_TOKEN);
-      if (found.length) {
-        console.log(
-          `  ${t("Found who messaged the bot:", "Нашёл, кто писал боту:")}`,
-        );
-        found.forEach((u, i) => console.log(`   ${i + 1}. ${u.id}  ${u.name}`));
-        const pick = await ask(
-          `  ${t("Which IDs to add? numbers comma-separated (Enter — add all)", "Чьи ID добавить? номера через запятую (Enter — добавить всех)")}`,
-          "",
-        );
-        const chosen = pick
-          ? pick
-              .split(/[,\s]+/)
-              .map((n) => found[parseInt(n, 10) - 1])
-              .filter(Boolean)
-          : found;
-        chosen.forEach((u) => ids.add(u.id));
-      } else {
-        console.log(
-          `${C.y}  ${t("I see no messages to the bot. Did you definitely send one? (if a webhook is set, getUpdates returns nothing)", "Не вижу сообщений боту. Точно написали? (если уже стоит вебхук — getUpdates не отдаёт апдейты)")}${C.x}`,
-        );
-      }
-    } catch (error) {
-      const caught = error as ThrownSetupError;
-      console.log(
-        `${C.y}  ${t(`Couldn't fetch updates: ${caught.message}`, `Не смог получить апдейты: ${caught.message}`)}${C.x}`,
-      );
-    }
-    if (ids.size === 0) {
-      const manual = await ask(
-        `  ${t("Enter your Telegram ID manually (find it: message @userinfobot), or Enter — try again", "Введите свой Telegram ID вручную (узнать: напишите @userinfobot), или Enter — попробовать снова")}`,
-        "",
-      );
-      manual
-        .split(/[,\s]+/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .forEach((s) => ids.add(s));
-    }
-  }
-  out.TELEGRAM_ALLOWED_USER_IDS = [...ids].join(",");
-  out.TELEGRAM_DIGEST_CHAT_ID =
-    existing.TELEGRAM_DIGEST_CHAT_ID || [...ids][0] || "";
-  console.log(
-    `  → ${t("access granted to ID", "доступ разрешён ID")}: ${C.g}${out.TELEGRAM_ALLOWED_USER_IDS}${C.x}`,
-  );
-
-  // ── Step 5: timezone, vault, port ─────────────────────────────────
-  head(5, t("Timezone and memory storage", "Часовой пояс и хранилище памяти"));
-  console.log(
-    `  ${t("The timezone lets Iva use your real local time, not the server's.", "Часовой пояс нужен, чтобы Iva понимала ваше реальное время, а не время сервера.")}`,
-  );
-  for (;;) {
-    const candidate = await ask(
-      `  ${t("Timezone (IANA, e.g. Asia/Almaty, Asia/Tashkent, Europe/Berlin)", "Часовой пояс (IANA, напр. Asia/Almaty, Asia/Tashkent, Europe/Moscow)")}`,
-      out.ASSISTANT_TIMEZONE || "Asia/Almaty",
-    );
-    const timezone = validateTimeZone(candidate);
-    if (timezone) {
-      out.ASSISTANT_TIMEZONE = timezone;
-      break;
-    }
-    console.log(
-      `${C.r}  ${t("Unknown IANA timezone. Try again.", "Неизвестный часовой пояс IANA. Введите ещё раз.")}${C.x}`,
-    );
-  }
-  out.ASSISTANT_VAULT_DIR = await ask(
-    `  ${t("Vault directory (memory + git backup)", "Каталог vault (память + git-бэкап)")}`,
-    out.ASSISTANT_VAULT_DIR || "vault",
-  );
-  out.ASSISTANT_DATA_DIR = out.ASSISTANT_DATA_DIR || "data";
-  // Off-the-beaten-path port: 3000/8000/8080 are often taken on a typical VPS (docker etc.). The server
-  // listens on IVA_PORT and clients (poll bridge, digest, rollups) reach it via ASSISTANT_HOST. We check
-  // the chosen port is free — otherwise the server would die with EADDRINUSE (silent exit → bot is mute).
-  out.IVA_PORT = await pickPort(out.IVA_PORT || "8723");
-  // For localhost, ASSISTANT_HOST MUST follow IVA_PORT: otherwise changing the port here
-  // leaves bridge/cron clients on the old port (server moved, clients didn't) → the bot goes
-  // mute. A custom non-localhost host (remote server) is kept as is.
-  const localHost = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\/?$/i.test(
-    out.ASSISTANT_HOST || "",
-  );
-  out.ASSISTANT_HOST =
-    !out.ASSISTANT_HOST || localHost
-      ? `http://127.0.0.1:${out.IVA_PORT}`
-      : out.ASSISTANT_HOST;
-  // ── Write .env ────────────────────────────────────────────────────
-  const selected: { model: string; key: string | null } = {
-    ollama: { model: "OLLAMA_MODEL", key: "OLLAMA_API_KEY" },
-    opencode: { model: "OPENCODE_MODEL", key: "OPENCODE_API_KEY" },
-    openrouter: { model: "OPENROUTER_MODEL", key: "OPENROUTER_API_KEY" },
-    codex: { model: "CODEX_MODEL", key: null },
-    custom: { model: "CUSTOM_MODEL", key: "CUSTOM_API_KEY" },
-  }[provider];
-  process.stdout.write(
-    `  ${t("validating the selected model again…", "ещё раз проверяю выбранную модель…")} `,
-  );
-  const catOut = catalogProvider(provider);
-  await validateModelSelection({
-    provider: out.MODEL_PROVIDER,
-    model: out[selected.model],
-    key: selected.key ? out[selected.key] || undefined : undefined,
-    dataDir: dataDirAbs(out),
-    // Адрес своего эндпоинта: у остальных провайдеров он вшит в каталог.
-    ...(catOut ? { base: providerBase(catOut, out) } : {}),
-  });
-  console.log(`${C.g}${t("ok", "ок")}${C.x}`);
-  await writeEnv(out);
-
-  const chosenModel = {
-    ollama: out.OLLAMA_MODEL,
-    opencode: out.OPENCODE_MODEL,
-    openrouter: out.OPENROUTER_MODEL,
-    codex: out.CODEX_MODEL,
-    custom: out.CUSTOM_MODEL,
-  }[provider];
-  console.log();
-  hr();
-  console.log(
-    `${C.g}${C.b}  ✓ ${
-      STAGING_CONFIG
-        ? t(
-            "Ready — settings validated for apply",
-            "Готово к применению — настройки проверены",
-          )
-        : t("Done — everything written to .env", "Готово — всё записано в .env")
-    }${C.x}`,
-  );
-  console.log(
-    `  ${t("Provider", "Провайдер")}: ${provider} · ${t("Model", "Модель")}: ${C.g}${chosenModel}${C.x} · Deepgram: ${out.DEEPGRAM_LANGUAGE} · ${t("Bot", "Бот")}: ${C.g}@${out.TELEGRAM_BOT_USERNAME}${C.x}`,
-  );
-  console.log(
-    `  ${t("Access", "Доступ")}: ${out.TELEGRAM_ALLOWED_USER_IDS} · TZ: ${out.ASSISTANT_TIMEZONE} · vault: ${out.ASSISTANT_VAULT_DIR} · ${t("lang", "язык")}: ${out.AGENT_LANGUAGE}`,
-  );
-  hr();
-  rl.close();
+  return provChoice === 2
+    ? "opencode"
+    : provChoice === 3
+      ? "codex"
+      : provChoice === 4
+        ? "openrouter"
+        : provChoice === 5
+          ? "custom"
+          : "ollama";
 }
 
-main().catch((error) => {
+/** Контекст мастера: живой диалог, сеть и запись .env — то, что шаги получают параметром. */
+function createSetupContext(): SetupContext {
+  return {
+    t,
+    lang: () => LANG,
+    print: (...args: unknown[]) => console.log(...args),
+    write: (text: string) => {
+      process.stdout.write(text);
+    },
+    ask,
+    askYesNo,
+    askRequired,
+    mask,
+    pickFromList,
+    pickPort,
+    head,
+    hr,
+    envValue: (name) => process.env[name],
+    dataDirAbs,
+    readAuth,
+    listCodexModels,
+    runBrowserLogin,
+    runDeviceCodeLogin,
+    fetchModels,
+    validateModelSelection,
+    writeEnv,
+    ollamaModels,
+    opencodeCheck,
+    opencodeModels,
+    openrouterKeyCheck,
+    openrouterModelCheck,
+    deepgramCheck,
+    telegramGetMe,
+    fetchTelegramUserIds,
+  };
+}
+
+void main().catch((error) => {
   const caught = error as ThrownSetupError | null | undefined;
   console.error(
     `${C.r}${t("Setup aborted:", "Настройка прервана:")}${C.x}`,

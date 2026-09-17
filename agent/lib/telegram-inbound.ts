@@ -207,6 +207,19 @@ function isBotCommand(text: string, bot?: string): boolean {
     : bot !== undefined && target.toLowerCase() === bot.toLowerCase();
 }
 
+// Упоминание — только точное имя бота на границе ника. Наивная подстрока «@имя»
+// ловила чужие ники с тем же началом (@ivan при боте iva) и будила бота в группе
+// на сообщении, адресованном другому человеку; границы токена — та же логика,
+// что у eve isTelegramBotMentioned и hasExactMention в очереди моста.
+function mentionsBot(text: string, bot?: string): boolean {
+  if (bot === undefined) return false;
+  const escaped = bot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(
+    `(?:^|[^A-Za-z0-9_])@${escaped}(?=$|[^A-Za-z0-9_])`,
+    "iu",
+  ).test(text);
+}
+
 function shouldDispatch(msg: TelegramInboundMessage, bot?: string): boolean {
   if (msg.from?.isBot === true || msg.chat.type === "channel") return false;
   const text: string = msg.text || msg.caption || "";
@@ -215,7 +228,7 @@ function shouldDispatch(msg: TelegramInboundMessage, bot?: string): boolean {
     msg.chat.type === "private" ||
     msg.replyToMessage?.from?.isBot === true ||
     isBotCommand(text, bot) ||
-    (bot !== undefined && text.toLowerCase().includes(`@${bot.toLowerCase()}`))
+    mentionsBot(text, bot)
   );
 }
 
@@ -233,8 +246,7 @@ function shouldDispatchMedia(
   return (
     msg.replyToMessage?.from?.isBot === true ||
     isBotCommand(caption, bot) ||
-    (bot !== undefined &&
-      caption.toLowerCase().includes(`@${bot.toLowerCase()}`))
+    mentionsBot(caption, bot)
   );
 }
 
@@ -352,8 +364,10 @@ async function noAccessNote(
       );
   try {
     await effects.sendMessage(note);
-  } catch {
-    /* молча игнорируем сбой ответа */
+  } catch (error) {
+    console.error(
+      `[telegram] не смог отправить отказ в доступе: ${String(error)}`,
+    );
   }
 }
 
@@ -398,8 +412,10 @@ async function unreadableNote(
         `Не могу прочитать это сообщение${fields}. Пришли текстом или файлом.`,
       ),
     );
-  } catch {
-    /* молча игнорируем сбой ответа */
+  } catch (error) {
+    console.error(
+      `[telegram] не смог отправить «не могу прочитать сообщение»: ${String(error)}`,
+    );
   }
 }
 
@@ -423,7 +439,10 @@ function logInboundFindings(
   sanitized: ReturnType<typeof sanitizeInbound>,
 ): boolean {
   const flagged = sanitized.blocked || sanitized.flags.length > 0;
-  if (flagged) {
+  // Журнал — только для настоящей тревоги: blocked или attack-signal
+  // (role-markers/overrides). Флаги lookalikes/invisible стоят на каждом русском
+  // сообщении — тревога на каждый ход утопила бы настоящие находки.
+  if (sanitized.blocked || hasInboundAttackSignal(sanitized)) {
     console.error(
       "[security] inbound flagged:",
       sanitized.reason,

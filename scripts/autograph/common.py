@@ -9,6 +9,7 @@ import re
 import json
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from datetime import date, datetime
 from collections import defaultdict
@@ -539,12 +540,28 @@ def is_hub_path(path: str) -> bool:
     return Path(path).name in {'_index', 'MEMORY'}
 
 
+def extract_title(content: str) -> str | None:
+    """Return the first H1 of the card body, or None when it has none."""
+    _fields, body, _lines = parse_frontmatter(content)
+    for line in body.splitlines():
+        match = re.match(r'^#\s+(\S.*?)\s*$', line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def normalize_title(text: str) -> str:
+    """Normalize an H1 title into a link key: NFC, one space, casefold."""
+    return ' '.join(unicodedata.normalize('NFC', text).split()).casefold()
+
+
 def build_link_index(vault_dir: Path, files: list[Path] | None = None) -> dict:
     """Build deterministic indexes for wikilink resolution."""
     files = files or walk_vault(vault_dir)
     exact = {}
     suffix_map = defaultdict(set)
     stem_map = defaultdict(set)
+    title_map = defaultdict(set)
 
     for md in files:
         rp = rel_path(md, vault_dir)
@@ -556,12 +573,27 @@ def build_link_index(vault_dir: Path, files: list[Path] | None = None) -> dict:
         for i in range(1, len(parts) - 1):
             suffix_map['/'.join(parts[i:])].add(rp_noext)
 
+        # Ссылка по H1 — последняя стратегия резолва, поэтому заголовки читаются
+        # тем же обходом, что и stem'ы. Нечитаемая карточка пропускается с
+        # предупреждением из read_card, а не молча.
+        content = read_card(md)
+        if content is None:
+            continue
+        title = extract_title(content)
+        if title is None:
+            continue
+        key = normalize_title(title)
+        if key:
+            title_map[key].add(rp_noext)
+
     return {
         'exact': exact,
         'unique_suffix': {k: next(iter(v)) for k, v in suffix_map.items() if len(v) == 1},
         'ambiguous_suffix': {k: sorted(v) for k, v in suffix_map.items() if len(v) > 1},
         'unique_stem': {k: next(iter(v)) for k, v in stem_map.items() if len(v) == 1},
         'ambiguous_stem': {k: sorted(v) for k, v in stem_map.items() if len(v) > 1},
+        'unique_title': {k: next(iter(v)) for k, v in title_map.items() if len(v) == 1},
+        'ambiguous_title': {k: sorted(v) for k, v in title_map.items() if len(v) > 1},
     }
 
 
@@ -578,7 +610,7 @@ def normalize_link_target(target: str) -> str:
 
 
 def resolve_link_target(target: str, link_index: dict) -> tuple[str | None, str]:
-    """Resolve a target using exact path, unique suffix, then unique stem."""
+    """Resolve a target using exact path, unique suffix, unique stem, then unique title."""
     target = normalize_link_target(target)
     if not target:
         return None, 'empty'
@@ -588,6 +620,8 @@ def resolve_link_target(target: str, link_index: dict) -> tuple[str | None, str]
     ambiguous_suffix = link_index.get('ambiguous_suffix', {})
     unique_stem = link_index.get('unique_stem', {})
     ambiguous_stem = link_index.get('ambiguous_stem', {})
+    unique_title = link_index.get('unique_title', {})
+    ambiguous_title = link_index.get('ambiguous_title', {})
 
     if target in exact:
         return exact[target], 'exact'
@@ -603,6 +637,12 @@ def resolve_link_target(target: str, link_index: dict) -> tuple[str | None, str]
         return unique_stem[stem], 'unique_stem'
     if stem in ambiguous_stem:
         return None, 'ambiguous_stem'
+    # Путь и stem сильнее заголовка: H1 решает только там, где имя файла не решило.
+    title_key = normalize_title(target)
+    if title_key in unique_title:
+        return unique_title[title_key], 'unique_title'
+    if title_key in ambiguous_title:
+        return None, 'ambiguous_title'
     return None, 'missing'
 
 

@@ -3,19 +3,11 @@ import { spawn, type SpawnOptions } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
-import {
-  chmod,
-  cp,
-  copyFile,
-  mkdir,
-  mkdtemp,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -59,15 +51,9 @@ void test("iva userbot diagnose --json returns the shared ready state without se
   const project = join(dir, "iva");
   const fakeBin = join(dir, "bin");
   const token = "diagnose-secret-token";
-  await mkdir(join(project, "bin"), { recursive: true });
-  await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(join(project, "data"), { recursive: true });
   await mkdir(fakeBin, { recursive: true });
-  await copyFile(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts/cli"), join(project, "scripts/cli"), {
-    recursive: true,
-  });
-  await symlink(join(ROOT, "scripts/lib"), join(project, "scripts/lib"), "dir");
+  await plantCliTree(ROOT, project, { copy: ["scripts/cli"] });
   await writeFile(join(project, "data/telegram-userbot.token"), token);
 
   const systemctl = join(fakeBin, "systemctl");

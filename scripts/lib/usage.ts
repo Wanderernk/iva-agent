@@ -219,12 +219,30 @@ const blank = (): Accumulator => ({
   turns: new Set<string>(),
 });
 
+/**
+ * Слагаемое отчёта: число из лога, а не что угодно. Лог мог быть записан прежней версией,
+ * где мусор провайдера уезжал в файл (`null` вместо переполненного double) — такая строка
+ * считается нулём, а сумма не имеет права стать бесконечной: /usage не печатает Infinity
+ * (PBT-DS1-P F1). Потолок тот же, что у писателя (`agent/hooks/usage.ts`: `usageTokens`):
+ * расход — безопасное целое >= 0, всё прочее (одиночное `1e308`, дробное, отрицательное)
+ * из старого лога считается нулём, а не числом. Переполнение суммы упирается в потолок
+ * безопасного целого.
+ */
+function sum(current: number, value: unknown): number {
+  const part =
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      ? value
+      : 0;
+  const next = current + part;
+  return Number.isSafeInteger(next) ? next : Number.MAX_SAFE_INTEGER;
+}
+
 function add(accumulator: Accumulator, entry: UsageRecord): void {
-  accumulator.in += entry.in || 0;
-  accumulator.out += entry.out || 0;
-  accumulator.cacheRead += entry.cacheRead || 0;
-  accumulator.cacheWrite += entry.cacheWrite || 0;
-  accumulator.total += entry.total || 0;
+  accumulator.in = sum(accumulator.in, entry.in);
+  accumulator.out = sum(accumulator.out, entry.out);
+  accumulator.cacheRead = sum(accumulator.cacheRead, entry.cacheRead);
+  accumulator.cacheWrite = sum(accumulator.cacheWrite, entry.cacheWrite);
+  accumulator.total = sum(accumulator.total, entry.total);
   accumulator.steps += 1;
   accumulator.turns.add(turnKey(entry));
 }

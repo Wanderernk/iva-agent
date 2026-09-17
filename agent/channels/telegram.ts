@@ -10,8 +10,14 @@ import { POST } from "eve/channels";
 import {
   noticeSender,
   sendThroughOutbox,
+  type OutboxAck,
   type OutboxTransport,
 } from "../lib/outbox.js";
+import { hasRichButtons } from "../lib/telegram-format.js";
+import {
+  TELEGRAM_RICH_REPLIES,
+  type RichReplies,
+} from "../lib/telegram-rich-replies.js";
 // Inbound-пайплайн — единственный вход внутрь: allowlist, решение о диспатче,
 // запись в Vault, медиа со зрением и транскрипцией, inbound-Gate и контекст хода.
 // Канал приносит ему эффекты и сам про разбор входящего ничего не знает.
@@ -75,39 +81,13 @@ import {
 // решает шов (agent/lib/outbox.ts) — здесь только вызовы Bot API и логи отказов.
 // stop канал не выставляет намеренно: ответ в диалоге короткий, и упавший кусок
 // не повод молчать остальными. Обрыв хвоста — про ночные отчёты, не про разговор.
-function outboxTransport(
+// При TELEGRAM_RICH_REPLIES=never ключа sendRich в транспорте нет вовсе, и шов
+// (agent/lib/outbox.ts) сам уходит HTML-путём.
+export function outboxTransport(
   tg: Pick<TelegramHandle, "chatId" | "messageThreadId" | "request" | "post">,
+  richReplies: RichReplies,
 ): OutboxTransport {
-  return {
-    // Rich message (sendRichMessage, Bot API 10.1): таблицы/таск-листы/<details>/формулы
-    // рендерятся нативно — HTML-путь так не умеет. Любая ошибка (старый Bot API, парс,
-    // лимит 32768, RICH_MESSAGE_*) уводит шов в HTML-путь, то есть в поведение до rich.
-    // request() = raw Bot API call, транспорт JSON, поэтому rich_message шлём объектом.
-    async sendRich(markdown) {
-      try {
-        const res = await tg.request("sendRichMessage", {
-          chat_id: tg.chatId,
-          rich_message: { markdown },
-          ...(tg.messageThreadId !== undefined
-            ? { message_thread_id: tg.messageThreadId }
-            : {}),
-        });
-        if (res.ok) return { ok: true };
-        console.error(
-          "[telegram] sendRichMessage отвергнут, фолбэк HTML:",
-          res.status,
-          JSON.stringify(res.body).slice(0, 300),
-        );
-        return {
-          ok: false,
-          error: `sendRichMessage ${res.status}`,
-          retryPlain: false,
-        };
-      } catch (err) {
-        console.error("[telegram] sendRichMessage упал, фолбэк HTML:", err);
-        return { ok: false, error: String(err), retryPlain: false };
-      }
-    },
+  const transport: OutboxTransport = {
     async sendHtml(html) {
       try {
         // eve's TelegramMessageBody type omits parse_mode, но рантайм
@@ -138,6 +118,50 @@ function outboxTransport(
       }
     },
   };
+  // Rich message (sendRichMessage, Bot API 10.1): таблицы/таск-листы/<details>/формулы/
+  // кнопки рендерятся нативно — HTML-путь так не умеет. Любая ошибка (старый Bot API,
+  // парс, лимит 32768, RICH_MESSAGE_*) уводит шов в HTML-путь, то есть в поведение до
+  // rich. request() = raw Bot API call, транспорт JSON, поэтому rich_message шлём объектом.
+  const sendRich = async (markdown: string): Promise<OutboxAck> => {
+    try {
+      const res = await tg.request("sendRichMessage", {
+        chat_id: tg.chatId,
+        rich_message: { markdown },
+        ...(tg.messageThreadId !== undefined
+          ? { message_thread_id: tg.messageThreadId }
+          : {}),
+      });
+      if (res.ok) return { ok: true };
+      console.error(
+        "[telegram] sendRichMessage отвергнут, фолбэк HTML:",
+        res.status,
+        JSON.stringify(res.body).slice(0, 300),
+      );
+      return {
+        ok: false,
+        error: `sendRichMessage ${res.status}`,
+        retryPlain: false,
+      };
+    } catch (err) {
+      console.error("[telegram] sendRichMessage упал, фолбэк HTML:", err);
+      return { ok: false, error: String(err), retryPlain: false };
+    }
+  };
+  // TELEGRAM_RICH_REPLIES=never держит таблицы и прочее на HTML-пути, но кнопка живёт
+  // только в rich-сообщении (ADR-0015): ответ с <tg-button> уходит rich в любом режиме,
+  // иначе тег доехал бы до чата текстом.
+  transport.sendRich =
+    richReplies === "auto"
+      ? sendRich
+      : async (markdown) =>
+          hasRichButtons(markdown)
+            ? sendRich(markdown)
+            : {
+                ok: false,
+                error: "TELEGRAM_RICH_REPLIES=never",
+                retryPlain: false,
+              };
+  return transport;
 }
 
 // Пульс живого хода в run-status: без него жнец моста снимал молчаливый длинный ход
@@ -172,6 +196,12 @@ const telegram = telegramChannel({
   // ВАЖНО: наличие этого хука закрывает дефолтную ветку eve НАВСЕГДА — «Unsupported
   // action.» на не-HITL колбэки больше не отправляется. Поэтому чужой колбэк гасим
   // сами пустым answerCallbackQuery: иначе у нажавшего вечный спиннер на кнопке.
+  //
+  // Кнопки, написанные моделью, в long-poll до этого хука не доходят вовсе: мост
+  // превращает тап в обычное сообщение (scripts/poller/control.ts) и отдаёт его
+  // inbound pipeline — подать сообщение в сессию каналу нечем, у него только Bot API,
+  // а inbound pipeline читает сообщения. В webhook-режиме (моста нет) такой тап
+  // остаётся без доставки: здесь он только гаснет.
   onCallbackQuery: async (ctx, query) => {
     const ack = async (text?: string) => {
       try {
@@ -255,8 +285,9 @@ const telegram = telegramChannel({
     // Ответ модели уходит через Outbox — он же переопределяет дефолтную plain-доставку
     // eve. Промежуточный текст перед tool-calls не шлём (зеркалим дефолт). Повторного
     // хода модели на сбой доставки нет — ход уже закрыт, реформат произойдёт на следующем
-    // сообщении (ошибка видна в логе/vault). Латентность засчитываем, только если ушло
-    // хотя бы одно сообщение и ни одно не потерялось.
+    // сообщении (ошибка видна в логе/vault). Латентность засчитываем, только если ни одно
+    // сообщение не потерялось: пустой рендер шов отдаёт с ok=false, поэтому проверки
+    // delivered у вызывающего больше нет.
     async "message.completed"(data, channel, ctx) {
       if (data.finishReason === "tool-calls" || !data.message) return;
       const message = data.message;
@@ -282,9 +313,13 @@ const telegram = telegramChannel({
           source: "telegram",
         },
         message,
-        () => sendThroughOutbox(message, outboxTransport(channel.telegram)),
+        () =>
+          sendThroughOutbox(
+            message,
+            outboxTransport(channel.telegram, TELEGRAM_RICH_REPLIES),
+          ),
       );
-      if (result.delivered > 0 && result.ok) recordDelivery(true);
+      if (result.ok) recordDelivery(true);
     },
     // Ход упал: статус прибираем по CAS, но сообщение об ошибке от него не гейтим —
     // позднее terminal-событие всё равно должно объяснить пользователю, что произошло.
@@ -296,6 +331,7 @@ const telegram = telegramChannel({
       }
       await notifyTelegramFailure(
         ctx.session.id,
+        data.turnId,
         data,
         noticeSender((text) => channel.telegram.sendMessage(text)),
       );
@@ -312,6 +348,7 @@ const telegram = telegramChannel({
       }
       await notifyTelegramFailure(
         data.sessionId,
+        null,
         data,
         noticeSender((text) => channel.telegram.sendMessage(text)),
       );

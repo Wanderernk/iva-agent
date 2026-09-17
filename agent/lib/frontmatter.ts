@@ -27,6 +27,32 @@ export class FrontmatterParseError extends Error {
   override readonly name = "FrontmatterParseError";
 }
 
+/**
+ * Frontmatter карточки, которую мог испортить человек. Вольт — обычный git-репо,
+ * владелец правит карточки руками, и одной незакрытой кавычки (`company: 'Sayyora's
+ * Splendor'`) хватало, чтобы выключить ВСЮ память: каталог карточек обходят четыре
+ * читателя, и каждый падал на первом же битом файле — ни поиска, ни записи, ни
+ * ночного индекса, пока файл не найдут глазами.
+ *
+ * Разбор остаётся строгим; терпимость живёт здесь и только здесь. Битая карточка —
+ * `null` и одна строка в журнал С ПУТЁМ: пропуск без имени файла стал бы новой
+ * тишиной, а найти его иначе нечем. Любая другая ошибка — наружу: это уже не
+ * карточка владельца, а наш дефект.
+ */
+export function parseFrontmatterOrSkip(
+  content: string,
+  path: string,
+  log: (message: string) => void = console.error,
+): ParsedFrontmatter | null {
+  try {
+    return parseFrontmatter(content);
+  } catch (error) {
+    if (!(error instanceof FrontmatterParseError)) throw error;
+    log(`[frontmatter] ${path} пропущена: ${error.message}`);
+    return null;
+  }
+}
+
 export function parseFrontmatter(content: string): ParsedFrontmatter {
   const { frontmatter, body } = splitCard(content);
   if (frontmatter === null) return { fields: null, body, lines: [] };

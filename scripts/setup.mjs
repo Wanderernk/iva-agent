@@ -1,3 +1,4 @@
 #!/usr/bin/env node
 // Permanent compatibility shim: install.sh, npm and iva config invoke this path.
-import "./setup/main.ts";
+import { main } from "./setup/main.ts";
+void main(import.meta.url);

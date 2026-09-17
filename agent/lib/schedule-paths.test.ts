@@ -58,6 +58,7 @@ await test("resolvePaths defaults data paths under the current working directory
     dataDir: join(root, "data"),
     statusPath: join(root, "data", "rollup-status.json"),
     memoryLockPath: join(root, ".memory.lock"),
+    factsPath: join(root, "data", "jobs.json"),
   });
 });
 
@@ -69,6 +70,7 @@ await test("resolvePaths resolves a relative ASSISTANT_DATA_DIR from the root", 
     dataDir: join(root, "runtime/state"),
     statusPath: join(root, "runtime/state", "rollup-status.json"),
     memoryLockPath: join(root, ".memory.lock"),
+    factsPath: join(root, "runtime/state", "jobs.json"),
   });
 });
 
@@ -81,6 +83,7 @@ await test("resolvePaths preserves an absolute data directory without moving the
     dataDir,
     statusPath: join(dataDir, "rollup-status.json"),
     memoryLockPath: join(root, ".memory.lock"),
+    factsPath: join(dataDir, "jobs.json"),
   });
 });
 
@@ -101,6 +104,7 @@ await test("memoryRollupJob returns the exact command contract for every period"
       nodeBin: process.execPath,
       lockPath: join(root, ".memory.lock"),
       statusPath: join(root, "schedule-data", "rollup-status.json"),
+      factsPath: join(root, "schedule-data", "jobs.json"),
     });
   }
 });

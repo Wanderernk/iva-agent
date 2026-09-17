@@ -148,6 +148,97 @@ test("an edited line is not damage: that is the night's job", () => {
   );
 });
 
+test("a section whose body was emptied under a surviving heading is damage", () => {
+  const hollowedPreferences = coreDamage(
+    CORE,
+    CORE.replace("- 2026-07: отвечать коротко, без преамбул", ""),
+  );
+  assert.equal(hollowedPreferences.damaged, true);
+  assert.deepEqual(hollowedPreferences.hollowedHeadings, ["Предпочтения"]);
+  assert.deepEqual(hollowedPreferences.lostHeadings, []);
+  assert.equal(hollowedPreferences.emptied, false);
+
+  // Пользовательская секция вне шаблона: тело из пробелов тоже пусто.
+  const hollowedNotes = coreDamage(
+    CORE,
+    CORE.replace("- секция вне шаблона, модель её не трогает", "   "),
+  );
+  assert.deepEqual(hollowedNotes.hollowedHeadings, ["Мои заметки"]);
+
+  const hollowedBoth = coreDamage(
+    CORE,
+    CORE.replace("- 2026-07: отвечать коротко, без преамбул", "").replace(
+      "- секция вне шаблона, модель её не трогает",
+      "   ",
+    ),
+  );
+  assert.deepEqual(hollowedBoth.hollowedHeadings, [
+    "Предпочтения",
+    "Мои заметки",
+  ]);
+
+  const alert = coreDamageAlert(ru, [
+    ...hollowedBoth.lostHeadings,
+    ...hollowedBoth.hollowedHeadings,
+  ]);
+  assert.match(alert, /Предпочтения/u);
+  assert.match(alert, /vault\/CORE\.md/u);
+});
+
+test("an empty body that stays empty, or fills up, is not damage", () => {
+  const blank = CORE.replace("- 2026-07: отвечать коротко, без преамбул", "");
+  assert.equal(coreDamage(blank, blank).damaged, false);
+  assert.equal(coreDamage(blank, CORE).damaged, false);
+
+  const renamed = coreDamage(
+    CORE,
+    CORE.replace("## Мои заметки", "## Заметки"),
+  );
+  assert.deepEqual(renamed.lostHeadings, ["Мои заметки"]);
+  assert.deepEqual(renamed.hollowedHeadings, []);
+
+  // Идентичный файл не потеря ни для одного входа.
+  fc.assert(
+    fc.property(
+      fc.oneof(
+        coreDocument.map((document) => document.text),
+        junk,
+      ),
+      (text) => {
+        assert.equal(coreDamage(text, text).damaged, false);
+      },
+    ),
+    RUNS,
+  );
+});
+
+test("тела одинаковых заголовков склеиваются: выхолощенная секция видна", () => {
+  const duplicateBefore = [
+    "# CORE",
+    "",
+    "## Предпочтения",
+    "",
+    "- главное лежит в первой секции",
+    "",
+    "## Предпочтения",
+    "",
+    "## Указатели",
+    "",
+    "- Последний день: summaries/daily/2026-08-20 · Индекс: MOC.md",
+    "",
+  ].join("\n");
+  const duplicateAfter = duplicateBefore.replace(
+    "- главное лежит в первой секции",
+    "",
+  );
+
+  const damage = coreDamage(duplicateBefore, duplicateAfter);
+
+  assert.equal(damage.damaged, true);
+  assert.deepEqual(damage.hollowedHeadings, ["Предпочтения"]);
+  assert.deepEqual(damage.lostHeadings, []);
+});
+
 test("a first-run vault without CORE is not damage", () => {
   assert.equal(coreDamage("", "").damaged, false);
   assert.equal(coreDamage("", "# CORE\n").damaged, false);
@@ -245,6 +336,12 @@ test("CORE is snapshotted before the turn and pointed at the day after it", () =
   assert.ok(snapshot < turn, "a snapshot taken after the turn proves nothing");
   assert.ok(guard > turn, "damage is judged against the pre-turn file");
   assert.ok(guard < pointer, "restore first, only then point at the day");
+  // Список имён для alert собирается из обоих видов потери: пропавшие и выхолощенные секции.
+  assert.match(
+    rollupSource,
+    /\.\.\.damage\.lostHeadings,\s*\.\.\.damage\.hollowedHeadings,/u,
+  );
+  assert.match(rollupSource, /coreDamageAlert\(tr, damagedHeadings\)/u);
 });
 
 test("the daily prompt leaves an empty day's CORE alone", () => {

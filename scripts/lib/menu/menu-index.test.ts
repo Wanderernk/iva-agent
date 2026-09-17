@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-floating-promises -- Node's test runner owns registration promises. */
+import "../../fixtures/rich-menu-style.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFlows } from "../tg-flow.ts";
@@ -50,15 +51,11 @@ type TextMessage = {
   text: string;
 };
 type ScreenContext = {
-  backRow: (screen: string) => Array<Record<string, unknown>>;
   show: (state: MenuState, screen: string) => Promise<void>;
 };
 type Screen = {
   parent: string | null;
-  render: (
-    state: MenuState,
-    context: ScreenContext,
-  ) => { text: string; rows: Array<Array<Record<string, unknown>>> };
+  render: (state: MenuState, context: ScreenContext) => { text: string };
   on: (verb: string, args: string[]) => unknown;
   texts: {
     demo: (
@@ -101,9 +98,9 @@ function fakeScreens() {
   const log: Log = { render: [], on: [], texts: [] };
   const mk = (sid: string, parent: string | null): Screen => ({
     parent,
-    render(st: MenuState, ctx: ScreenContext) {
+    render(st: MenuState) {
       log.render.push(st.screen);
-      return { text: `[${st.screen}#${st.page}]`, rows: [ctx.backRow("r")] };
+      return { text: `[${st.screen}#${st.page}]` };
     },
     on(verb: string, args: string[]) {
       log.on.push({ sid, verb, args: [...args] });
@@ -199,14 +196,14 @@ const cb = (
   data,
 });
 
-test("open рисует root, заводит menu-стейт и шлёт новое сообщение", async () => {
+test("open рисует root, заводит menu-стейт и шлёт новое rich-сообщение", async () => {
   const { menu, flows, calls } = setup();
   const st = await menu.open(10, "20");
   assert.equal(st.flow, "menu");
   assert.equal(st.screen, "r");
-  assert.ok(st.msgId); // sendMessage выдал message_id
+  assert.ok(st.msgId); // sendRichMessage выдал message_id
   assert.equal(flows.get(10, "20"), st);
-  assert.equal(calls[0].method, "sendMessage");
+  assert.equal(calls[0].method, "sendRichMessage");
 });
 
 test("грамматика: одноаргументный data-верб уходит в screen.on(verb, args)", async () => {
@@ -300,6 +297,26 @@ test("stale: нет стейта, o-верб УСЫНОВЛЯЕТ тапнуто
   assert.equal(log.render.at(-1), "srch");
 });
 
+// sid, попадающий в Object.prototype (constructor/toString/__proto__/valueOf), — не экран:
+// поиск по реестру обязан идти по СВОИМ ключам, иначе мусор из кнопки становится «живым»
+// экраном, тап отвечает тишиной, а состояние уезжает на несуществующий экран.
+test("sid из прототипа Object не считается экраном: тост «устарело» и корень", async () => {
+  for (const sid of ["constructor", "toString", "__proto__", "valueOf"]) {
+    const { menu, flows, calls, log } = setup();
+    const result = await menu.onCallback(
+      cb(`iva_menu:${sid}:o`, { messageId: 555 }),
+    );
+    assert.equal(result, true, sid);
+    const ack = calls.find((c) => c.method === "answerCallbackQuery");
+    assert.ok(ack, sid);
+    assert.match(String(ack.params.text ?? ""), /устарело|expired/iu, sid);
+    const st = flows.get(10, "20");
+    assert.ok(st, sid);
+    assert.equal(st.screen, "r", sid);
+    assert.equal(log.render.at(-1), "r", sid);
+  }
+});
+
 test("stale group callback is acknowledged without adopting state or dispatching", async () => {
   for (const chatType of ["group", "supergroup", "channel", null]) {
     const { menu, flows, calls, log } = setup();
@@ -332,7 +349,8 @@ test("stale: нет стейта, data-верб -> «устарело» (editMes
   assert.equal(flows.get(10, "20"), null); // стейт не создан
   assert.equal(log.on.length, 0); // экран не тронут
   const edit = calls.find((c) => c.method === "editMessageText");
-  assert.ok(edit && /устарело|expired/i.test(edit.params.text ?? ""));
+  const rich = edit?.params.rich_message as { markdown?: string } | undefined;
+  assert.ok(edit && /устарело|expired/i.test(rich?.markdown ?? ""));
 });
 
 test("stale: msgId mismatch на data-верб -> «устарело», экран не тронут", async () => {
@@ -346,7 +364,10 @@ test("stale: msgId mismatch на data-верб -> «устарело», экра
     calls.some(
       (c) =>
         c.method === "editMessageText" &&
-        /устарело|expired/i.test(c.params.text ?? ""),
+        /устарело|expired/i.test(
+          ((c.params.rich_message ?? {}) as { markdown?: string }).markdown ??
+            "",
+        ),
     ),
   );
 });
@@ -359,6 +380,24 @@ test("stale: msgId mismatch на o-верб -> усыновляет новое �
   assert.ok(st);
   assert.equal(st.msgId, 777);
   assert.equal(st.screen, "st");
+});
+
+// Владение ожиданием проверяется по СВОЕМУ ключу texts: унаследованный `Object.constructor`
+// обработчиком не является. Иначе ожидание с kind «constructor» считается своим, живое меню
+// вытесняется, а следующий обычный текст удаляется и поглощается.
+test("kind из прототипа texts не делает экран владельцем ожидания", async () => {
+  const { menu, flows, log } = setup();
+  const st = await menu.open(10, "20");
+  st.screen = "srch";
+  st.awaitText = { kind: "constructor", secret: true, data: {} };
+  const liveMsgId = st.msgId;
+
+  await menu.onCallback(cb("iva_menu:core:o", { messageId: liveMsgId + 45 }));
+
+  assert.equal(flows.get(10, "20"), st, "живое меню не вытеснено");
+  assert.equal(st.msgId, liveMsgId, "меню осталось за своим сообщением");
+  assert.equal(st.awaitText, null, "ожидание снято, а не перенесено");
+  assert.equal(log.render.at(-1), "r", "перерисован корень");
 });
 
 test("allowlist: чужой тап ack-нут и проглочен — без диспатча, стейт не тронут", async () => {
@@ -380,14 +419,18 @@ test("allowlist пуст: любой тап проглочен", async () => {
   assert.equal(log.on.length, 0);
 });
 
-test("close r:x снимает стейт и убирает клавиатуру (edit без reply_markup)", async () => {
+test("close r:x снимает стейт и убирает кнопки из текста (edit без reply_markup)", async () => {
   const { menu, flows, calls } = setup();
   const st = await menu.open(10, "20");
   await menu.onCallback(cb("iva_menu:r:x", { messageId: st.msgId }));
   assert.equal(flows.get(10, "20"), null);
   const lastEdit = calls.filter((c) => c.method === "editMessageText").at(-1);
   assert.ok(lastEdit);
-  assert.equal(lastEdit.params.reply_markup, undefined); // клавиатура снята
+  assert.equal(lastEdit.params.reply_markup, undefined); // клавиатуры нет вовсе
+  // Финальный экран — rich: кнопок в нём не осталось (они жили в тексте прежнего экрана).
+  const rich = lastEdit.params.rich_message as
+    { markdown?: string } | undefined;
+  assert.equal(rich?.markdown, "Меню закрыто.");
 });
 
 test("close без стейта: правит тапнутое сообщение, не создаёт стейт", async () => {
@@ -509,16 +552,14 @@ test("every button on the root screen resolves to a registered screen", () => {
     {},
     {
       tr: (_english: string, russian: string) => russian,
-      btn: (text: string, callback_data: string) => ({ text, callback_data }),
     },
   );
 
   // Псевдо-sid — хендофф в визарды /model и /think, их обрабатывает сам движок (index.ts).
   const known = new Set([...Object.keys(SCREENS), "mdl", "thk"]);
-  const sids = view.rows
-    .flat()
-    .map((button: { callback_data: string }) => button.callback_data)
-    .map((data: string) => data.replace(/^iva_menu:/u, "").split(":")[0]);
+  const sids = [...view.text.matchAll(/<tg-button[^>]*data="([^"]+)"/g)]
+    .map((match) => match[1])
+    .map((data) => data.replace(/^iva_menu:/u, "").split(":")[0]);
 
   assert.ok(sids.length > 0, "the root screen must have buttons at all");
   for (const sid of sids)

@@ -126,3 +126,43 @@ test("a header template is expanded once, and an unset variable is empty", (t) =
     "[plugin trace] MISSING is not set in trace.env; using an empty value",
   ]);
 });
+
+// Конфиг плагина пишет владелец руками. Пока лишняя запятая в нём давала пустой конфиг
+// без единой строки в журнал, настройка исчезала бесследно: ни сборка, ни `iva doctor`,
+// ни журнал о ней не говорили. Возвращаемое значение прежнее — меняется только то, что
+// об испорченном файле теперь СЛЫШНО (agent/lib/settings.ts:57-90 про ту же развилку).
+test("a damaged config still reads as empty, but says so in the journal", (t) => {
+  const data = dataDir(t);
+  write(data, "trace", "{oh no");
+
+  const journal: string[] = [];
+  const before = console.error;
+  console.error = (...args: unknown[]) =>
+    journal.push(args.map(String).join(" "));
+  t.after(() => {
+    console.error = before;
+  });
+
+  assert.deepEqual(readPluginConfig("trace"), {});
+  assert.equal(journal.length, 1, "ровно одна строка на одно чтение");
+  assert.ok(
+    journal[0].includes(pluginConfigFile(data, "trace")),
+    "строка называет файл, который правит владелец",
+  );
+  assert.match(journal[0], /JSON/i, "и причину, по которой он не читается");
+});
+
+test("a config that is simply absent is silent: that is the normal state", (t) => {
+  dataDir(t);
+
+  const journal: string[] = [];
+  const before = console.error;
+  console.error = (...args: unknown[]) =>
+    journal.push(args.map(String).join(" "));
+  t.after(() => {
+    console.error = before;
+  });
+
+  assert.deepEqual(readPluginConfig("absent"), {});
+  assert.deepEqual(journal, [], "у плагина без конфига нет проблемы");
+});

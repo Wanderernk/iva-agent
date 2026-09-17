@@ -70,6 +70,20 @@ assert.equal(
   "file untouched after reject",
 );
 
+// /menu and /model write provider keys through here. An ordinary key round-trips…
+await upsertEnv(p, { CUSTOM_API_KEY: "sk-live_ABC-123.xyz" });
+assert.equal(
+  (await readEnvValues(p)).CUSTOM_API_KEY,
+  "sk-live_ABC-123.xyz",
+  "an ordinary key survives the round trip",
+);
+// …and a value the service and the CLI would read differently is refused before the
+// file is touched. A hash is the reachable case: node cuts the value there, systemd
+// keeps it, so no single line means the same to both.
+const before = await readFile(p, "utf8");
+await assert.rejects(() => upsertEnv(p, { CUSTOM_API_KEY: "ab#cd" }), /one of/);
+assert.equal(await readFile(p, "utf8"), before, "file untouched after reject");
+
 // A failure after the replacement is durable but before rename keeps the original bytes.
 await writeFile(p, "ORIGINAL=still-here\n");
 assert.throws(

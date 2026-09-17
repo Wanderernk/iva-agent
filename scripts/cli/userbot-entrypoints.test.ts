@@ -3,7 +3,6 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import test, { type TestContext } from "node:test";
 import {
   chmod,
-  cp,
   copyFile,
   mkdir,
   mkdtemp,
@@ -11,12 +10,12 @@ import {
   realpath,
   rm,
   stat,
-  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const SECRET = "userbot-characterization-secret";
@@ -48,18 +47,11 @@ async function fixture(
   const userbotDir = join(project, "services/telegram-userbot");
   const venvPython = join(userbotDir, ".venv/bin/python");
 
-  await mkdir(join(project, "bin"), { recursive: true });
-  await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(userbotDir, { recursive: true });
   await mkdir(home, { recursive: true });
   await mkdir(fakeBin, { recursive: true });
   await mkdir(stateDir, { recursive: true });
-  await copyFile(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts/cli"), join(project, "scripts/cli"), {
-    recursive: true,
-  });
-  await symlink(join(ROOT, "scripts/lib"), join(project, "scripts/lib"), "dir");
-  await symlink(join(ROOT, "deploy"), join(project, "deploy"), "dir");
+  await plantCliTree(ROOT, project, { copy: ["scripts/cli"] });
   await copyFile(
     join(ROOT, "services/telegram-userbot/requirements.lock"),
     join(userbotDir, "requirements.lock"),

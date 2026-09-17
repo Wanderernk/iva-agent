@@ -11,6 +11,7 @@ import { catalogModel, catalogProvider } from "../model-catalog.ts";
 import { SEARCH_CATALOG } from "../search-catalog.ts";
 import { readEntries, summarize } from "../usage.ts";
 import { probeUserbotHealth } from "../userbot-health.ts";
+import { button, escapeRichText } from "./buttons.ts";
 
 type Env = Record<string, string | undefined>;
 type VersionPackage = { version?: unknown };
@@ -28,16 +29,10 @@ type MenuContext = {
   };
   flows: {
     get: (chatId: unknown, userId: unknown) => StatusState | null;
-    screen: (
-      state: StatusState,
-      text: string,
-      rows: Array<Array<unknown>>,
-    ) => Promise<unknown>;
+    screen: (state: StatusState, text: string) => Promise<unknown>;
   };
   getLang: () => string;
   tr: (en: string, ru: string) => string;
-  btn: (text: string, callbackData: string) => unknown;
-  backRow: (screen: string) => Array<unknown>;
 };
 
 function version(root: string) {
@@ -125,31 +120,27 @@ function buildView(
     health === null
       ? "…"
       : labels[health.state as keyof typeof labels] || labels.unreachable;
-  const lines = [
-    T("📊 Status", "📊 Статус"),
-    "",
-    `Iva v${d.version}`,
-    T(
-      `Model: ${d.provider} · ${d.model}${d.effort ? ` · think ${d.effort}` : ""}`,
-      `Модель: ${d.provider} · ${d.model}${d.effort ? ` · размышления ${d.effort}` : ""}`,
-    ),
-    T(
-      `Search: ${d.searchProv} ${d.hasKey ? "🔑" : "🔒"}`,
-      `Поиск: ${d.searchProv} ${d.hasKey ? "🔑" : "🔒"}`,
-    ),
-    T(`Language: ${d.lang}`, `Язык: ${d.lang}`),
-    `Userbot: ${ub}`,
-    T(
-      `Google: ${d.gws ? "configured" : "not set"}`,
-      `Google: ${d.gws ? "настроен" : "не настроен"}`,
-    ),
-    T(`Usage today: ${d.usage}`, `Расход за сегодня: ${d.usage}`),
-  ];
-  const rows = [
-    [ctx.btn(T("🔄 Refresh", "🔄 Обновить"), "iva_menu:st:rf")],
-    ctx.backRow("r"),
-  ];
-  return { text: lines.join("\n"), rows };
+  const cell = (value: string) => escapeRichText(value);
+  const table = [
+    `| ${T("Field", "Параметр")} | ${T("Value", "Значение")} |`,
+    "| --- | --- |",
+    `| ${T("Version", "Версия")} | Iva v${cell(d.version)} |`,
+    `| ${T("Model", "Модель")} | ${cell(d.provider)} · ${cell(d.model)}${d.effort ? ` · ${T("thinking", "размышления")} ${cell(d.effort)}` : ""} |`,
+    `| ${T("Search", "Поиск")} | ${cell(d.searchProv)} ${d.hasKey ? "🔑" : "🔒"} |`,
+    `| ${T("Language", "Язык")} | ${cell(d.lang)} |`,
+    `| Userbot | ${cell(ub)} |`,
+    `| Google | ${cell(d.gws ? T("configured", "настроен") : T("not set", "не настроен"))} |`,
+    `| ${T("Usage today", "Расход за сегодня")} | ${cell(d.usage)} |`,
+  ].join("\n");
+  const text = [
+    `# ${T("📊 Status", "📊 Статус")}`,
+    table,
+    `${button(T("🔄 Refresh", "🔄 Обновить"), "iva_menu:st:rf", "success")} — ${T(
+      "read the values again.",
+      "перечитать показатели.",
+    )}`,
+  ].join("\n\n");
+  return { text };
 }
 
 export default {
@@ -165,7 +156,7 @@ export default {
       .then((result: Health) => {
         if (ctx.flows.get(st.chatId, st.userId) === st && st.screen === "st") {
           const v = buildView(d, result, ctx);
-          return ctx.flows.screen(st, v.text, v.rows);
+          return ctx.flows.screen(st, v.text);
         }
       })
       .catch(() => {});

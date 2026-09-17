@@ -61,6 +61,7 @@ export async function loadJsonStrict<T>(file: string, fallback: T): Promise<T> {
 export async function saveJsonAtomic(
   file: string,
   data: unknown,
+  options?: { mode?: number },
 ): Promise<void> {
-  await writeFileAtomic(file, JSON.stringify(data, null, 2));
+  await writeFileAtomic(file, JSON.stringify(data, null, 2), options);
 }

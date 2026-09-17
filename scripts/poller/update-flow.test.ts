@@ -43,10 +43,21 @@ const { handleUpdateCallback, handleUpdateCheck, removeStaleUpdateJobs } =
         }>;
         markNotifiedImpl?: (dataDir: string, version: string) => Promise<void>;
         envImpl?: () => Promise<NodeJS.ProcessEnv>;
+        force?: boolean;
       },
     ) => Promise<boolean>;
     removeStaleUpdateJobs: () => Promise<void>;
   };
+
+/** Текст экрана из тела вызова Telegram: финальные экраны — rich (markdown), начальные — text. */
+function screenText(body: {
+  text?: unknown;
+  rich_message?: { markdown?: unknown };
+}): string {
+  const markdown = body.rich_message?.markdown;
+  if (typeof markdown === "string") return markdown;
+  return typeof body.text === "string" ? body.text : "";
+}
 
 test("stale update-job cleanup removes only expired JSON job files", async () => {
   const jobs = join(dataDir, "update-jobs");
@@ -71,6 +82,31 @@ test("stale update-job cleanup removes only expired JSON job files", async () =>
   await assert.rejects(() =>
     import("node:fs/promises").then(({ stat }) => stat(oldJob)),
   );
+});
+
+/**
+ * Заявка на повтор - часть своего job: TTL судит job, а не её собственный mtime.
+ * Иначе свежий job остаётся без заявки, и обрыв повторяется второй раз.
+ */
+test("the retry claim outlives the sweep while its job does", async () => {
+  const jobs = join(dataDir, "update-jobs");
+  mkdirSync(jobs, { recursive: true });
+  const fresh = join(jobs, "live.json");
+  const claim = `${fresh}.retried`;
+  const orphan = join(jobs, "gone.json.retried");
+  writeFileSync(fresh, "{}");
+  writeFileSync(claim, "");
+  writeFileSync(orphan, "");
+  const old = new Date(Date.now() - 7 * 60 * 60 * 1000);
+  utimesSync(claim, old, old);
+  utimesSync(orphan, old, old);
+
+  await removeStaleUpdateJobs();
+
+  assert.equal(existsSync(fresh), true);
+  assert.equal(existsSync(claim), true);
+  // Заявка, чей job уже убрали, - мусор: уходит вместе с ним, не живёт вечно.
+  assert.equal(existsSync(orphan), false);
 });
 
 type MockFetch = (
@@ -146,8 +182,12 @@ async function press(launcher: string): Promise<string[]> {
   const previousFetch = mutableGlobal.fetch;
   const previousPath = process.env.PATH;
   mutableGlobal.fetch = (_url, init) => {
-    const body = JSON.parse(init.body ?? "{}") as { text?: string };
-    if (typeof body.text === "string") texts.push(body.text);
+    const body = JSON.parse(init.body ?? "{}") as {
+      text?: unknown;
+      rich_message?: { markdown?: unknown };
+    };
+    const text = screenText(body);
+    if (text) texts.push(text);
     return Promise.resolve({
       json: () => Promise.resolve({ ok: true, result: {} }),
     });
@@ -237,7 +277,7 @@ test("the /update button leaves the lock to the update it launches", async (t) =
 
   const first = await press(bin);
 
-  assert.match(first.at(-1) ?? "", /Saving your changes/u);
+  assert.match(first.at(-1) ?? "", /Starting the update/u);
   const command = readFileSync(launched, "utf8");
   assert.match(command, /update --telegram-job [0-9a-f]/u);
   assert.match(command, new RegExp(`--setenv=ASSISTANT_DATA_DIR=${dataDir}`));
@@ -252,13 +292,19 @@ test("the /update button leaves the lock to the update it launches", async (t) =
   assert.equal(existsSync(lock), false, first.join(" | "));
 
   // So a second tap is answered by starting an update, not by a wedged lock.
-  assert.match((await press(bin)).at(-1) ?? "", /Saving your changes/u);
+  assert.match((await press(bin)).at(-1) ?? "", /Starting the update/u);
   assert.equal(existsSync(lock), false);
   assert.equal(readdirSync(jobs).length, 2);
 
-  // A launcher that fails takes the job file back down with it.
-  rmSync(join(bin, "systemd-run"));
-  assert.match((await press(bin)).at(-1) ?? "", /Couldn't start the update/u);
+  // A launcher that fails takes the job file back down with it, and names the reason.
+  writeFileSync(
+    join(bin, "systemd-run"),
+    `#!/bin/sh\necho 'Failed to connect to bus: No such file or directory' >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  const failed = (await press(bin)).at(-1) ?? "";
+  assert.match(failed, /Couldn't start the update/u);
+  assert.match(failed, /Failed to connect to bus/u);
   assert.equal(readdirSync(jobs).length, 2);
 
   // And an update that is really running is answered before anything is launched.
@@ -271,48 +317,59 @@ test("the /update button leaves the lock to the update it launches", async (t) =
   assert.equal(readdirSync(jobs).length, 2);
 });
 
-test("saved update view explains a preserved change set with no conflicts", async (t) => {
-  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
-  const bundle = "2026-08-07T00-00-00-000Z-deadbeef1234";
-  const bundleDir = join(dataDir, "update-conflicts", bundle);
-  mkdirSync(bundleDir, { recursive: true });
-  writeFileSync(
-    join(bundleDir, "report.json"),
-    JSON.stringify({ schema: "iva-update-conflicts/v1", conflicts: [] }),
-  );
-  const calls: { method: string | undefined; body: unknown }[] = [];
+test("/update --force starts a rebuild of the running version without asking upstream", async (t) => {
+  const jobs = join(dataDir, "update-jobs");
+  rmSync(jobs, { recursive: true, force: true });
+  const bin = join(dataDir, "bin-force");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "systemd-run"), "#!/bin/sh\nexit 0\n", {
+    mode: 0o755,
+  });
+  t.after(() => {
+    for (const path of [jobs, bin])
+      rmSync(path, { recursive: true, force: true });
+  });
+  const texts: string[] = [];
+  let inspected = 0;
   const previousFetch = mutableGlobal.fetch;
-  mutableGlobal.fetch = (url, init) => {
-    const body: unknown = JSON.parse(init.body ?? "{}");
-    calls.push({
-      method: url.split("/").at(-1),
-      body,
-    });
+  const previousPath = process.env.PATH;
+  mutableGlobal.fetch = (_url, init) => {
+    const body = JSON.parse(init.body ?? "{}") as {
+      text?: unknown;
+      rich_message?: { markdown?: unknown };
+    };
+    const text = screenText(body);
+    if (text) texts.push(text);
     return Promise.resolve({
-      json: () => Promise.resolve({ ok: true, result: {} }),
+      json: () => Promise.resolve({ ok: true, result: { message_id: 10 } }),
     });
   };
+  process.env.PATH = bin;
   try {
-    await handleUpdateCallback({
-      id: "callback",
-      from: { id: 42 },
-      message: { chat: { id: 1 }, message_id: 10 },
-      data: `iva_update:conflicts:${bundle}`,
-    });
+    assert.equal(
+      await handleUpdateCheck(1, {
+        force: true,
+        inspectImpl: () => {
+          inspected += 1;
+          return Promise.reject(new Error("must not be asked"));
+        },
+        markNotifiedImpl: () => Promise.resolve(),
+        envImpl: () => Promise.resolve({}),
+      }),
+      true,
+    );
   } finally {
     mutableGlobal.fetch = previousFetch;
+    process.env.PATH = previousPath;
   }
-
-  const edit = calls.find((call) => call.method === "editMessageText");
-  const text =
-    edit?.body &&
-    typeof edit.body === "object" &&
-    "text" in edit.body &&
-    typeof edit.body.text === "string"
-      ? edit.body.text
-      : "";
-  assert.match(text, /saved in full/i);
-  assert.doesNotMatch(text, /Saved local conflicts:/);
+  assert.equal(inspected, 0);
+  assert.match(texts[0] ?? "", /Rebuilding the current version/u);
+  assert.match(texts.at(-1) ?? "", /Starting the update/u);
+  const [name] = readdirSync(jobs);
+  const job = JSON.parse(readFileSync(join(jobs, name), "utf8")) as {
+    force?: unknown;
+  };
+  assert.equal(job.force, true, "the flag travels in the job file");
 });
 
 /** git in a directory, with an identity, so a commit needs no ambient config. */
@@ -375,8 +432,12 @@ async function check(root: string): Promise<string[]> {
   const texts: string[] = [];
   const previousFetch = mutableGlobal.fetch;
   mutableGlobal.fetch = (_url, init) => {
-    const body = JSON.parse(init.body ?? "{}") as { text?: string };
-    if (typeof body.text === "string") texts.push(body.text);
+    const body = JSON.parse(init.body ?? "{}") as {
+      text?: unknown;
+      rich_message?: { markdown?: unknown };
+    };
+    const text = screenText(body);
+    if (text) texts.push(text);
     return Promise.resolve({
       json: () => Promise.resolve({ ok: true, result: { message_id: 10 } }),
     });

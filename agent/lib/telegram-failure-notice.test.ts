@@ -23,19 +23,64 @@ await test("turn.failed и session.failed об одной сессии объя�
   const { sent, send } = collector();
   const data = { message: "provider exploded" };
 
-  await notifyTelegramFailure("s-1", data, send, { now: 1_000 });
-  await notifyTelegramFailure("s-1", data, send, { now: 1_050 });
+  await notifyTelegramFailure("s-1", "turn_0", data, send, { now: 1_000 });
+  await notifyTelegramFailure("s-1", null, data, send, { now: 1_050 });
 
   assert.equal(sent.length, 1);
+});
+
+await test("два упавших хода одной сессии внутри минуты объясняются оба, один ход - один раз", async () => {
+  const { sent, send } = collector();
+  const data = { message: "provider exploded" };
+
+  await notifyTelegramFailure("s-turns", "turn_0", data, send, { now: 1_000 });
+  await notifyTelegramFailure("s-turns", "turn_1", data, send, { now: 1_050 });
+  assert.equal(sent.length, 2);
+
+  await notifyTelegramFailure("s-turns", "turn_1", data, send, { now: 1_100 });
+  assert.equal(sent.length, 2);
+
+  await notifyTelegramFailure("s-turns", null, data, send, { now: 1_150 });
+  assert.equal(sent.length, 2);
+
+  // Обратный порядок того же сбоя: заявку первым взял session.failed (null),
+  // поэтому названный ход в окне молчит, а не объясняет ту же беду второй раз.
+  await notifyTelegramFailure("s-null-first", null, data, send, { now: 2_000 });
+  await notifyTelegramFailure("s-null-first", "turn_9", data, send, {
+    now: 2_050,
+  });
+  assert.equal(sent.length, 3);
+});
+
+await test("ход без имени считается по сессии и говорит об этом в журнал", async (t) => {
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = original;
+  });
+  const { sent, send } = collector();
+  const data = { message: "provider exploded" };
+
+  await notifyTelegramFailure("s-noname", "", data, send, { now: 1_000 });
+  await notifyTelegramFailure("s-noname", "", data, send, { now: 1_050 });
+
+  assert.equal(sent.length, 1);
+  assert.ok(
+    logged.some((line) => line.includes("turnId")),
+    `ожидалась строка про turnId в журнале, получено: ${JSON.stringify(logged)}`,
+  );
 });
 
 await test("другая сессия и повтор после TTL получают своё объяснение", async () => {
   const { sent, send } = collector();
   const data = { message: "provider exploded" };
 
-  await notifyTelegramFailure("s-2", data, send, { now: 1_000 });
-  await notifyTelegramFailure("s-3", data, send, { now: 1_000 });
-  await notifyTelegramFailure("s-2", data, send, { now: 61_001 });
+  await notifyTelegramFailure("s-2", "turn_0", data, send, { now: 1_000 });
+  await notifyTelegramFailure("s-3", "turn_0", data, send, { now: 1_000 });
+  await notifyTelegramFailure("s-2", "turn_0", data, send, { now: 61_001 });
 
   assert.equal(sent.length, 3);
 });
@@ -46,11 +91,12 @@ await test("несостоявшаяся отправка возвращает �
 
   await notifyTelegramFailure(
     "s-4",
+    "turn_0",
     data,
     noticeSender(() => Promise.reject(new Error("Telegram 502"))),
     { now: 1_000 },
   );
-  await notifyTelegramFailure("s-4", data, send, { now: 1_100 });
+  await notifyTelegramFailure("s-4", "turn_0", data, send, { now: 1_100 });
 
   assert.equal(sent.length, 1);
 });
@@ -90,6 +136,7 @@ await test("ключ из ошибки провайдера доезжает д�
 
   await notifyTelegramFailure(
     "s-key",
+    "turn_0",
     { message: `Incorrect API key provided: ${PLANTED_KEY}` },
     send,
     { now: 1_000 },
@@ -117,6 +164,7 @@ await test("секрет в errorId вычищается швом, а не сб�
 
   await notifyTelegramFailure(
     "s-error-id",
+    "turn_0",
     {
       message: "Provider returned a strange response",
       details: { errorId: PLANTED_KEY },
@@ -136,6 +184,7 @@ await test("многострочная ошибка: в чат уходит пе
 
   await notifyTelegramFailure(
     "s-multiline",
+    "turn_0",
     {
       message: `Provider returned a strange response ${PLANTED_KEY}\nstack line ${PLANTED_KEY}`,
       details: { errorId: "err-9" },
@@ -156,6 +205,7 @@ await test("телеграм-токен и ключ в одной ошибке �
 
   await notifyTelegramFailure(
     "s-both",
+    "turn_0",
     { message: `bot ${PLANTED_BOT_TOKEN} rejected: ${PLANTED_KEY}` },
     send,
     { now: 1_000 },
@@ -178,6 +228,7 @@ await test("ключ провайдера настоящего формата н
 
   await notifyTelegramFailure(
     "s-openrouter",
+    "turn_0",
     { message: `Provider rejected the request for key ${OPENROUTER_KEY}` },
     send,
     { now: 1_000 },

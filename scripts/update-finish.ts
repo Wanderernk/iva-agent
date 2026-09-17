@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
-  readdirSync,
+  readFileSync,
+  lstatSync,
+  realpathSync,
   renameSync,
   rmdirSync,
   rmSync,
@@ -19,9 +21,10 @@ import {
 import {
   isEntrypoint,
   refreshOwnedShim,
+  shimIsForeign,
   SHIM_PATH,
-  throughLink,
 } from "./lib/version-layout.ts";
+import { throughLink } from "./lib/link-target.ts";
 import {
   quarantinePath,
   rewriteRunStatusesForUpdate,
@@ -365,6 +368,154 @@ export function restoreWriterOwnership(
 const ARTIFACTS =
   ".git .iva-build .iva-update .output .worktrees node_modules".split(" ");
 
+/**
+ * Метка незавершённого вывода. Ставится после первого состоявшегося удаления и снимается
+ * в конце удачного прохода: если вывод упал до первого удаления (например, на чужих
+ * правах), метки не остаётся вовсе.
+ *
+ * Метка несёт идентичность выводимого дерева (путь, inode каталога `.git`, HEAD) и
+ * проверяется перед сносом. Без неё и без git вывод не трогает ничего: залипшая метка
+ * на живом дереве не имеет права санкционировать снос.
+ */
+export const RETIRE_MARKER = ".iva-retiring";
+
+/** Артефакты чекаута без `.git`: сам репозиторий уходит последним. */
+const RETIRE_ARTIFACTS = ARTIFACTS.filter((path) => path !== ".git");
+
+export interface RetireIdentity {
+  readonly home: string;
+  /** dev+inode каталога: вторая ветка сверки, когда `.git` уже снесён обрывом. */
+  readonly homeDev: string | null;
+  readonly homeIno: string | null;
+  readonly gitDev: string | null;
+  readonly gitIno: string | null;
+  readonly headSha: string | null;
+  readonly at: number;
+}
+
+/** Идентичность дерева: путь, `.git` (dev+inode) и HEAD, если они читаются. */
+export function retireIdentity(home: string): RetireIdentity | null {
+  let realHome: string;
+  try {
+    realHome = realpathSync(home);
+  } catch {
+    return null;
+  }
+  let homeDev: string | null = null;
+  let homeIno: string | null = null;
+  try {
+    const stat = lstatSync(realHome, { bigint: true });
+    homeDev = String(stat.dev);
+    homeIno = String(stat.ino);
+  } catch {
+    // Каталог исчез между realpath и stat - сверять будет нечем, поля остаются пустыми.
+  }
+  let gitDev: string | null = null;
+  let gitIno: string | null = null;
+  try {
+    const stat = lstatSync(join(realHome, ".git"), { bigint: true });
+    gitDev = String(stat.dev);
+    gitIno = String(stat.ino);
+  } catch {
+    // `.git` уже нет или не читается - идентичность держится на каталоге и пути.
+  }
+  let headSha: string | null = null;
+  try {
+    headSha = git(realHome, ["rev-parse", "HEAD"]).trim() || null;
+  } catch {
+    // Покалеченный или недоступный git: HEAD неизвестен.
+  }
+  return {
+    home: realHome,
+    homeDev,
+    homeIno,
+    gitDev,
+    gitIno,
+    headSha,
+    at: Date.now(),
+  };
+}
+
+/** Метка с диска; нет файла или мусор - null (чужую метку не толкуем как свою). */
+export function readRetireMarker(marker: string): RetireIdentity | null {
+  let raw: string;
+  try {
+    raw = readFileSync(marker, "utf8");
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const value = parsed as Record<string, unknown>;
+  if (typeof value.home !== "string") return null;
+  const optional = (field: unknown): string | null =>
+    typeof field === "string" && field.length > 0 ? field : null;
+  return {
+    home: value.home,
+    homeDev: optional(value.homeDev),
+    homeIno: optional(value.homeIno),
+    gitDev: optional(value.gitDev),
+    gitIno: optional(value.gitIno),
+    headSha: optional(value.headSha),
+    at:
+      typeof value.at === "number" && Number.isFinite(value.at) ? value.at : 0,
+  };
+}
+
+/** Метка принадлежит этому дереву: путь совпал и `.git` тот же самый (dev+inode). */
+export function sameRetireTree(
+  marker: RetireIdentity,
+  current: RetireIdentity,
+): boolean {
+  if (marker.home !== current.home) return false;
+  // Если в метке записан `.git`, он обязан совпасть: пересозданный репозиторий на том же
+  // пути - уже другое дерево.
+  if (marker.gitDev !== null || marker.gitIno !== null) {
+    if (current.gitDev !== null || current.gitIno !== null)
+      return (
+        marker.gitDev === current.gitDev && marker.gitIno === current.gitIno
+      );
+    // `.git` уже снесён обрывом: сверять репозиторий нечем, вторая ветка - сам каталог
+    // (dev+inode). Без неё повтор после обрыва сразу за удалением `.git` не дочищал
+    // вывод никогда: метка оставалась, а идентичность давала null/null.
+    if (marker.homeDev !== null && current.homeDev !== null)
+      return (
+        marker.homeDev === current.homeDev && marker.homeIno === current.homeIno
+      );
+  }
+  return true;
+}
+
+/**
+ * Есть ли что-то по пути - хоть битый симлинк. `existsSync` идёт по ссылке и на
+ * симлинке в никуда отвечает «нет», а tracked-файл, подменённый такой ссылкой, вывод
+ * чекаута обязан снести наравне с обычным.
+ */
+function pathPresent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Убрать опустевшие родители пути до home; каталог с любым содержимым остаётся. */
+function pruneEmptyParents(home: string, path: string): void {
+  for (let at = dirname(path); at !== home; at = dirname(at)) {
+    try {
+      rmdirSync(at);
+    } catch {
+      return; // Не пусто (или уже нет) - выше содержимое есть точно.
+    }
+  }
+}
+
 /** First path segment, for both `agent/tools/x.ts` and a bare `install.sh`. */
 function topLevel(path: string): string {
   return path.split("/", 1)[0] ?? "";
@@ -376,6 +527,10 @@ const KEEP = new Set([
   ...".env current repo versions".split(" "),
 ]);
 
+function errorCode(error: unknown): unknown {
+  return (error as { readonly code?: unknown } | null | undefined)?.code;
+}
+
 function git(home: string, args: string[]): string {
   return execFileSync("git", ["-C", home, ...args], {
     encoding: "utf8",
@@ -383,58 +538,129 @@ function git(home: string, args: string[]): string {
   });
 }
 
-/** Install the shim that outlives every version; refresh only an owned stale snapshot. */
-export function writeShim(home: string, log: Say): void {
-  if (refreshOwnedShim(SHIM_PATH, home, process.execPath, layoutFor(home).data))
+/**
+ * Install the shim that outlives every version; refresh only an owned stale snapshot.
+ *
+ * Чужой файл на том же пути не трогаем - но и молчать нельзя: `bin/iva.mjs` чекаута
+ * при переводе на версии уходит, и команда `iva` через чужой файл в установку уже не
+ * ведёт. Одна строка владельцу говорит, чем запускать, пока файл на месте.
+ */
+export function writeShim(
+  home: string,
+  log: Say,
+  notify: Say = () => {},
+): void {
+  if (
+    refreshOwnedShim(SHIM_PATH, home, process.execPath, layoutFor(home).data)
+  ) {
     log(`rewrote ${SHIM_PATH}`);
+    return;
+  }
+  if (shimIsForeign(SHIM_PATH, home))
+    notify(
+      `${SHIM_PATH} is not a shim of ours, so the update left it alone; until you move it away run \`node ${join(home, "current/bin/iva.mjs")}\` instead of \`iva\``,
+    );
 }
 
 /**
  * Remove the working tree the installation ran from, now that a version runs
- * instead. Only files git accounts for, only where unedited, one at a time: what
- * git ignores inside a tracked directory - the userbot's venv, a skill's
- * credentials - is the user's, and a layout change is no right to it.
+ * instead. Every file git accounts for goes, an edited one too - the version is
+ * built from the commit, and an edit to Iva's own code the update does not carry
+ * over. What git does not account for stays: a file the owner put next to ours,
+ * the userbot's venv, a skill's credentials are theirs, and a layout change is no
+ * right to them.
+ *
+ * Судится каждый файл, не каталог: чужой файл в нашем каталоге спасает себя, а не
+ * правленые исходники рядом с собой - иначе один `scripts/mine.txt` оставлял бы весь
+ * `scripts/` от старой установки. Каталоги-артефакты (`node_modules`, `.git`) уходят
+ * целиком, как и раньше; опустевшие наши каталоги подчищаются проходом ниже.
+ *
+ * Прерываемость: до первого удаления ставится метка (RETIRE_MARKER), `.git` идёт
+ * последним, а пустые родители подчищаются отдельным проходом в конце. Поэтому
+ * повтор после обрыва на любом шаге доводит вывод до конца.
  */
-export function retireCheckout(home: string): string[] {
-  let tracked: string[];
-  let dirty: Set<string>;
+export function retireCheckout(home: string, notify: Say = () => {}): string[] {
+  const marker = join(home, RETIRE_MARKER);
+  const previous = readRetireMarker(marker);
+  let tracked: string[] | null;
   try {
-    // -z on both: without it git escapes and quotes every path outside ASCII,
-    // and a quoted name matches no file, retiring the checkout only in part.
+    // -z: without it git escapes and quotes every path outside ASCII, and a quoted
+    // name matches no file, retiring the checkout only in part.
     tracked = git(home, ["ls-tree", "-r", "-z", "--name-only", "HEAD"])
       .split("\0")
       .filter(Boolean);
-    dirty = new Set(
-      git(home, ["status", "--porcelain=v1", "--untracked-files=all", "-z"])
-        .split("\0")
-        .filter(Boolean)
-        .map((entry) => topLevel(entry.slice(3))),
-    );
-  } catch {
-    // Without git there is no telling the user's files from ours: keep everything.
-    return [];
+  } catch (error) {
+    // Git как команда недоступен (нет в PATH): не сносим ничего. Метка санкционирует
+    // снос только покалеченного репозитория (git есть, но не отвечает), и только если
+    // она принадлежит этому дереву.
+    if (errorCode(error) === "ENOENT") {
+      notify(
+        `git is not available - the checkout at ${home} was not retired, nothing was removed`,
+      );
+      return [];
+    }
+    tracked = null;
+  }
+  if (tracked === null) {
+    // Git есть, но репозиторий не отвечает (покалечен обрывом).
+    if (!previous) {
+      notify(
+        `the checkout at ${home} has a broken .git and no retire marker - nothing was removed, clean it up by hand`,
+      );
+      return [];
+    }
+    const current = retireIdentity(home);
+    if (!current || !sameRetireTree(previous, current)) {
+      notify(
+        `the retire marker at ${marker} does not belong to this tree - nothing was removed`,
+      );
+      return [];
+    }
+    const removed = new Set<string>();
+    for (const path of [...RETIRE_ARTIFACTS, ".git"]) {
+      const full = join(home, path);
+      if (!pathPresent(full)) continue;
+      rmSync(full, { recursive: true, force: true });
+      removed.add(path);
+    }
+    for (const path of [...RETIRE_ARTIFACTS, ".git"])
+      pruneEmptyParents(home, join(home, path));
+    rmSync(marker, { force: true });
+    return [...removed].sort();
   }
   if (!tracked.includes("package.json")) return [];
 
+  let identity: RetireIdentity | null = null;
+  let marked = false;
+
   const removed = new Set<string>();
-  // Artifacts however edited: rebuilt, never authored, and .git is mirrored.
-  for (const path of [...tracked, ...ARTIFACTS]) {
+  // Артефакты пересобираются, их не жалко; `.git` последним: обрыв оставляет повтору
+  // работающий git, а не дерево без истории.
+  for (const path of [...tracked, ...RETIRE_ARTIFACTS, ".git"]) {
     const name = topLevel(path);
-    if (KEEP.has(name) || (dirty.has(name) && !ARTIFACTS.includes(path)))
-      continue;
+    if (KEEP.has(name)) continue;
     const full = join(home, path);
-    if (!existsSync(full)) continue;
+    if (!pathPresent(full)) continue;
+    // Идентичность снимается до удалений (`.git` уходит последним, так что он ещё цел)
+    // и ложится в метку только после первого состоявшегося удаления: упавший на первом
+    // файле вывод не оставляет метки вовсе.
+    identity ??= retireIdentity(home);
     rmSync(full, { recursive: true, force: true });
     removed.add(name);
-    // Up to the first directory that still holds something, which is never ours:
-    // git listed everything of ours in `tracked`.
-    for (
-      let at = dirname(full);
-      at !== home && readdirSync(at).length === 0;
-      at = dirname(at)
-    )
-      rmdirSync(at);
+    if (!marked && identity) {
+      try {
+        writeFileSync(marker, JSON.stringify(identity), { mode: 0o600 });
+        marked = true;
+      } catch {
+        // Не смогли пометить - вывод всё равно продолжится; окно обрыва остаётся прежним.
+      }
+    }
   }
+  // Пустые каталоги - после файлов: обрыв мог случиться уже после удаления последнего
+  // файла, и тогда подчищать нечего, кроме самих каталогов.
+  for (const path of [...tracked, ...RETIRE_ARTIFACTS, ".git"])
+    pruneEmptyParents(home, join(home, path));
+  rmSync(marker, { force: true });
   return [...removed].sort();
 }
 
@@ -706,14 +932,20 @@ export async function main(argv: readonly string[]): Promise<number> {
         await Promise.resolve();
       },
       adopt: () => {
-        writeShim(home, log);
-        if (!existsSync(join(home, ".git"))) return;
+        writeShim(home, log, notify);
+        // Метка прерванного вывода - тот же повод дочистить, что и живого `.git`.
+        if (
+          !existsSync(join(home, ".git")) &&
+          !existsSync(join(home, RETIRE_MARKER))
+        )
+          return;
         const back = tombstoned(home, layout.data);
         if (back.length > 0)
           notify(
             `a version cannot have a file of Iva's own deleted from it, so ${back.length} you had removed are back: ${back.join(", ")}`,
           );
-        for (const removed of retireCheckout(home)) log(`retired ${removed}`);
+        for (const removed of retireCheckout(home, notify))
+          log(`retired ${removed}`);
       },
     });
   } catch (error) {

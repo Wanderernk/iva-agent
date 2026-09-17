@@ -139,7 +139,11 @@ export async function runDailyUpdateCheck({
       remoteVersion: info.remoteVersion,
       gitImpl,
     });
-    const text = whatsNew ? `${offer.text}\n\n${whatsNew}` : offer.text;
+    // What's New стоит перед кнопками: кнопки — часть текста и закрывают сообщение.
+    const body = offer.text.slice(0, -offer.actions.length).trimEnd();
+    const text = whatsNew
+      ? `${body}\n\n${whatsNew}\n\n${offer.actions}`
+      : offer.text;
     await sendImpl({ token, chatId, offer: { ...offer, text } });
     await writeStateImpl(storage, info.remoteVersion);
     return { status: "notified" as const, info };

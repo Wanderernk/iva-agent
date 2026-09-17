@@ -15,6 +15,7 @@ import {
 } from "./fs-atomic.ts";
 import {
   parseFrontmatter,
+  parseFrontmatterOrSkip,
   writeFrontmatter,
   type FmFields,
 } from "./frontmatter.js";
@@ -142,7 +143,11 @@ function cardNames(dir: string): Map<string, CardNames> {
       continue;
     }
     resolveStats.fileReads++;
-    const { fields, body } = parseFrontmatter(text);
+    // Соседняя карточка со сломанным frontmatter не имеет права уронить разбор
+    // всего каталога: её просто не найти по заголовку, остальные на месте.
+    const parsed = parseFrontmatterOrSkip(text, full);
+    if (parsed === null) continue;
+    const { fields, body } = parsed;
     const h1 = extractH1(body);
     const cands = [h1, ...fmNames(fields), name.replace(/\.md$/, "")].filter(
       Boolean,

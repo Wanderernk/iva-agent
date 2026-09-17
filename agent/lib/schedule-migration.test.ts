@@ -239,8 +239,11 @@ void test("legacy teardown is not attempted when the seed transaction cannot be 
   const { execImpl, calls } = fakeExecImpl();
   const logs: string[] = [];
 
-  // A directory cannot be atomically replaced by the JSON status tmp file. This makes
-  // the seed write fail after the status lock is acquired, before teardown is allowed.
+  // A directory where the status file belongs. The pass cannot commit a seed through
+  // it, so teardown must not be reached. Since readStatus tells "unreadable" apart from
+  // "absent", the pass now stops one step earlier — at the read, deliberately deferred —
+  // instead of crashing on the write. Both facts this test exists for are unchanged:
+  // nothing is torn down and the unit file survives.
   await runScheduleMigration({
     homedir,
     statusPath: unitDir,
@@ -250,7 +253,10 @@ void test("legacy teardown is not attempted when the seed transaction cannot be 
 
   assert.deepEqual(calls, []);
   assert.equal(existsSync(unit), true);
-  assert.ok(logs.some((line) => line.includes("unexpected failure")));
+  assert.ok(
+    logs.some((line) => line.includes("defer") && line.includes(unitDir)),
+    "the deferral names the path the owner has to fix",
+  );
 });
 
 void test("legacy units: disabled and deleted by exact name; unrelated xfeed-daily.timer is left alone", async () => {
@@ -530,5 +536,43 @@ void test("if the status lock can't be acquired, the whole pass is deferred: no 
   assert.ok(
     lines.some((l) => l.toLowerCase().includes("defer")),
     "the deferral must be logged, not silent",
+  );
+});
+
+void test("a damaged status file defers the whole pass: no seed, no catch-up, and the file is left as found", async () => {
+  const homedir = await scaffoldHome();
+  const dataDir = join(homedir, "..", "data");
+  const statusPath = join(dataDir, "rollup-status.json");
+  await mkdir(dataDir, { recursive: true });
+  // Truncated mid-write. Seeding over this would tell every period "you never ran" and
+  // fire a catch-up burst off a status nobody could actually read.
+  const damaged = '{\n  "memory-daily": { "lastSuccessAt": 111';
+  await writeFile(statusPath, damaged, "utf8");
+
+  const { execImpl } = fakeExecImpl();
+  let runJobCalled = false;
+  const lines: string[] = [];
+
+  await runScheduleMigration({
+    homedir,
+    execImpl,
+    statusPath,
+    tz: "UTC",
+    log: (...args: unknown[]) => lines.push(args.join(" ")),
+    runJob: () => {
+      runJobCalled = true;
+      return Promise.resolve();
+    },
+  });
+
+  assert.equal(runJobCalled, false, "no catch-up off an unreadable status");
+  assert.equal(
+    await readFile(statusPath, "utf8"),
+    damaged,
+    "the damaged file is left exactly as found",
+  );
+  assert.ok(
+    lines.some((l) => l.includes(statusPath)),
+    "the journal must name the file the owner has to fix",
   );
 });

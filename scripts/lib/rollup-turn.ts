@@ -112,7 +112,10 @@ export async function cancelTurnQuietly(
       label: "cancel",
     });
     return true;
-  } catch {
+  } catch (error) {
+    console.error(
+      `rollup-turn: не удалось отменить ход (cancel): ${String(error)}`,
+    );
     return false;
   }
 }
@@ -139,7 +142,10 @@ export async function cancelTurnAndConfirmQuietly(
     return (
       result?.events?.some((event) => event?.type === "turn.cancelled") === true
     );
-  } catch {
+  } catch (error) {
+    console.error(
+      `rollup-turn: не удалось подтвердить отмену хода: ${String(error)}`,
+    );
     return false;
   }
 }

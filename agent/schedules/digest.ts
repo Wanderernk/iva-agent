@@ -21,7 +21,7 @@ export default defineSchedule({
     };
     if (settings.digestSchedule?.enabled !== true) return;
 
-    const { root, statusPath } = resolvePaths();
+    const { root, statusPath, factsPath } = resolvePaths();
     waitUntil(
       runScheduledJob({
         name: "digest",
@@ -29,6 +29,7 @@ export default defineSchedule({
         root,
         nodeBin: process.execPath,
         statusPath,
+        factsPath,
       }),
     );
   },

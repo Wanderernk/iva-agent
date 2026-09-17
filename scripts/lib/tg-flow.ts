@@ -8,6 +8,8 @@
 // Состояние живёт только в памяти этого процесса. Рестарт моста теряет его —
 // протухший тап по кнопке ловится диспатчером как «диалог устарел».
 
+import { legacyRows, screenPayload } from "./telegram-buttons.ts";
+
 const TTL_MS = 15 * 60 * 1000; // как WIZARD_TTL_MS — совпадает с временем жизни codex device-code
 
 export type TelegramFlowResponse = {
@@ -121,28 +123,32 @@ export function createFlows({ tg, log = () => {} }: CreateFlowsOptions) {
   }
 
   // wizScreen :393 — правит единственное сообщение флоу на месте (первый раз шлёт).
+  // Экран — это rich message: markdown, кнопки живут в самом тексте, клавиатуры рядом нет.
+  // Пока экраны отдают старые ряды, они доезжают до текста через legacyRows — шим
+  // переходного периода, D3 снимет его вместе с рядами.
   async function screenWithResult(
     st: TelegramFlowState,
-    text: string,
+    markdown: string,
     rows?: TelegramKeyboard | null,
   ): Promise<boolean> {
-    const reply_markup = rows ? { inline_keyboard: rows } : undefined;
+    const payload = screenPayload(
+      rows ? `${markdown}\n\n${legacyRows(rows)}` : markdown,
+    );
+    const rich = "rich_message" in payload;
     if (st.msgId) {
       const r = await tg("editMessageText", {
         chat_id: st.chatId,
         message_id: st.msgId,
-        text,
-        reply_markup,
+        ...payload,
       });
       // «message is not modified» = двойной тап перерисовал тот же экран — это успех, не сбой.
       if (r.ok) return messageResultSucceeded(r);
       if (/not modified/i.test(r.description || "")) return true;
       // правка не удалась (сообщение слишком старое / удалено) — падаем на свежее сообщение
     }
-    const r = await tg("sendMessage", {
+    const r = await tg(rich ? "sendRichMessage" : "sendMessage", {
       chat_id: st.chatId,
-      text,
-      reply_markup,
+      ...payload,
     });
     const succeeded = messageResultSucceeded(r);
     if (succeeded) st.msgId = r.result!.message_id;
@@ -158,7 +164,8 @@ export function createFlows({ tg, log = () => {} }: CreateFlowsOptions) {
   }
 
   // endWizard :406 — снимает стейт и показывает финальный экран. НОВОЕ: опциональные
-  // rows (терминальный экран может нести кнопку «‹ Меню» — возврат в меню).
+  // rows (терминальный экран может нести кнопку «‹ Меню» — возврат в меню; пока это
+  // старый ряд, legacyRows в screenWithResult ставит её в текст).
   async function endWithResult(
     st: TelegramFlowState,
     text: string,

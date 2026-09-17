@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   alertOwnerAboutPlugins,
+  retireCheckout,
   captureOptionalWriterState,
   restartPluginUnits,
   quarantineUpdateState,
@@ -14,8 +15,10 @@ import {
   stopWriterUnits,
   tombstoned,
 } from "./update-finish.ts";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -66,7 +69,7 @@ test("update quarantines session state and rewrites chat status in place", (t) =
   writeFileSync(
     join(data, "run-status.d/chat.json"),
     JSON.stringify({
-      status: "idle",
+      status: "running",
       updatedAt: 123,
       statusMessageId: 42,
       sessionId: "old-session",
@@ -963,4 +966,183 @@ test("the flip restarts the plugin units that were running, and only those", asy
     said.join("\n"),
     /some plugin units did not restart: job failed/u,
   );
+});
+
+/**
+ * Конверсия чекаута в версию правку в коде Ивы затирает: после перевода на диске
+ * остаётся то, что в коммите, а не то, что правил владелец, и копии правки нет нигде.
+ * Своё живёт в `data/custom/`, а разработчик ставит `.iva-dev`.
+ */
+test("a conversion wipes an edit to Iva's own code and keeps the file beside it", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-retire-edits-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-C", home, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva" }\n');
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  // Правка в коде Ивы, правка в файле верхнего уровня и файл пользователя рядом.
+  writeFileSync(join(home, "agent/index.ts"), "export const mine = 2;\n");
+  writeFileSync(
+    join(home, "package.json"),
+    '{ "name": "iva", "mine": true }\n',
+  );
+  writeFileSync(join(home, "notes.md"), "# my notes\n");
+  // Чужой файл в нашем же каталоге, рядом с правленым исходником: спасает себя, но не его.
+  writeFileSync(join(home, "agent/secret.env"), "TOKEN=keep-me\n");
+
+  const removed = retireCheckout(home);
+
+  // Конверсия прошла: шапка чекаута выведена вместе с историей.
+  assert.ok(removed.includes("package.json"), JSON.stringify(removed));
+  assert.equal(existsSync(join(home, ".git")), false);
+  assert.equal(existsSync(join(home, "package.json")), false);
+  // Правленый tracked-файл уходит вместе с остальными: дальше работает версия из
+  // коммита, правка не переносится и нигде не сохраняется.
+  assert.equal(existsSync(join(home, "agent/index.ts")), false);
+  // Неотслеживаемое - пользователя, остаётся как есть, и каталог под него тоже.
+  assert.equal(readFileSync(join(home, "notes.md"), "utf8"), "# my notes\n");
+  assert.equal(
+    readFileSync(join(home, "agent/secret.env"), "utf8"),
+    "TOKEN=keep-me\n",
+  );
+  const saved = readdirSync(home, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(String(entry.parentPath ?? home), entry.name))
+    .filter((path) => readFileSync(path, "utf8").includes("mine"));
+  assert.deepEqual(saved, []);
+});
+
+/**
+ * Обратная сторона того же шва: неотслеживаемый файл внутри нашего каталога - чужой,
+ * вывод его не трогает, даже когда все tracked-файлы каталога уходят.
+ */
+test("a conversion leaves an untracked file inside a directory of ours", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-retire-untracked-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-C", home, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva" }\n');
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  writeFileSync(join(home, "agent/secret.env"), "TOKEN=keep-me\n");
+
+  retireCheckout(home);
+
+  assert.equal(
+    readFileSync(join(home, "agent/secret.env"), "utf8"),
+    "TOKEN=keep-me\n",
+  );
+  // И только его: соседний tracked-файл в том же каталоге уходит вместе со всеми.
+  assert.equal(existsSync(join(home, "agent/index.ts")), false);
+});
+
+/**
+ * Tracked-файл можно подменить локально не только правкой, но и симлинком в никуда:
+ * `existsSync` идёт по ссылке и такой путь считает пустым. Контракт вывода - «все
+ * tracked-файлы сняты» - решается по самой записи, а неотслеживаемая ссылка остаётся
+ * пользователю, как любой его файл.
+ */
+test("a conversion removes a tracked path held by a dangling symlink", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "iva-retire-dangling-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const git = (...args: string[]): string =>
+    execFileSync("git", ["-C", home, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "name": "iva" }\n');
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeFileSync(join(home, "agent/index.ts"), "export const shipped = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  rmSync(join(home, "agent/index.ts"));
+  symlinkSync(join(home, "agent/gone.ts"), join(home, "agent/index.ts"));
+  // Такая же ссылка, но git о ней не знает: она пользователя и остаётся.
+  symlinkSync(join(home, "agent/gone.ts"), join(home, "agent/mine.ts"));
+
+  retireCheckout(home);
+
+  assert.throws(() => lstatSync(join(home, "agent/index.ts")));
+  assert.equal(lstatSync(join(home, "agent/mine.ts")).isSymbolicLink(), true);
+});
+
+/**
+ * Шим на PATH решается по `homedir()`, а он читается при загрузке модуля - поэтому шов
+ * проверяется дочерним процессом с подменённым HOME.
+ */
+test("a foreign file on the shim path stays, and the owner is told what to run", (t) => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "iva-shim-foreign-"));
+  t.after(() => rmSync(fakeHome, { recursive: true, force: true }));
+  const install = join(fakeHome, "iva");
+  mkdirSync(join(install, "data"), { recursive: true });
+  mkdirSync(join(fakeHome, ".local/bin"), { recursive: true });
+  const shim = join(fakeHome, ".local/bin/iva");
+  writeFileSync(shim, "#!/bin/sh\necho not-iva\n");
+  const driver = join(fakeHome, "driver.ts");
+  writeFileSync(
+    driver,
+    [
+      `const { writeShim } = await import(${JSON.stringify(join(import.meta.dirname, "update-finish.ts"))});`,
+      "const logged: string[] = [];",
+      "const said: string[] = [];",
+      `writeShim(${JSON.stringify(install)}, (line) => logged.push(line), (line) => said.push(line));`,
+      "console.log(JSON.stringify({ logged, said }));",
+      "",
+    ].join("\n"),
+  );
+  const run = (): { logged: string[]; said: string[] } =>
+    JSON.parse(
+      execFileSync(process.execPath, [driver], {
+        encoding: "utf8",
+        env: { ...process.env, HOME: fakeHome },
+      }),
+    ) as { logged: string[]; said: string[] };
+
+  const foreign = run();
+
+  assert.equal(readFileSync(shim, "utf8"), "#!/bin/sh\necho not-iva\n");
+  assert.equal(foreign.logged.length, 0);
+  assert.equal(foreign.said.length, 1);
+  assert.match(foreign.said[0] ?? "", /\.local\/bin\/iva/u);
+  assert.match(foreign.said[0] ?? "", /current\/bin\/iva\.mjs/u);
+
+  // Свободное место - шим ставится, и владельцу говорить не о чем.
+  rmSync(shim);
+  const free = run();
+
+  assert.equal(free.said.length, 0);
+  assert.equal(free.logged.length, 1);
+  assert.equal(existsSync(shim), true);
 });

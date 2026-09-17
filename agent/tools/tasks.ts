@@ -26,40 +26,52 @@ interface Task {
 }
 
 // Нет файла → []. Битый JSON — НЕ пустой список: loadJsonStrict откладывает бэкап и
-// бросает (иначе следующий save молча уничтожил бы все задачи).
-const load = () => loadJsonStrict<Task[]>(FILE, []);
+// бросает (иначе следующий save молча уничтожил бы все задачи). Поверх этого — форма
+// записей: файл лежит в data/ и правится руками, а одна запись без целого id ломала
+// Math.max → NaN → "id": null у ВСЕХ новых задач, и закрыть их было нельзя (схема
+// требует целый положительный id). Записи не по форме пропускаются со строкой в журнал;
+// чужой корень (не массив) — явная ошибка: перезаписать его пустотой значит стереть данные.
+async function load(): Promise<Task[]> {
+  const raw = await loadJsonStrict<unknown>(FILE, []);
+  if (!Array.isArray(raw))
+    throw new Error(`${FILE} damaged (not an array) — fix or delete it`);
+  const tasks = raw.filter(isTask);
+  if (tasks.length !== raw.length)
+    console.warn(
+      `tasks.json: пропущено ${raw.length - tasks.length} записей не по форме, читаются остальные ${tasks.length}; файл починится следующей записью`,
+    );
+  return tasks;
+}
 const save = (tasks: Task[]) => saveJsonAtomic(FILE, tasks);
+
+function isTask(value: unknown): value is Task {
+  if (typeof value !== "object" || value === null) return false;
+  const task = value as Record<string, unknown>;
+  return (
+    typeof task.id === "number" &&
+    Number.isInteger(task.id) &&
+    task.id > 0 &&
+    typeof task.text === "string" &&
+    (task.priority === "low" ||
+      task.priority === "med" ||
+      task.priority === "high") &&
+    (task.due === null || typeof task.due === "string") &&
+    typeof task.done === "boolean" &&
+    typeof task.createdAt === "string"
+  );
+}
 
 export default defineTool({
   description:
-    "Управление списком задач пользователя. action=add добавляет задачу (нужен text); " +
-    "list показывает задачи (по умолчанию незавершённые); done отмечает задачу выполненной (нужен id); " +
-    "remove удаляет задачу (нужен id).",
+    "Задачи: add (text, priority, due), list (includeDone; по умолчанию — незавершённые), " +
+    "done/remove (id). Задачи не выдумываются из памяти: список ведёт тул.",
   inputSchema: z.object({
     action: z.enum(["add", "list", "done", "remove"]),
-    text: z
-      .string()
-      .min(1)
-      .optional()
-      .describe("Текст задачи (для action=add)"),
-    id: z
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .describe("ID задачи (для done/remove)"),
-    priority: z
-      .enum(["low", "med", "high"])
-      .optional()
-      .describe("Приоритет (для add)"),
-    due: z
-      .string()
-      .optional()
-      .describe("Срок в свободной форме или ISO-дата (для add)"),
-    includeDone: z
-      .boolean()
-      .optional()
-      .describe("Показать и выполненные (для list)"),
+    text: z.string().min(1).optional().describe("Текст задачи"),
+    id: z.number().int().positive().optional().describe("ID задачи"),
+    priority: z.enum(["low", "med", "high"]).optional().describe("Приоритет"),
+    due: z.string().optional().describe("Срок: свободная форма или ISO-дата"),
+    includeDone: z.boolean().optional().describe("Показать и выполненные"),
   }),
   async execute({ action, text, id, priority, due, includeDone }) {
     // Мутации — под локом: параллельный ход (расписание + живой чат) на голом

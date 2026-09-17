@@ -5,6 +5,7 @@
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveTimeZone } from "./timezone.ts";
+import { resolveVaultDir } from "@iva/vault-dir";
 
 export type VaultStamp = { date: string; hhmm: string; hhmmss: string };
 
@@ -39,7 +40,7 @@ export function localStamp(): VaultStamp {
 // усёк вход для модели.
 export function appendDaily(type: string, content: string): string {
   const { date, hhmm } = localStamp();
-  const dir = join(process.env.ASSISTANT_VAULT_DIR || "vault", "daily");
+  const dir = join(resolveVaultDir(process.cwd()), "daily");
   mkdirSync(dir, { recursive: true });
   // Append-only: существующие записи никогда не переписываются.
   const path = join(dir, `${date}.md`);
@@ -78,11 +79,7 @@ export function saveBlob(
     .replace(/-+$/, "");
   let fname =
     safe && /\.[a-z0-9]+$/.test(safe) ? safe : `${kind}-${stamp.hhmmss}.${ext}`;
-  const dir = join(
-    process.env.ASSISTANT_VAULT_DIR || "vault",
-    "attachments",
-    stamp.date,
-  );
+  const dir = join(resolveVaultDir(process.cwd()), "attachments", stamp.date);
   mkdirSync(dir, { recursive: true });
   const dot = fname.lastIndexOf(".");
   const base = dot > 0 ? fname.slice(0, dot) : fname;

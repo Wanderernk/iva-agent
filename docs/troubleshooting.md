@@ -2,6 +2,16 @@
 
 Every entry below is a real failure someone hit, and the fix that shipped. Find your symptom, run the command. Env-var details live in [configuration.md](configuration.md); the full command reference in [cli.md](cli.md).
 
+## Send the maintainer a log package
+
+One line on the server, nothing else to type:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/diagnose.sh | bash
+```
+
+It runs `iva diagnose` (on Iva older than 0.4.1 it collects the service journal instead), cuts the secrets, and sends the package as a file into your chat with the bot. Forward that file to whoever is helping you.
+
 ## Common issues
 
 ### Build killed / exit 137
@@ -118,13 +128,13 @@ ffmpeg -i note.m4a -f segment -segment_time 600 -c copy part%02d.m4a
 
 ### iva update fails after force-push
 
-Cause: old versions used a destructive recovery path when upstream history changed. Re-run the current installer; it creates a backup ref, stashes tracked and untracked customizations by exact OID, and refuses an unsafe merge:
+Cause: old versions used a destructive recovery path when upstream history changed. Run the repair command; it puts the checkout back onto its release — edits to Iva's own code are removed, `.env`, `data/` and the vault are not touched — and hands the rest to the one updater:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/repair.sh | bash
 ```
 
-Do not reset or clean the checkout. If the histories cannot be combined safely, the existing version and user files remain in place and the full reason is recorded under `data/logs/`.
+The installer command does the same thing over an existing installation: it hands it to that updater instead of updating anything itself. If the update cannot finish, the version that was running stays in place and the full reason is recorded under `data/logs/`.
 
 ### Update says "local commits conflict with the update"
 
@@ -151,7 +161,7 @@ Reinstall from the current tree — one command, and it is the only way out:
 curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/repair.sh | bash
 ```
 
-Your data and `.env` stay in place: `.env`, `data/`, `vault/` and `attachments/` are copied byte for byte, and the whole old installation is kept beside the new one as `~/iva-backup-<timestamp>`.
+Your data and `.env` stay in place: nothing outside Iva's own code is touched. What the command does touch is that code - it puts the checkout back on the release it tracks, so local edits to Iva's files are removed - and then runs the ordinary update.
 
 ### gh not available warnings
 

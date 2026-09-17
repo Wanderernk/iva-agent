@@ -4,21 +4,19 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   chmod,
-  cp,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   realpath,
   rm,
-  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -37,16 +35,9 @@ async function createCliFixture(t: TestContext): Promise<CliFixture> {
   const home = join(dir, "home");
   const fakeBin = join(dir, "bin");
   const systemctlLog = join(dir, "systemctl.log");
-  await mkdir(join(project, "bin"), { recursive: true });
-  await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(home, { recursive: true });
   await mkdir(fakeBin, { recursive: true });
-  await copyFile(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts/cli"), join(project, "scripts/cli"), {
-    recursive: true,
-  });
-  await symlink(join(ROOT, "scripts/lib"), join(project, "scripts/lib"), "dir");
-  await symlink(join(ROOT, "deploy"), join(project, "deploy"), "dir");
+  await plantCliTree(ROOT, project, { copy: ["scripts/cli"] });
 
   const fakeSystemctl = join(fakeBin, "systemctl");
   await writeFile(
@@ -90,10 +81,24 @@ void test("update rejects a fresh lock without mutating update state", async (t)
   const envText = "AGENT_LANGUAGE=en\nASSISTANT_DATA_DIR=data\n";
   const dataDir = join(fixture.project, "data");
   const lockDir = join(dataDir, "update.lock");
+  // An installation's own repository: the updater mirrors the history it follows
+  // before it asks for the lock, and a tree without one fails the clone instead.
+  for (const args of [
+    ["init", "-q", "--initial-branch=main"],
+    ["remote", "add", "origin", fixture.project],
+  ]) {
+    const done = spawnSync("git", args, {
+      cwd: fixture.project,
+      encoding: "utf8",
+    });
+    assert.equal(done.status, 0, done.stderr);
+  }
   const ownerPath = join(lockDir, "owner.json");
+  // A live owner: the lock of a process that is gone is a leftover, and the updater
+  // is right to take it over.
   const ownerText = `${JSON.stringify({
     owner: "existing-update",
-    pid: 4242,
+    pid: process.pid,
     startedAt: new Date().toISOString(),
   })}\n`;
   await mkdir(lockDir, { recursive: true });
@@ -103,7 +108,10 @@ void test("update rejects a fresh lock without mutating update state", async (t)
   const result = runCli(fixture, ["update"]);
 
   assert.equal(result.status, 1, result.stderr || result.stdout);
-  assert.equal(result.stdout, "⚠️ An update is already running\n");
+  assert.equal(
+    result.stdout,
+    "◇ Getting the update\n⚠️ An update is already running\n",
+  );
   assert.equal(result.stderr, "");
   assert.equal(await readFile(envPath, "utf8"), envText);
   assert.equal(await readFile(ownerPath, "utf8"), ownerText);

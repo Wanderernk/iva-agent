@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { writeEnvAtomicSync } from "../lib/env-file.ts";
+import { parseEnv } from "node:util";
+import { formatEnvLine, writeEnvAtomicSync } from "../lib/env-file.ts";
 import { resolveDataDir } from "../lib/data-dir.ts";
 import { createSystemdControl } from "../lib/systemd-control.ts";
 import { real } from "../lib/version-layout.ts";
@@ -139,13 +140,22 @@ export function createCliRuntime(root: string) {
     parseVersionName(basename(real(ROOT)))?.sha ||
     "";
 
+  /**
+   * `.env` читается ТЕМ ЖЕ парсером, что и сам процесс: сервис стартует через
+   * `node --env-file=.env` (package.json, deploy/*.service), и `util.parseEnv` — ровно его
+   * разбор. Своя регулярка клала в значение инлайн-комментарий целиком
+   * (`KEY=secret # note` → `secret # note`) и видела только первую строку многострочного
+   * значения в кавычках, поэтому половина ключа уезжала мимо любого списка вырезания (T21).
+   * Битая строка бросает, как и у `node --env-file`: молча продолжать значит читать
+   * установку не так, как её читает сервис.
+   */
   function readEnv(): EnvValues {
+    if (!existsSync(ENV_PATH)) return {};
     const env: EnvValues = {};
-    if (!existsSync(ENV_PATH)) return env;
-    for (const line of readFileSync(ENV_PATH, "utf8").split("\n")) {
-      const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-      if (match) env[match[1]] = match[2].replace(/^["']|["']$/g, "");
-    }
+    for (const [key, value] of Object.entries(
+      parseEnv(readFileSync(ENV_PATH, "utf8")),
+    ))
+      if (typeof value === "string") env[key] = value;
     return env;
   }
 
@@ -177,29 +187,32 @@ export function createCliRuntime(root: string) {
     }
   }
 
+  // Через formatEnvLine, как и остальные писатели: `iva userbot creds` кладёт сюда
+  // api_hash прямо из рук владельца, и значение вне безопасного подмножества обязано
+  // получить отказ, а не лечь в файл огрызком.
   function writeEnvVars(vars: Readonly<Record<string, unknown>>): void {
-    for (const [key, value] of Object.entries(vars)) {
-      if (/[\r\n]/.test(String(value)))
-        throw new Error(`env value for ${key} contains a newline`);
-    }
-    const raw = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, "utf8") : "";
-    const pending = new Map(
-      Object.entries(vars).map(([key, value]) => [key, String(value)]),
+    const lines = new Map(
+      Object.entries(vars).map(([key, value]) => [
+        key,
+        formatEnvLine(key, String(value)),
+      ]),
     );
+    const raw = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, "utf8") : "";
     const out: string[] = [];
     for (const line of raw.split(/\r?\n/)) {
       const key = line.match(/^\s*([A-Z0-9_]+)\s*=/)?.[1];
       if (key && Object.hasOwn(vars, key)) {
-        if (pending.has(key)) {
-          out.push(`${key}=${pending.get(key)}`);
-          pending.delete(key);
+        const replacement = lines.get(key);
+        if (replacement !== undefined) {
+          out.push(replacement);
+          lines.delete(key);
         }
         continue;
       }
       out.push(line);
     }
     while (out.length && out.at(-1) === "") out.pop();
-    for (const [key, value] of pending) out.push(`${key}=${value}`);
+    for (const line of lines.values()) out.push(line);
     writeEnvAtomicSync(ENV_PATH, `${out.join("\n")}\n`);
   }
 

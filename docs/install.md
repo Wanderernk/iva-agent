@@ -47,7 +47,7 @@ The first question is your language — English or Russian — before anything t
 Five steps. Each key comes with a direct link to where it lives, and each is validated live — a bad key is rejected on the spot, not discovered at runtime. Enter keeps the current value, so re-running the wizard (`iva config`) changes only what you want.
 
 1. **Provider and model.** Ollama Cloud or OpenCode Go ([comparison](providers.md)); the key is checked against the API, then you pick a model from the provider's live list.
-2. **Voice, search, hybrid memory.** Deepgram key (free starter credit); recognition language `multi` auto-detects ru/uz/en. The same step picks a web-search provider — Tavily, Exa, Parallel or Brave; Enter skips and search stays off — and offers optional hybrid memory with an embedding key.
+2. **Voice, search, hybrid memory.** Deepgram key (free starter credit) — Enter skips it, voice notes stay untranscribed until you add the key in `/menu` → 🎤 Voice; recognition language `multi` auto-detects ru/uz/en. The same step picks a web-search provider — Tavily, Exa, Parallel or Brave; Enter skips and search stays off — and offers optional hybrid memory with an embedding key.
 3. **Telegram bot.** Paste the token from @BotFather; the wizard validates it via `getMe` and detects the bot's username itself.
 4. **Access.** Send your new bot any message — "hi" works. The wizard reads `getUpdates`, shows who wrote, and you pick yourself. Iva answers only these IDs; an empty list means it answers nobody.
 5. **Timezone, vault, port.** IANA timezone so nightly jobs run on your clock, the vault directory, and the port — default 8723, probed for conflicts.
@@ -63,7 +63,7 @@ Five steps. Each key comes with a direct link to where it lives, and each is val
 - 🧰 **The `iva` command** — installed into `~/.local/bin`: `iva status`, `iva doctor`, `iva update`. Full reference: [cli.md](cli.md).
 - ✅ **Telegram confirmation** — the last thing the installer does is message you from your own bot: "Iva is installed and online. Send me a message — I'll reply." That's the success signal.
 
-Re-running the same command later is safe, and cheap: it reuses the existing checkout, fast-forwards it, and keeps `.env` and the vault untouched.
+Re-running the same command later is safe: over an installation that already exists the installer updates nothing itself — it hands the installation to the one updater, exactly as `iva update` and `repair.sh` do. A checkout is put back onto its release first (edits to Iva's own code are removed, `.env`, `data/` and the vault are not touched), a versioned installation goes straight to its own updater, and a checkout you marked with `.iva-dev` is refused.
 
 Every stage checks whether its work is already done and skips it, so a run after a failure costs seconds instead of minutes:
 
@@ -75,9 +75,9 @@ Every stage checks whether its work is already done and skips it, so a run after
 | `gws`           | the binary is installed (`iva update` keeps it current)                                 |
 | Build           | `.output` carries this installer's stamp for the current commit, local edits and `.env` |
 
-The wizard, the vault check, the `iva` command and the systemd units are cheap, so they run every time. A run that fails is undone: the checkout goes back to the commit and the changes it started with, and the copies it made of `.env` and of your untracked files are deleted — on Ctrl-C and on a dropped SSH session too.
+The wizard, the vault check, the `iva` command and the systemd units are cheap, so they run every time. A run that fails is undone: the copy it made of `.env` goes back, the build it replaced is put back, and both copies are deleted — on Ctrl-C and on a dropped SSH session too. The code is never this script's to move.
 
-If the undo itself cannot finish — a read-only checkout, a full disk — nothing it saved is thrown away. Whatever is still the only copy of something stays where it is, and the installer prints each one by name before it exits: the stash entry holding your changes (`git stash list`), the commit it recorded under `refs/iva/update-backups/`, the copy of `.env` under `data/update-backups/`, and the previous build under `.output.iva-install-backup-*`. Read those lines before running anything else. An installation unpacked from an archive instead of cloned has no commit to compare against, so it rebuilds every time; so does one with a file the build cannot read.
+If the undo itself cannot finish — a read-only checkout, a full disk — nothing it saved is thrown away. Whatever is still the only copy of something stays where it is, and the installer prints each one by name before it exits: the copy of `.env` under `data/update-backups/`, and the previous build under `.output.iva-install-backup-*`. Read those lines before running anything else. An installation unpacked from an archive instead of cloned has no commit to compare against, so it rebuilds every time; so does one with a file the build cannot read.
 
 Only one installer runs in an installation at a time: a second one is refused by name, with the process id of the one already working. A lock left by a run that no longer exists is taken over, so a power cut cannot leave the installation unusable.
 

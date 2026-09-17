@@ -2,6 +2,7 @@ import { APICallError, generateText, streamText } from "ai";
 import {
   providerConfig,
   providerName,
+  providerRequestHeaders,
   makeCodexModel,
   makeTextModel,
 } from "./provider.ts";
@@ -50,6 +51,8 @@ export async function describeImage(
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      // Go без ID диалога и User-Agent отвечает 4xx; у остальных провайдеров тут пусто.
+      ...(providerRequestHeaders() ?? {}),
     },
     body: JSON.stringify({
       model: visionModel,
@@ -183,7 +186,7 @@ export function makeVisionProbe(
 const probe = makeVisionProbe(
   async () => {
     const result = await generateText({
-      model: makeTextModel(),
+      model: makeTextModel({ chatModelSeesImages }),
       // Ответ в одно слово, но потолок высокий: думающая модель тратит на reasoning
       // сотни токенов ДО первого слова ответа, и на десятке их ответ пуст.
       maxOutputTokens: 1024,

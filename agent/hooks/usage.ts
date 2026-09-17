@@ -25,6 +25,20 @@ interface StepData {
   };
 }
 
+/**
+ * Одно число расхода: конечное неотрицательное целое. Отсутствующее значение — ноль, как
+ * и раньше; всё остальное (1e308, отрицательное, «12», NaN) — `null`, то есть мусор
+ * провайдера. Такая строка в лог не пишется: сумма такого числа теряет конечность,
+ * `JSON.stringify` пишет Infinity как null, а /usage печатает «0 tokens (in Infinity/out
+ * Infinity)» — и лечится это только у источника (PBT-DS1-P F1).
+ */
+function usageTokens(value: unknown): number | null {
+  if (value === undefined || value === null) return 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
 function record(
   data: StepData,
   sessionId: string,
@@ -33,10 +47,22 @@ function record(
 ): void {
   const u = data.usage;
   if (!u) return;
-  const inT = u.inputTokens ?? 0;
-  const outT = u.outputTokens ?? 0;
-  const cacheRead = u.cacheReadTokens ?? 0;
-  const cacheWrite = u.cacheWriteTokens ?? 0;
+  const inT = usageTokens(u.inputTokens);
+  const outT = usageTokens(u.outputTokens);
+  const cacheRead = usageTokens(u.cacheReadTokens);
+  const cacheWrite = usageTokens(u.cacheWriteTokens);
+  if (
+    inT === null ||
+    outT === null ||
+    cacheRead === null ||
+    cacheWrite === null
+  ) {
+    // Пропуск не молчаливый: журнал называет шаг и что именно пришло.
+    console.error(
+      `[usage] расход шага пропущен: turn=${data.turnId ?? "?"} step=${data.stepIndex ?? 0} in=${String(u.inputTokens)} out=${String(u.outputTokens)} cacheRead=${String(u.cacheReadTokens)} cacheWrite=${String(u.cacheWriteTokens)}`,
+    );
+    return;
+  }
   if (inT + outT + cacheRead + cacheWrite === 0) return; // нет usage — не пишем нулевую строку
   appendUsage({
     ts: new Date().toISOString(),

@@ -1,9 +1,12 @@
 // Thin spawner shared by agent/schedules/*.ts and agent/lib/schedule-migration.ts.
 // Runs an existing cron script exactly the way the (now retired) systemd units did —
-// `flock -w 3900 <lockPath> <nodeBin> --env-file=.env <argv...>` — under a hard timeout,
-// and records the outcome to a status file so `iva doctor` and the /menu → crons screen
+// `flock -w 3900 <lockPath> <nodeBin> --env-file-if-exists=.env <argv...>` — under a hard
+// timeout, and records the outcome to a status file so `iva doctor` and the /menu → crons screen
 // can see it. Never throws: eve's schedule runner and the fire-and-forget migration hook
-// both need a promise that always settles.
+// both need a promise that always settles. The flag is the tolerant one on purpose: the
+// parent (systemd EnvironmentFile, eve start) already carries every key of .env in its own
+// process.env, so a checkout or version tree without the file must not kill the child —
+// node prints one honest `not found. Continuing without it.` line to the tail instead.
 import {
   spawn,
   type ChildProcess,
@@ -11,6 +14,8 @@ import {
 } from "node:child_process";
 import { resolveDataDir } from "./data-dir.ts";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { jobTail, recordFact, recordWake } from "./job-facts.ts";
 import {
   acquireFileLock,
   releaseFileLock,
@@ -67,6 +72,11 @@ export interface RunScheduledJobOptions {
   readonly killGraceMs?: number;
   readonly guardMs?: number;
   readonly statusPath?: string;
+  /** Путь к data/jobs.json; по умолчанию — рядом с данными при наличии statusPath. */
+  readonly factsPath?: string;
+  /** Будить агента после запуска (по умолчанию да). */
+  readonly wake?: boolean;
+  readonly wakeImpl?: (name: string, startedAt: number) => void;
   readonly env?: NodeJS.ProcessEnv;
   readonly spawnImpl?: SpawnImplementation;
   readonly killImpl?: (pid: number, signal: NodeJS.Signals) => unknown;
@@ -86,6 +96,8 @@ interface SpawnOutcome {
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
   readonly tail: string;
+  /** Хвост для факта: только stderr и уже без секретов (см. onErrData ниже). */
+  readonly errTail: string;
   readonly error?: unknown;
 }
 
@@ -127,17 +139,40 @@ function ownsReservation(
   );
 }
 
+export class ScheduleStatusError extends Error {}
+
 // Shared with schedule-migration.ts — one status file, one implementation of how it's
 // safely read/written/locked, rather than two copies that could drift.
+//
+// No file yet → empty status: that is a fresh install, and every caller's guards read
+// correctly off it. Anything else — damaged JSON, EACCES, EISDIR, a JSON value that
+// isn't an object — throws with the path: answering "{}" there would claim nothing had
+// ever run, which turns off the in-progress and last-success guards AND makes the very
+// next `{ ...existing, [name]: … }` write erase every other schedule's record. Same
+// split, for the same reason, in agent/lib/json-store.ts and agent/lib/reminder-tick.ts.
 export function readStatus(statusPath: string): ScheduleStatus {
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(statusPath, "utf8"));
-    return typeof parsed === "object" && parsed !== null
-      ? (parsed as ScheduleStatus)
-      : {};
-  } catch {
-    return {};
+    raw = readFileSync(statusPath, "utf8");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return {};
+    throw new ScheduleStatusError(
+      `${statusPath} unreadable: ${errorMessage(error)}`,
+    );
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new ScheduleStatusError(
+      `${statusPath} damaged (invalid JSON): ${errorMessage(error)}`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    throw new ScheduleStatusError(
+      `${statusPath} is not a schedule status object`,
+    );
+  return parsed as ScheduleStatus;
 }
 
 export function writeStatusAtomic(
@@ -145,6 +180,74 @@ export function writeStatusAtomic(
   data: ScheduleStatus,
 ): void {
   writeFileAtomicSync(statusPath, JSON.stringify(data, null, 2));
+}
+
+/** Причина провала одной строкой: спавн, сигнал или код выхода. */
+function factError(outcome: SpawnOutcome, ok: boolean): string | null {
+  if (outcome.error !== undefined) return errorMessage(outcome.error);
+  if (outcome.signal) return `killed by ${outcome.signal}`;
+  if (!ok) return `exited ${outcome.code ?? "n/a"}`;
+  return null;
+}
+
+// Fire-and-forget: раннер не ждёт хода агента (он идёт до восьми минут) и не падает, если
+// ребёнок не поднялся. Но и молчать о таком провале нельзя: ребёнок отвязан (detached,
+// stdio ignore), поэтому единственный его след — строка журнала и отметка в строке факта,
+// которую раннер ставит только если сам ход ничего записать не успел. Повторов нет: провал
+// пробуждения — факт, а не повод будить снова.
+function spawnWake(
+  root: string,
+  nodeBin: string,
+  env: NodeJS.ProcessEnv,
+  name: string,
+  startedAt: number,
+  factsFile: string,
+  log: (...args: unknown[]) => void,
+): void {
+  const child = spawn(
+    nodeBin,
+    [
+      // Тот же терпимый флаг, что у самого запуска (шапка файла): родитель уже несёт
+      // ключи .env в своём окружении, и дерево без файла не должно убивать пробуждение.
+      "--env-file-if-exists=.env",
+      join(root, "scripts/jobs/wake.ts"),
+      name,
+      String(startedAt),
+    ],
+    {
+      cwd: root,
+      env: {
+        ...env,
+        ASSISTANT_DATA_DIR: resolveDataDir(root, env.ASSISTANT_DATA_DIR),
+      },
+      detached: true,
+      stdio: "ignore",
+    },
+  );
+  const failed = (reason: string): void => {
+    log(`schedule-runner: ${name} wake failed — ${reason}`);
+    void recordWake(
+      factsFile,
+      name,
+      startedAt,
+      { at: Date.now(), status: "failed", error: reason },
+      true,
+    ).catch((error: unknown) => {
+      log(
+        `schedule-runner: ${name} wake outcome not recorded — ${errorMessage(error)}`,
+      );
+    });
+  };
+  child.on("error", (error) => failed(errorMessage(error)));
+  child.on("exit", (code, signal) => {
+    if (code === 0) return;
+    // Ход сам пишет свой исход и выходит 1 на провале: тогда отметка уже стоит и
+    // onlyIfMissing её не тронет, а строка журнала останется единственным следом.
+    failed(
+      signal ? `wake child killed by ${signal}` : `wake child exited ${code}`,
+    );
+  });
+  child.unref();
 }
 
 function tailLines(tail: string, n = 5): string {
@@ -197,6 +300,9 @@ export async function runScheduledJob(
     killGraceMs = DEFAULT_KILL_GRACE_MS,
     guardMs = GUARD_MS,
     statusPath,
+    factsPath,
+    wake = true,
+    wakeImpl,
     env = process.env,
     spawnImpl = spawn,
     killImpl = (pid: number, signal: NodeJS.Signals) =>
@@ -208,6 +314,9 @@ export async function runScheduledJob(
 ): Promise<RunScheduledJobResult> {
   let reserved = false;
   let startedAt = now();
+  // Провал записи обязательного факта: причину обязан увидеть тот, кто ждёт промис
+  // (waitUntil расписаний), поэтому она выезжает отклонением, а не полем результата.
+  let factFailure: Error | null = null;
   try {
     if (statusPath) {
       const admitted = await withStatusLock(statusPath, (acquired) => {
@@ -223,7 +332,19 @@ export async function runScheduledJob(
           );
           return false;
         }
-        const existing = readStatus(statusPath);
+        let existing: ScheduleStatus;
+        try {
+          existing = readStatus(statusPath);
+        } catch (error) {
+          // Deciding off a status we could not read means deciding off "nothing ever
+          // ran": both guards below would wave this attempt through, and the
+          // reservation write would erase every other schedule's record. Defer exactly
+          // like the lock-less path above — no write, retried next tick.
+          log(
+            `schedule-runner: ${name} deferring this attempt — ${errorMessage(error)} (retried on the next tick/boot)`,
+          );
+          return false;
+        }
         const prior = existing[name];
 
         // Genuinely still running (started less than our own hard timeout ago) — a run
@@ -281,10 +402,10 @@ export async function runScheduledJob(
           String(LOCK_WAIT_SECONDS),
           lockPath,
           nodeBin as string,
-          "--env-file=.env",
+          "--env-file-if-exists=.env",
           ...argv,
         ]
-      : ["--env-file=.env", ...argv];
+      : ["--env-file-if-exists=.env", ...argv];
 
     const outcome = await new Promise<SpawnOutcome>((resolve) => {
       let child: ChildProcess;
@@ -309,7 +430,7 @@ export async function runScheduledJob(
           detached: true,
         });
       } catch (error) {
-        resolve({ code: null, signal: null, tail: "", error });
+        resolve({ code: null, signal: null, tail: "", errTail: "", error });
         return;
       }
 
@@ -317,8 +438,21 @@ export async function runScheduledJob(
       const onData = (chunk: { toString(): string }) => {
         tail = (tail + chunk.toString()).slice(-TAIL_MAX);
       };
+      // Хвост для факта отдельный, и он копится иначе, чем хвост для журнала сервиса:
+      //  • только stderr — спека T20 просит в факте причину, а отчёт скрипта в stdout
+      //    вытеснял её из хвоста и ехал в текст пробуждения (лишние токены);
+      //  • вырезание секретов идёт ДО обрезки, поэтому граница буфера не может рассечь
+      //    значение и оставить в jobs.json его суффикс (jobTail сам держит 20 строк
+      //    и потолок знаков, так что буфер остаётся ограниченным).
+      let errTail = "";
+      const onErrData = (chunk: { toString(): string }) => {
+        errTail = jobTail(errTail + chunk.toString(), env);
+      };
       child.stdout?.on("data", onData);
-      child.stderr?.on("data", onData);
+      child.stderr?.on("data", (chunk: { toString(): string }) => {
+        onData(chunk);
+        onErrData(chunk);
+      });
 
       // Signal the process GROUP (negative pid), not just this one pid — see the
       // detached:true comment above. Falls back to a direct child.kill if the group
@@ -374,13 +508,20 @@ export async function runScheduledJob(
       if (killTimer.unref) killTimer.unref();
 
       child.on("error", (error) =>
-        settle({ code: null, signal: null, tail, error }),
+        settle({ code: null, signal: null, tail, errTail, error }),
       );
-      child.on("exit", (code, signal) => settle({ code, signal, tail }));
+      // close, а не exit: exit приходит до слива потоков, и поздняя причина из stderr
+      // не попадала бы в факт (T30 №8).
+      child.on("close", (code, signal) =>
+        settle({ code, signal, tail, errTail }),
+      );
     });
 
     const finishedAt = now();
-    const ok = outcome.code === 0 && !outcome.error;
+    // Успех запуска — это ещё и записанный факт: без строки в таблице агента никто не
+    // разбудит, а «последний успех» в статусе скажет, что всё в порядке (слепая приёмка
+    // T20 по v6). Поэтому исход считается ниже, после попытки записи.
+    const childOk = outcome.code === 0 && !outcome.error;
     const codeDesc = outcome.code ?? "n/a";
     const signalDesc = outcome.signal ? `, signal=${outcome.signal}` : "";
     log(`schedule-runner: ${name} finished (code=${codeDesc}${signalDesc})`);
@@ -391,6 +532,60 @@ export async function runScheduledJob(
         `schedule-runner: ${name} spawn error: ${errorMessage(outcome.error)}`,
       );
 
+    // Факт — история запуска (одна таблица, п.1 T20): пишется и после провала, и после
+    // успеха. Будим агента только когда факт на диске — иначе ходу нечего показать.
+    const factsFile = factsPath ?? null;
+    if (factsFile) {
+      let recorded = false;
+      try {
+        await recordFact(
+          factsFile,
+          {
+            name,
+            startedAt,
+            finishedAt,
+            ok: childOk,
+            error: factError(outcome, childOk),
+            exitCode: outcome.code,
+            tail: outcome.errTail,
+            acked: false,
+            wake: null,
+          },
+          finishedAt,
+        );
+        recorded = true;
+      } catch (error) {
+        log(
+          `schedule-runner: ${name} fact not recorded — ${errorMessage(error)}`,
+        );
+        factFailure = error instanceof Error ? error : new Error(String(error));
+      }
+      if (recorded && wake) {
+        try {
+          (
+            wakeImpl ??
+            ((wakeName: string, at: number) =>
+              spawnWake(
+                root ?? process.cwd(),
+                nodeBin ?? process.execPath,
+                env,
+                wakeName,
+                at,
+                factsFile,
+                log,
+              ))
+          )(name, startedAt);
+        } catch (error) {
+          log(
+            `schedule-runner: ${name} wake not started — ${errorMessage(error)}`,
+          );
+        }
+      }
+    }
+
+    // Запуск успешен, только если ребёнок вышел нулём И факт лёг в таблицу.
+    const ok = childOk && factFailure === null;
+
     if (statusPath) {
       const completed = await withStatusLock(statusPath, (acquired) => {
         if (!acquired) {
@@ -399,7 +594,19 @@ export async function runScheduledJob(
           );
           return false;
         }
-        const current = readStatus(statusPath);
+        let current: ScheduleStatus;
+        try {
+          current = readStatus(statusPath);
+        } catch (error) {
+          // The job already ran; we simply cannot record it. Writing from an unreadable
+          // snapshot would erase the neighbours, so leave the file alone: the
+          // reservation stays, and the inProgressSince/timeoutMs staleness check frees
+          // it on a later attempt.
+          log(
+            `schedule-runner: ${name} outcome not recorded — ${errorMessage(error)}`,
+          );
+          return false;
+        }
         if (!ownsReservation(current[name], startedAt)) {
           log(
             `schedule-runner: ${name} completion ignored because its reservation changed owner`,
@@ -423,6 +630,9 @@ export async function runScheduledJob(
             lastFinishedAt: finishedAt,
             lastExitCode: outcome.code,
             ...(ok ? { lastSuccessAt: finishedAt } : {}),
+            // Роли файлов: здесь — гварды («идёт сейчас», «последний успех») и след того,
+            // что запуск вообще был (scripts/lib/notice-policy.ts). Исход запуска и его
+            // история живут в data/jobs.json — второго ответа на «как прошло» тут нет.
           },
         });
         return true;
@@ -430,8 +640,23 @@ export async function runScheduledJob(
       if (completed) reserved = false;
     }
 
-    return { skipped: false, ok, code: outcome.code, signal: outcome.signal };
+    // Факт обязателен: без строки нет ни пробуждения, ни следа в таблице. Отказ записи
+    // обязан отклонить промис, иначе расписание считает шаг успешным (T30 №5).
+    if (factFailure !== null) throw factFailure;
+
+    // Ошибка spawn (ENOENT и любая другая) едет наружу: потребитель обязан сказать
+    // причину, а не «exited unknown» — ребёнок не запускался вовсе.
+    return {
+      skipped: false,
+      ok,
+      code: outcome.code,
+      signal: outcome.signal,
+      ...(outcome.error === undefined ? {} : { error: outcome.error }),
+    };
   } catch (error) {
+    // Провал факта уже назван в журнале строкой «fact not recorded» — не выдаём его за
+    // неожиданный сбой, а отдаём тому, кто ждёт промис.
+    if (error === factFailure) throw error;
     try {
       log(
         `schedule-runner: ${name} unexpected failure: ${errorMessage(error)}`,

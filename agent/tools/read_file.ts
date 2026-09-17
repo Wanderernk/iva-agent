@@ -2,6 +2,8 @@ import { defineTool } from "eve/tools";
 import { z } from "zod";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
+import { resolveVaultDir } from "@iva/vault-dir";
+import { vaultDirErrorText } from "../lib/vault-error.ts";
 
 // Host-native чтение файла. Переопределяет встроенный read_file eve: читает реальный
 // файл на VPS через node:fs/promises (UTF-8). Самодостаточно (eve/tools, zod, node-builtins).
@@ -12,10 +14,10 @@ import { isAbsolute, resolve } from "node:path";
 // последний от ASSISTANT_VAULT_DIR. Иначе модель получала ENOENT на путь, который ей же
 // и выдали. Не менять в одностороннем порядке.
 
-const VAULT = () => process.env.ASSISTANT_VAULT_DIR || "vault";
-
 function resolvePath(path: string): string {
-  return isAbsolute(path) ? path : resolve(VAULT(), path);
+  return isAbsolute(path)
+    ? path
+    : resolve(resolveVaultDir(process.cwd()), path);
 }
 
 // Потолок вывода: большой файл не должен переполнять окно контекста за один ход.
@@ -32,33 +34,39 @@ const cap = (s: string) =>
 
 export default defineTool({
   description:
-    "Прочитать UTF-8 файл НАПРЯМУЮ с файловой системы хоста VPS. " +
-    "Путь — абсолютный ИЛИ относительный от корня vault (так возвращает memory_search). " +
-    "По умолчанию возвращает всё содержимое; можно ограничить диапазон строк " +
-    "через offset (номер первой строки, 1-based) и limit (число строк). " +
-    "Возвращает { path, content, lines, truncated }.",
+    "Прочитать UTF-8 файл хоста. path — абсолютный или от корня vault. " +
+    "offset (1-based) и limit — диапазон строк; " +
+    "возвращает { path, content, lines, truncated }.",
   inputSchema: z.object({
     path: z
       .string()
       .min(1)
-      .describe(
-        "Абсолютный путь к файлу на хосте либо путь относительно корня vault (hits[].file)",
-      ),
+      .describe("Абсолютный или от корня vault (hits[].file)"),
     offset: z
       .number()
       .int()
       .positive()
       .optional()
-      .describe("Номер первой возвращаемой строки (1-based)"),
-    limit: z
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .describe("Максимальное число строк для чтения"),
+      .describe("Первая строка, 1-based"),
+    limit: z.number().int().positive().optional().describe("Максимум строк"),
   }),
   async execute({ path, offset, limit }) {
-    const raw = await readFile(resolvePath(path), "utf8");
+    let raw: string;
+    try {
+      raw = await readFile(resolvePath(path), "utf8");
+    } catch (error) {
+      const text = vaultDirErrorText(error);
+      if (text !== null)
+        return {
+          path,
+          content: "",
+          lines: 0,
+          truncated: false,
+          ok: false,
+          error: text,
+        };
+      throw error;
+    }
 
     // Без offset/limit — отдаём файл целиком (с потолком по символам).
     if (offset === undefined && limit === undefined) {

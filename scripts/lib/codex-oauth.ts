@@ -144,15 +144,21 @@ export function toAuth(
   prev: Partial<CodexAuth> = {},
 ): CodexAuth {
   const idToken = tokens.id_token || prev.id_token;
-  const { accountId, planType } = idToken
+  // id_token есть, но аккаунта в нём нет (не JWT, нет клейма, пустой клейм) — прежние
+  // accountId и planType остаются: без заголовка ChatGPT-Account-ID бэкенд подписки
+  // отвечает отказом, а рефреш сам себя не чинит (слепое QA v3). Новый id_token,
+  // НАЗВАВШИЙ аккаунт, по-прежнему побеждает: так переезжают на другой.
+  const named = idToken
     ? accountFromIdToken(idToken)
-    : { accountId: prev.accountId, planType: prev.planType };
+    : { accountId: null, planType: null };
   return {
     id_token: idToken,
-    access_token: tokens.access_token,
+    // Пустой ответ не смеет стереть уже записанный токен: файл входа обновляется только
+    // на непустое значение (PBT-DS1-P F2).
+    access_token: tokens.access_token || prev.access_token || "",
     refresh_token: tokens.refresh_token || prev.refresh_token,
-    accountId: accountId as string | null,
-    planType: planType as string | null,
+    accountId: named.accountId ?? prev.accountId ?? null,
+    planType: named.planType ?? prev.planType ?? null,
   };
 }
 

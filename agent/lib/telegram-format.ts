@@ -61,8 +61,12 @@ function inlineHtml(text: unknown): string {
     });
   s = escHtml(s);
   // links [t](http(s)://url)
+  // Границы квантификаторов обязательны: на строке из одних `[` жадный `[^\]]+`
+  // пробегает хвост на каждой позиции и вешает однопоточный мост (200k знаков - 41 с).
+  // Подпись длиннее 200 знаков и URL длиннее 2048 в сообщение Telegram не поместятся,
+  // так что отсечение живого текста не теряет.
   s = s.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    /\[([^\]\n]{1,200})\]\((https?:\/\/[^\s)\n]{1,2048})\)/g,
     (_m, t, u) => `<a href="${escAttr(u)}">${t}</a>`,
   );
   // bold
@@ -95,7 +99,12 @@ const tableCells = (line: string): string[] =>
 
 // ── block + inline converter ────────────────────────────────────────────────────
 function convert(md: unknown): string {
-  const lines = String(md).replace(/\r\n/g, "\n").split("\n");
+  // PUA-метка code-span извне срезается до разбора фенсов: иначе она проезжает
+  // через fenced-путь (escHtml тела) и уходит в отправленное сообщение.
+  const lines = String(md)
+    .replace(/\r\n/g, "\n")
+    .replace(/[\uE000\uE001]/g, "")
+    .split("\n");
   const out = [];
   let i = 0;
   while (i < lines.length) {
@@ -110,11 +119,13 @@ function convert(md: unknown): string {
         body.push(lines[i++]);
       i++; // closing ``` (no-op if half-open / EOF)
       const inner = escHtml(body.join("\n"));
-      out.push(
-        lang
-          ? `<pre><code class="language-${lang}">${inner}</code></pre>`
-          : `<pre>${inner}</pre>`,
-      );
+      // Пустой забор ничего не показывает: пустое сообщение пользователю не нужно.
+      if (inner)
+        out.push(
+          lang
+            ? `<pre><code class="language-${lang}">${inner}</code></pre>`
+            : `<pre>${inner}</pre>`,
+        );
       continue;
     }
     // table: header row + separator → header bold, body rows joined with ·
@@ -380,7 +391,10 @@ export function sanitizeTelegramHtml(input: unknown): string {
       return String(input)
         .replace(/<[^>]*>/g, "")
         .replace(/[&<>]/g, (c) => HTML_ESC[c]);
-    } catch {
+    } catch (error) {
+      console.error(
+        `[telegram] форматтер упал, и запасное экранирование тоже: ${String(error)}`,
+      );
       return "";
     }
   }
@@ -393,7 +407,10 @@ export function mdToTelegramHtml(md: unknown): string {
   } catch {
     try {
       return escHtml(md);
-    } catch {
+    } catch (error) {
+      console.error(
+        `[telegram] md→HTML не удался, и запасное экранирование тоже: ${String(error)}`,
+      );
       return "";
     }
   }
@@ -406,29 +423,48 @@ export function mdToTelegramHtml(md: unknown): string {
 export function chunkMarkdown(md: unknown, limit = 3500): string[] {
   const text = String(md);
   if (text.length <= limit) return [text];
-  const paras: string[] = [];
-  for (const p of text.split(/\n{2,}/)) {
-    if (p.length <= limit) {
-      paras.push(p);
+  // Кусок несёт свой разделитель: "\n\n" между абзацами, "\n" между строками одного
+  // абзаца, "" внутри разрезанной строки. Раньше строки абзаца склеивались заново
+  // пустой строкой, и длинный блок кода приезжал с пустой строкой между каждой строкой.
+  const pieces: { text: string; sep: string }[] = [];
+  for (const paragraph of text.split(/\n{2,}/)) {
+    if (paragraph.length <= limit) {
+      pieces.push({ text: paragraph, sep: "\n\n" });
       continue;
     }
-    for (const line of p.split("\n")) {
+    let firstLine = true;
+    for (const line of paragraph.split("\n")) {
+      const sep = firstLine ? "\n\n" : "\n";
+      firstLine = false;
       if (line.length <= limit) {
-        paras.push(line);
+        pieces.push({ text: line, sep });
         continue;
       }
-      for (let j = 0; j < line.length; j += limit)
-        paras.push(line.slice(j, j + limit));
+      for (let j = 0; j < line.length;) {
+        let end = Math.min(line.length, j + limit);
+        // Не разрывать суррогатную пару: Telegram покажет «�» на стыке сообщений.
+        if (
+          end < line.length &&
+          /[\uD800-\uDBFF]/.test(line[end - 1]) &&
+          /[\uDC00-\uDFFF]/.test(line[end])
+        )
+          end -= 1;
+        if (end <= j) end = j + limit;
+        pieces.push({ text: line.slice(j, end), sep: j === 0 ? sep : "" });
+        j = end;
+      }
     }
   }
   const chunks: string[] = [];
   let cur = "";
-  for (const p of paras) {
-    if (cur && cur.length + p.length + 2 > limit) {
+  for (const piece of pieces) {
+    const sep = cur === "" ? "" : piece.sep;
+    if (cur && cur.length + sep.length + piece.text.length > limit) {
       chunks.push(cur);
-      cur = "";
+      cur = piece.text;
+      continue;
     }
-    cur = cur ? `${cur}\n\n${p}` : p;
+    cur = cur ? `${cur}${sep}${piece.text}` : piece.text;
   }
   if (cur) chunks.push(cur);
   return chunks;
@@ -494,23 +530,47 @@ function splitHtmlHard(html: string, limit: number): string[] {
 
 // One-call helper: markdown → array of send-ready, balanced HTML chunks, each
 // guaranteed <= limit. (text=4096, caption=1024). NEVER throws.
+// Кнопка живёт только в rich-сообщении. Когда rich отвергнут (BUTTON_DATA_INVALID,
+// старый Bot API) и текст идёт HTML-путём, тег не должен доехать до чата буквами:
+// url-кнопка становится ссылкой, остальные — своей подписью, ряд — строкой подписей.
+export function stripRichButtons(md: string): string {
+  return md
+    .replace(
+      /<tg-button(?=[\s>])([^>]*)>([\s\S]*?)<\/tg-button>/gi,
+      (_m, attrs: string, label: string) => {
+        const url = /\btype="url"/i.test(attrs)
+          ? /\burl="([^"]*)"/i.exec(attrs)?.[1]
+          : undefined;
+        const text = label.trim();
+        return (url ? `[${text}](${url})` : `**${text}**`) + " ";
+      },
+    )
+    .replace(/<\/?tg-button-row\b[^>]*>/gi, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/ +$/gm, "");
+}
+
 export function toTelegramHtmlChunks(md: unknown, limit = 4096): string[] {
   try {
     const cap = Math.max(1, limit);
     const srcLimit = Math.min(3500, Math.floor(cap * 0.85));
     const result: string[] = [];
-    for (const src of chunkMarkdown(md, srcLimit)) {
+    for (const src of chunkMarkdown(stripRichButtons(String(md)), srcLimit)) {
       const html = mdToTelegramHtml(src);
       if (html.length <= cap) {
+        // Кусок, из которого ничего не отрендерилось (пустой забор, пробелы),
+        // не отправляем: пустое сообщение в чате - шум.
         if (html) result.push(html);
-        else if (src) result.push("");
       } else for (const piece of splitHtmlHard(html, cap)) result.push(piece);
     }
     return result.length ? result : [""];
   } catch {
     try {
       return [escHtml(md)];
-    } catch {
+    } catch (error) {
+      console.error(
+        `[telegram] нарезка ответа не удалась, текст потерян: ${String(error)}`,
+      );
       return [""];
     }
   }
@@ -519,10 +579,15 @@ export function toTelegramHtmlChunks(md: unknown, limit = 4096): string[] {
 // ── rich-message routing ────────────────────────────────────────────────────────
 // True when the text has a construct that Telegram's rich messages
 // (sendRichMessage, Bot API 10.1) render natively but parse_mode=HTML CANNOT:
-// GFM tables, task lists, <details>, block math. Headings/quotes/bold/etc.
+// GFM tables, task lists, <details>, block math, footnotes, media blocks, <tg-*>
+// tags (buttons, collage, slideshow, map, time), pull quotes. Headings/quotes/bold
 // render fine in HTML, so — like hermes-agent — we do NOT route on those: normal
 // replies stay on the proven HTML path. Conservative by design: a false negative
 // is just today's behavior; a false positive falls back on API rejection anyway.
+export function hasRichButtons(md: unknown): boolean {
+  return /<tg-button[\s>]/i.test(String(md));
+}
+
 export function needsRichMessage(md: unknown): boolean {
   const s = String(md);
   // GFM table delimiter row: a line of only pipes/dashes/colons/space with a dash run.
@@ -534,6 +599,12 @@ export function needsRichMessage(md: unknown): boolean {
   }
   if (/^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+/m.test(s)) return true; // task list
   if (/<details[\s>]/i.test(s)) return true; // collapsible
+  if (/<aside[\s>]/i.test(s)) return true; // pull quote
   if (/\$\$[\s\S]+?\$\$/.test(s)) return true; // block math
+  if (/^\[\^[^\]]+\]:/m.test(s)) return true; // footnote definition
+  if (/^!\[[^\]]*\]\(https?:\/\//m.test(s)) return true; // media block by public URL
+  // <tg-button>, <tg-collage>, <tg-slideshow>, <tg-map>, <tg-time>, <tg-emoji>:
+  // rich-only tags; <tg-spoiler> is also plain-HTML syntax and stays on that path.
+  if (/<tg-(?!spoiler)[a-z-]+[\s>/]/i.test(s)) return true;
   return false;
 }

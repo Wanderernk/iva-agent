@@ -3,20 +3,18 @@ import test from "node:test";
 import { spawnSync } from "node:child_process";
 import {
   chmod,
-  cp,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
   realpath,
   rm,
   stat,
-  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const STABLE_BEARER = "a".repeat(43);
@@ -28,16 +26,9 @@ void test("old install migration deduplicates a stable bearer and writes a loopb
   const project = join(dir, "iva");
   const home = join(dir, "home");
   const fakeBin = join(dir, "bin");
-  await mkdir(join(project, "bin"), { recursive: true });
-  await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(home, { recursive: true });
   await mkdir(fakeBin, { recursive: true });
-  await copyFile(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts/cli"), join(project, "scripts/cli"), {
-    recursive: true,
-  });
-  await symlink(join(ROOT, "scripts/lib"), join(project, "scripts/lib"), "dir");
-  await symlink(join(ROOT, "deploy"), join(project, "deploy"), "dir");
+  await plantCliTree(ROOT, project, { copy: ["scripts/cli"] });
 
   const envPath = join(project, ".env");
   await writeFile(

@@ -6,6 +6,11 @@
 /** Границы frontmatter: группа 1 - его строки, группа 2 - тело карточки. */
 const FRONTMATTER_BLOCK = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/;
 
+// Frontmatter карточки — отображение ключ→значение. Блок без ни одной строки-ключа
+// (например, абзац между двумя горизонтальными чертами) метаданными не является:
+// считать его frontmatter — значит выбросить голову карточки из тела.
+const FRONTMATTER_KEY = /^[ \t]*[A-Za-z_][A-Za-z0-9_-]*[ \t]*:/mu;
+
 export interface CardText {
   /** null — frontmatter отсутствует (тогда body === весь текст). */
   frontmatter: string | null;
@@ -16,7 +21,7 @@ export interface CardText {
 export function splitCard(content: string): CardText {
   const text = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const match = FRONTMATTER_BLOCK.exec(text);
-  return match
+  return match && FRONTMATTER_KEY.test(match[1])
     ? { frontmatter: match[1], body: match[2] }
     : { frontmatter: null, body: text };
 }

@@ -9,8 +9,10 @@ Iva is a self-hosted Telegram AI assistant with layered memory that turns your m
 - [security.md](security.md) — injection screening in, secret redaction out, allowlist fails closed
 - [providers.md](providers.md) — every external service, with real prices
 - [deploy.md](deploy.md) — systemd services and timers, long polling, updates, backups
+- [schedules.md](schedules.md) — what runs on its own, the fact every run leaves, the agent waking up with it, and what happens when it cannot
 - [cli.md](cli.md) — Telegram slash commands and the `iva` CLI
 - [menu.md](menu.md) — the `/menu` settings hub: screen map, what applies instantly vs on restart, key intake, character test, memory interview
+- [reminders.md](reminders.md) — how to ask Iva to remind you, one-time and repeating, the minute dispatcher, failed delivery, limits
 - [extending.md](extending.md) — skills, MCP connections, custom tools
 - [plugins.md](plugins.md) — plugins: what one is, how to install it, how to write your own, and what you risk
 - [trace.md](trace.md) — the turn journal: what the core records per turn, how to stitch one turn, retention and the content toggle

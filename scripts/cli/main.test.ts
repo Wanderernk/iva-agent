@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test, { type TestContext } from "node:test";
 import { createCliMain, dispatchCli, type CliCommand } from "./main.ts";
 
 class ExitSignal extends Error {
@@ -157,6 +167,7 @@ void test("main composition exposes the exact legacy command key set without exe
     "config",
     "login",
     "doctor",
+    "diagnose",
     "plugin",
     "trace",
     "status",
@@ -165,6 +176,7 @@ void test("main composition exposes the exact legacy command key set without exe
     "usage",
     "notify",
     "remind",
+    "jobs",
     "post",
     "start",
     "stop",
@@ -179,4 +191,113 @@ void test("main composition exposes the exact legacy command key set without exe
     "_activate-units",
     "_await-healthy",
   ]);
+});
+
+/** Everything `iva update` prints: `bad` goes through console.log, the progress through stdout. */
+function printed(t: TestContext): () => string {
+  const lines: string[] = [];
+  const previousExitCode = process.exitCode;
+  t.after(() => {
+    process.exitCode = previousExitCode;
+  });
+  t.mock.method(console, "log", (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    lines.push(String(chunk));
+    return true;
+  });
+  return () => lines.join("\n");
+}
+
+function scratch(t: TestContext): string {
+  const dir = mkdtempSync(join(tmpdir(), "iva-main-update-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** Every message the update UI would send to Telegram, with the API answering ok. */
+function chat(t: TestContext): string[] {
+  const sent: string[] = [];
+  t.mock.method(globalThis, "fetch", (_url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { text?: string };
+    sent.push(body.text ?? "");
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true, result: { message_id: 100 } }),
+    });
+  });
+  return sent;
+}
+
+void test("a checkout marked `.iva-dev` is refused and left exactly as it was", async (t) => {
+  const home = join(scratch(t), "iva");
+  mkdirSync(home);
+  const git = (...args: string[]): string =>
+    execFileSync("git", args, {
+      cwd: home,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "iva",
+        GIT_AUTHOR_EMAIL: "iva@example.com",
+        GIT_COMMITTER_NAME: "iva",
+        GIT_COMMITTER_EMAIL: "iva@example.com",
+      },
+    }).trim();
+  git("init", "-q", "--initial-branch=main");
+  writeFileSync(join(home, "package.json"), '{ "version": "0.3.19" }\n');
+  git("add", "-A");
+  git("commit", "-q", "-m", "release");
+  writeFileSync(join(home, "package.json"), '{ "version": "mine" }\n');
+  writeFileSync(join(home, "notes.txt"), "untracked\n");
+  // The one thing that keeps the updater out of a tree: the file its owner wrote.
+  writeFileSync(join(home, ".iva-dev"), "");
+  // The tap came from the chat, so the refusal is owed to the chat: the terminal of
+  // a self-update belongs to systemd-run and nobody reads it.
+  writeFileSync(join(home, ".env"), "TELEGRAM_BOT_TOKEN=1:token\n");
+  const job = join(home, "data/update-jobs/deadbeefdeadbeef.json");
+  mkdirSync(dirname(job), { recursive: true });
+  writeFileSync(job, JSON.stringify({ chatId: 7, messageId: 100 }));
+  // Everything but the agent's own state: the job file the refusal closes lives there.
+  const tree = (): readonly string[] => [
+    git("rev-parse", "HEAD"),
+    git("status", "--porcelain", "--", ".", ":(exclude)data"),
+  ];
+  const before = tree();
+
+  const out = printed(t);
+  const sent = chat(t);
+  await createCliMain(home).commands.update([
+    "--telegram-job",
+    "deadbeefdeadbeef",
+  ]);
+
+  assert.equal(process.exitCode, 1);
+  assert.match(
+    out(),
+    /development checkout \(\.iva-dev\): update it with git, build it with `npm run build`/u,
+  );
+  assert.deepEqual(sent, [
+    "⚠️ this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
+  ]);
+  // Left behind, the job keeps the bridge waiting on an update that will never run,
+  // and the chat stays on "Starting the update" until the six-hour TTL.
+  assert.equal(existsSync(job), false);
+  assert.deepEqual(tree(), before);
+});
+
+void test("an installed version is handed to the updater", async (t) => {
+  const root = join(scratch(t), "versions", "0.3.19-aaaaaaaaaaaa");
+  mkdirSync(root, { recursive: true });
+  // The first thing the updater checks, and the one refusal that touches nothing.
+  writeFileSync(join(root, ".env"), "MODEL_PROVIDER=ollmaa\n");
+
+  const out = printed(t);
+  await createCliMain(root).commands.update([]);
+
+  assert.equal(process.exitCode, 1);
+  assert.match(out(), /MODEL_PROVIDER/u);
+  assert.doesNotMatch(out(), /development checkout/u);
 });

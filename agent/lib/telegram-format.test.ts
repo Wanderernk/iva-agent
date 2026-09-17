@@ -5,6 +5,7 @@ import {
   escHtml,
   htmlToPlain,
   mdToTelegramHtml,
+  hasRichButtons,
   needsRichMessage,
   sanitizeTelegramHtml,
   toTelegramHtmlChunks,
@@ -76,4 +77,31 @@ await test("chunking and rich routing keep their current boundaries", () => {
 
   assert.equal(needsRichMessage("- [ ] todo"), true);
   assert.equal(needsRichMessage("**bold** and `code`"), false);
+  assert.equal(
+    needsRichMessage('<tg-button data="Отложи на час">На час</tg-button>'),
+    true,
+  );
+  assert.equal(
+    needsRichMessage("<tg-collage>\n![](https://h/a.jpg)\n</tg-collage>"),
+    true,
+  );
+  assert.equal(needsRichMessage('![](https://h/a.jpg "подпись")'), true);
+  assert.equal(needsRichMessage("текст[^1]\n[^1]: сноска"), true);
+  assert.equal(needsRichMessage("<tg-spoiler>секрет</tg-spoiler>"), false);
+  assert.equal(
+    hasRichButtons(
+      '<tg-button type="url" url="https://t.me">Открыть</tg-button>',
+    ),
+    true,
+  );
+  assert.equal(hasRichButtons("| a | b |\n|---|---|"), false);
+});
+
+void test("HTML path never shows button tags: url becomes a link, the rest their label", () => {
+  const html = toTelegramHtmlChunks(
+    'Готово.\n\n<tg-button-row><tg-button type="callback_data" data="Да">Да</tg-button><tg-button type="url" url="https://iva-agent.com">Сайт</tg-button></tg-button-row>',
+  ).join("\n");
+  assert.doesNotMatch(html, /tg-button/);
+  assert.match(html, /<b>Да<\/b>/);
+  assert.match(html, /<a href="https:\/\/iva-agent\.com">Сайт<\/a>/);
 });

@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { selfRestartViolation } from "../lib/self-restart-guard.ts";
+import { schedulerBypassViolation } from "../lib/scheduler-bypass-guard.ts";
 
 // Host-native bash. Переопределяет встроенный sandbox-bash eve: команда выполняется
 // напрямую на реальной файловой системе VPS через node:child_process (без sandbox).
@@ -253,26 +254,16 @@ export function normalizeCwd(cwd?: string): { cwd?: string; error?: string } {
 
 export default defineTool({
   description:
-    "Выполнить shell-команду НАПРЯМУЮ на хосте VPS (без sandbox, полный доступ к реальной " +
-    "файловой системе и окружению). Возвращает { stdout, stderr, exitCode }. " +
-    "Очень большой вывод обрезается до последних ~30000 символов каждого потока " +
-    "(в этом случае добавляется пометка об усечении). " +
-    "Используй для запуска любых команд: git, ls, uv, systemctl --user и т.д. " +
-    "Команды, останавливающие сервис самой Ивы (iva restart/stop/update, " +
-    "systemctl … restart iva, pkill node), заблокированы — перезапуск инициирует " +
-    "только пользователь: /restart или /update в чате, iva restart в терминале.",
+    "Shell-команда на хосте (без sandbox): возвращает { stdout, stderr, exitCode }, " +
+    "вывод обрезается до последних ~30000 символов каждого потока. Блокируются команды, " +
+    "останавливающие сервис Ивы: iva restart/stop/update, " +
+    "systemctl … restart iva, pkill node.",
   inputSchema: z.object({
-    command: z
-      .string()
-      .min(1)
-      .describe("Shell-команда для выполнения на хосте"),
+    command: z.string().min(1).describe("Shell-команда"),
     cwd: z
       .string()
       .optional()
-      .describe(
-        "Рабочая директория: абсолютный host-путь; ~ разворачивается в HOME. " +
-          "/workspace на хосте не существует — не используй. Не уверен в пути — не указывай cwd.",
-      ),
+      .describe("Абсолютный host-путь; ~ → HOME; /workspace нет."),
     timeoutMs: z
       .number()
       .int()
@@ -286,8 +277,7 @@ export default defineTool({
       )
       .optional()
       .describe(
-        `Таймаут в миллисекундах, от ${MIN_TIMEOUT_MS} до ${MAX_TIMEOUT_MS} ms ` +
-          "(по умолчанию 120000)",
+        `Таймаут, мс: ${MIN_TIMEOUT_MS}…${MAX_TIMEOUT_MS} (по умолчанию 120000)`,
       ),
   }),
   async execute({ command, cwd, timeoutMs }) {
@@ -296,6 +286,11 @@ export default defineTool({
     // немеет с HookConflictError (issue #68). Промпт-запрета мало — модели его игнорируют.
     const lethal = selfRestartViolation(command);
     if (lethal) return { stdout: "", stderr: lethal, exitCode: 1 };
+    // Свои таймеры и свои отправки в Telegram агент строил мимо штатных инструментов
+    // (curl с токеном, systemd-run, crontab, sleep-цепочки): такой путь не виден ни в
+    // напоминаниях, ни в расписаниях. Режем до запуска тем же видом возврата.
+    const bypass = schedulerBypassViolation(command);
+    if (bypass) return { stdout: "", stderr: bypass, exitCode: 1 };
     const timeout = timeoutMs ?? 120_000;
     if (
       !Number.isSafeInteger(timeout) ||

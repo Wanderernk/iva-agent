@@ -1,5 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { wrapLanguageModel, type LanguageModelMiddleware } from "ai";
+import { join } from "node:path";
+import {
+  APICallError,
+  wrapLanguageModel,
+  type LanguageModelMiddleware,
+} from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import {
@@ -10,7 +16,6 @@ import {
   MAX_IMAGE_BYTES,
 } from "./lib/attachment-ref.ts";
 import { resolveAttachmentPath } from "./lib/telegram-media-cache.ts";
-import { chatModelSeesImages } from "./vision.ts";
 import {
   CODEX_BASE_URL,
   codexAuthHeaders,
@@ -116,6 +121,61 @@ if (providerName === "custom" && !providerConfig.baseURL)
   throw new Error(
     "MODEL_PROVIDER=custom requires CUSTOM_BASE_URL (OpenAI-compatible base, e.g. https://api.example.com/v1) — run: iva config",
   );
+
+// --- OpenCode Go: что провайдер требует от клиента --------------------------------------------
+// С сентября 2026 Go принимает запрос только от клиента, который (1) называет себя своим
+// User-Agent, а не именем SDK, и (2) шлёт стабильный ID диалога в x-opencode-session. Без них
+// каждый ход падает 4xx MissingSessionID (https://opencode.ai/docs/go/#where-can-i-use-it).
+// ID диалога — sessionId eve: agent.ts получает его на session.started и строит модель под
+// него. Там, где сессии нет (планировщик, vision-пробник, describeImage), идёт один ID на
+// процесс: заголовок обязан быть всегда, пустой не уходит никогда. Остальным провайдерам
+// заголовки не достаются — их провод остаётся ровно таким, каким был.
+function readOwnVersion(): string {
+  // От cwd, не от import.meta.url: authored-модули инлайнятся в кэш eve (см. lib/data-dir.ts).
+  try {
+    const parsed: unknown = JSON.parse(
+      readFileSync(join(process.cwd(), "package.json"), "utf8"),
+    );
+    if (isRecord(parsed) && typeof parsed.version === "string") {
+      const version = parsed.version.trim();
+      if (version.length > 0) return version;
+    }
+  } catch {
+    /* версия нужна только для User-Agent — без неё ход не падает */
+  }
+  return "0";
+}
+export const IVA_USER_AGENT = `iva/${readOwnVersion()}`;
+const PROCESS_SESSION_ID = `iva-${randomUUID()}`;
+
+/** ID диалога для x-opencode-session: sessionId eve как есть, без него — ID процесса. */
+export function opencodeSessionId(sessionId?: string): string {
+  const id = (sessionId ?? "").trim();
+  return id.length > 0 ? id : PROCESS_SESSION_ID;
+}
+
+/** Заголовки клиента для активного провайдера. Требует их только Go; остальным — ничего. */
+export function providerRequestHeaders(
+  sessionId?: string,
+): Record<string, string> | undefined {
+  if (providerName !== "opencode") return undefined;
+  return {
+    "x-opencode-session": opencodeSessionId(sessionId),
+    "user-agent": IVA_USER_AGENT,
+  };
+}
+
+// AI SDK ставит свой User-Agent (`ai/… ai-sdk/… runtime/node.js`) поверх заголовков
+// провайдера — ровно то «имя SDK», которое Go отказывается принимать. Поэтому у Go свой
+// fetch: имя клиента ставится в самом запросе, после SDK. ID диалога SDK не трогает,
+// он едет обычными заголовками модели.
+export const opencodeFetch: typeof fetch = (input, init) => {
+  const headers = new Headers(
+    init?.headers ?? (input instanceof Request ? input.headers : undefined),
+  );
+  headers.set("user-agent", IVA_USER_AGENT);
+  return fetch(input, { ...init, headers });
+};
 
 // THINKING_EFFORT (.env, пишут /model и /think в Telegram): reasoning-усилие модели.
 // Codex получает его через providerOptions.openai.reasoningEffort ниже. Ollama Cloud
@@ -250,10 +310,18 @@ export const codexFetch: typeof fetch = async (input, init) => {
 // reasoningSummary:null гасит побочный эффект SDK: при заданном reasoningEffort он сам
 // добавляет summary:"detailed" в reasoning-блок. Summary нам не нужен (reasoning всё равно
 // вырезается withReasoningStripped), а лишний параметр — лишний шанс на 400 от бэкенда.
-const codexProviderOptions: LanguageModelMiddleware = {
+// strict:false на каждом инструменте - явно, как Hermes в своём Codex-адаптере. AI SDK поле
+// не шлёт, а Responses API без него включает строгий режим сам: тогда все поля схемы
+// обязательны, и модель забивает необязательные мусором (живой прогон 13.09.2026:
+// luna слала в remind `cron: ":"`, `id: ":? "`, получала «give exactly one of at or cron»
+// и повторяла это 33 раза, пока висело «Работаю»).
+export const codexProviderOptions: LanguageModelMiddleware = {
   transformParams({ params }) {
     return Promise.resolve({
       ...params,
+      tools: params.tools?.map((tool) =>
+        tool.type === "function" ? { ...tool, strict: false } : tool,
+      ),
       providerOptions: {
         ...params.providerOptions,
         openai: {
@@ -381,8 +449,12 @@ export function attachVaultImages(
       console.error(`[vision] картинку ${rel} из Vault не прочитал:`, error);
       continue;
     }
-    if (data.byteLength > MAX_IMAGE_BYTES) {
-      console.error(`[vision] картинка ${rel} больше потолка, иду без неё`);
+    if (data.byteLength === 0 || data.byteLength > MAX_IMAGE_BYTES) {
+      console.error(
+        data.byteLength === 0
+          ? `[vision] картинка ${rel} пустая, иду без неё`
+          : `[vision] картинка ${rel} больше потолка, иду без неё`,
+      );
       continue;
     }
     if (data.byteLength > budget) {
@@ -410,23 +482,35 @@ export function attachVaultImages(
   });
 }
 
-export const attachImagesMiddleware: LanguageModelMiddleware = {
-  async transformParams({ params }) {
-    // Ссылки ищем ДО пробника: ход без картинок не будит сеть, и сам пробник (он идёт
-    // через makeTextModel, то есть через этот же middleware) не ждёт собственного вердикта.
-    if (!Array.isArray(params.prompt)) return params;
-    const hasRefs = params.prompt.some(
-      (message) =>
-        isUserMessage(message) && imageRefsInMessage(message).length > 0,
-    );
-    if (!hasRefs) return params;
-    if (!(await chatModelSeesImages())) return params;
-    return {
-      ...params,
-      prompt: attachVaultImages(params.prompt, { readImage: readVaultImage }),
-    };
-  },
-};
+/**
+ * Прикладывает картинки Vault к промпту. Предикат «текстовая модель видит картинки»
+ * приходит параметром, а не импортом `vision.ts`: vision сам зовёт `makeTextModel()`
+ * для пробника, и этот импорт замыкал цикл provider ↔ vision. Форма — как у эффектов
+ * telegram-media: потребитель (agent.ts, planner, vision) отдаёт свою реализацию.
+ */
+export type ImageCapability = () => Promise<boolean>;
+
+export function attachImagesMiddleware(
+  chatModelSeesImages: ImageCapability,
+): LanguageModelMiddleware {
+  return {
+    async transformParams({ params }) {
+      // Ссылки ищем ДО пробника: ход без картинок не будит сеть, и сам пробник (он идёт
+      // через makeTextModel, то есть через этот же middleware) не ждёт собственного вердикта.
+      if (!Array.isArray(params.prompt)) return params;
+      const hasRefs = params.prompt.some(
+        (message) =>
+          isUserMessage(message) && imageRefsInMessage(message).length > 0,
+      );
+      if (!hasRefs) return params;
+      if (!(await chatModelSeesImages())) return params;
+      return {
+        ...params,
+        prompt: attachVaultImages(params.prompt, { readImage: readVaultImage }),
+      };
+    },
+  };
+}
 
 // Silent provider streams can keep a turn open indefinitely.
 // Remove when eve forwards ai SDK `timeout.firstChunkMs` to ToolLoopAgent (vercel/ai#17315 added the option; no eve issue yet).
@@ -552,18 +636,93 @@ export const modelFirstChunkDeadlineMiddleware: LanguageModelMiddleware = {
   },
 };
 
+// --- Схема инструмента, которую провайдер не принимает --------------------------------------
+// OpenAI (codex) отвергает ВЕСЬ запрос, если у любого инструмента в `pattern` стоит lookaround:
+// «Invalid JSON schema: regex lookaround is not supported. Found at $.properties.….pattern»,
+// 400, `param: tools` (пакет пользователя 13.09.2026: календарный инструмент с полем attendees, источник в пакете не различим - личный слой data/custom или подключение;
+// ход умирал до первого слова модели). Инструменты приходят откуда угодно - плагины,
+// подключения eve, свои - а граница с провайдером одна, эта. Как у Hermes (issue #42631):
+// отказ по схеме = вырезать такие `pattern` из инструментов ЭТОГО запроса и повторить один раз.
+// Остальная схема, включая описание поля, остаётся: модель по-прежнему видит, что от неё ждут.
+const LOOKAROUND_PATTERN = /\(\?<?[=!]/u;
+
+/** Копия схемы без `pattern` с lookaround на любой глубине; `dropped` считает вырезанные. */
+export function withoutLookaroundPatterns(
+  schema: unknown,
+  dropped = { count: 0 },
+): unknown {
+  if (Array.isArray(schema))
+    return schema.map((item) => withoutLookaroundPatterns(item, dropped));
+  if (!isRecord(schema)) return schema;
+  const copy: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (
+      key === "pattern" &&
+      typeof value === "string" &&
+      LOOKAROUND_PATTERN.test(value)
+    ) {
+      dropped.count++;
+      continue;
+    }
+    copy[key] = withoutLookaroundPatterns(value, dropped);
+  }
+  return copy;
+}
+
+export function isToolSchemaRejection(error: unknown): boolean {
+  return (
+    APICallError.isInstance(error) &&
+    error.statusCode === 400 &&
+    /invalid[ _-]?json[ _-]?schema/iu.test(error.message)
+  );
+}
+
+export const toolSchemaRetryMiddleware: LanguageModelMiddleware = {
+  async wrapStream({ doStream, model, params }) {
+    try {
+      return await doStream();
+    } catch (error) {
+      if (!isToolSchemaRejection(error) || !params.tools?.length) throw error;
+      const dropped = { count: 0 };
+      const tools = params.tools.map((tool) =>
+        tool.type === "function"
+          ? {
+              ...tool,
+              inputSchema: withoutLookaroundPatterns(
+                tool.inputSchema,
+                dropped,
+              ) as typeof tool.inputSchema,
+            }
+          : tool,
+      );
+      if (dropped.count === 0) throw error; // не та схема: чинить нечего, ошибка наружу
+      console.error(
+        `[provider] the provider rejected a tool schema; retrying without ${dropped.count} regex pattern(s) with lookaround`,
+      );
+      return model.doStream({ ...params, tools });
+    }
+  },
+};
+
 /**
  * Текстовая модель активного провайдера. Общая для КАЖДОГО узла графа: корень и субагенты
  * обязаны говорить с одним провайдером, свои createOpenAICompatible/env в субагентах не заводим.
  */
-export function makeTextModel() {
+export function makeTextModel(options: {
+  sessionId?: string;
+  chatModelSeesImages: ImageCapability;
+}) {
   return wrapLanguageModel({
-    model: makeBareTextModel(),
-    middleware: [attachImagesMiddleware, modelFirstChunkDeadlineMiddleware],
+    model: makeBareTextModel(options.sessionId),
+    middleware: [
+      attachImagesMiddleware(options.chatModelSeesImages),
+      toolSchemaRetryMiddleware,
+      modelFirstChunkDeadlineMiddleware,
+    ],
   });
 }
 
-function makeBareTextModel() {
+function makeBareTextModel(sessionId?: string) {
   // Codex-подписка говорит на Responses API — отдельная модель-фабрика (@ai-sdk/openai).
   // Остальные провайдеры — OpenAI-совместимый chat/completions через openai-compatible.
   if (providerName === "codex") return makeCodexModel();
@@ -571,6 +730,9 @@ function makeBareTextModel() {
     name: `iva-${providerName}`,
     baseURL: providerConfig.baseURL,
     apiKey: providerConfig.apiKey,
+    // Go: ID диалога и User-Agent (см. providerRequestHeaders); у остальных — undefined.
+    headers: providerRequestHeaders(sessionId),
+    fetch: providerName === "opencode" ? opencodeFetch : undefined,
     // Без этого стрим OpenAI-совместимых провайдеров НЕ несёт usage (нет stream_options:
     // {include_usage:true}) → событие step.completed приходит без поля usage, и учёт токенов
     // (agent/hooks/usage.ts) пуст. Включаем, чтобы провайдер отдавал расход в финальном чанке.

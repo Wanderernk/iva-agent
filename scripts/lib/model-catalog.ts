@@ -110,6 +110,7 @@ export const CATALOG: Record<string, ProviderCatalogEntry> = {
     models: [
       "deepseek-v4-pro",
       "deepseek-v4-flash",
+      "deepseek-v4.1-flash",
       "kimi-k3",
       "kimi-k2.7-code",
       "glm-5.2",

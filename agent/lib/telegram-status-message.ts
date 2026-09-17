@@ -1,6 +1,10 @@
 // Статус-сообщение хода: «Работаю…» с кнопкой [⏹ Стоп] и его уборка в терминале.
 // Это UI самого канала, не текст модели, поэтому мимо Outbox.
 //
+// Статус — rich message (sendRichMessage, Bot API 10.3): кнопка <tg-button> стоит
+// прямо в строке текста рядом с «Работаю…», а не клавиатурой под сообщением, поэтому
+// и текст, и кнопку несёт одна markdown-строка и правит их один editMessageText.
+//
 // turn.started шлёт статус и пишет running+sessionId+turnId в run-status.
 // Нажатие кнопки (и /stop) ловит Bridge: он берёт sessionId и зовёт cancel-роут
 // канала, а terminal-событие приводит статус в порядок: обычный финал удаляет
@@ -8,6 +12,7 @@
 //
 // Про eve модуль не знает: канал передаёт хендл Bot API структурно.
 import { tr } from "./i18n.ts";
+import { readSettings } from "./settings.ts";
 import { chatKeyOf, getChatStatus, setChatStatusIf } from "./run-status.ts";
 import { isPrivateTelegramChatHandle } from "./telegram-private-chat.ts";
 
@@ -34,22 +39,38 @@ function stoppedText(): string {
   );
 }
 
-export const stopReplyMarkup = () => ({
-  inline_keyboard: [
-    [{ text: tr("⏹ Stop", "⏹ Стоп"), callback_data: TELEGRAM_STOP_CALLBACK }],
-  ],
-});
-
 // Анимированный лоадер статуса — тот же набор, что у /update
 // (t.me/addemoji/iconemoji1), печатающие точки, чтобы «Работаю…» визуально
-// отличался от обновления. Без Premium у владельца бота
-// Telegram вернёт 400 на custom_emoji — тогда навсегда падаем на обычные ⏳.
+// отличался от обновления. Без Premium у владельца бота Telegram вернёт 400 на
+// custom_emoji — тогда анимация выключается навсегда, а текст падает на обычные ⏳.
 const WORK_LOADER = {
   alt: "💬",
   customEmojiId: "5818797194127346654",
   fallback: "⏳",
 };
 let workLoaderSupported = true;
+// Рич-путь целиком: старый Bot API не знает sendRichMessage. Один отказ — и статус
+// уходит обычным текстом, как до rich; повторять отказ на каждом ходу незачем.
+let richStatusSupported = true;
+
+// Строка статуса. Кнопка — inline-элемент rich-разметки, поэтому её место в этой же
+// строке; loader падает на ⏳, когда Telegram отверг custom emoji.
+function workingMarkdown({
+  animated = workLoaderSupported,
+  withStop = true,
+}: {
+  animated?: boolean;
+  withStop?: boolean;
+} = {}): string {
+  const loader = animated
+    ? `<tg-emoji emoji-id="${WORK_LOADER.customEmojiId}">${WORK_LOADER.alt}</tg-emoji>`
+    : WORK_LOADER.fallback;
+  const line = `${loader} ${tr("Working", "Работаю")}`;
+  // Кнопка рядом-блоком, не в строке: inline-кнопки Android-клиент рисует криво (13.09.2026).
+  return withStop
+    ? `${line}\n<tg-button-row><tg-button type="callback_data" style="danger" data="${TELEGRAM_STOP_CALLBACK}">${tr("⏹ Stop", "⏹ Стоп")}</tg-button></tg-button-row>`
+    : line;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -63,26 +84,47 @@ function messageIdFromResponse(response: { body: unknown }): number | null {
   return typeof result?.message_id === "number" ? result.message_id : null;
 }
 
-// Кнопку показываем только там, где она сработает: её колбэк принимают лишь в личке
-// (scripts/poller/control.ts, ./telegram-stop.ts). В группе мёртвый контрол хуже
-// отсутствующего, поэтому reply_markup туда не уезжает вовсе. Текстовая /stop в группе
-// работает по-прежнему — она через этот путь не ходит.
-export async function sendWorkingStatus(
-  tg: TelegramStatusHandle,
-  { canStop = true } = {},
-): Promise<number | null> {
-  const withStop = canStop && isPrivateTelegramChatHandle(tg);
-  const base = {
+function statusBody(tg: TelegramStatusHandle): Record<string, unknown> {
+  return {
     chat_id: tg.chatId,
-    ...(withStop ? { reply_markup: stopReplyMarkup() } : {}),
     ...(tg.messageThreadId !== undefined
       ? { message_thread_id: tg.messageThreadId }
       : {}),
   };
+}
+
+// Кнопку показываем только там, где она сработает: её колбэк принимают лишь в личке
+// (scripts/poller/control.ts, ./telegram-stop.ts). В группе мёртвый контрол хуже
+// отсутствующего, поэтому кнопка в текст не попадает вовсе. Текстовая /stop в группе
+// работает по-прежнему — она через этот путь не ходит.
+// Стиль меню владельца (settings.json menuStyle): classic = обычный текст с клавиатурой
+// под ним, rich = кнопка в rich message. Читается на каждую отправку.
+const classicMenu = () => readSettings().menuStyle !== "rich";
+
+const stopKeyboard = () => ({
+  inline_keyboard: [
+    [
+      {
+        text: tr("⏹ Stop", "⏹ Стоп"),
+        callback_data: TELEGRAM_STOP_CALLBACK,
+        style: "danger",
+      },
+    ],
+  ],
+});
+
+async function sendClassicWorkingStatus(
+  tg: TelegramStatusHandle,
+  withStop: boolean,
+): Promise<number | null> {
+  const base = {
+    ...statusBody(tg),
+    ...(withStop ? { reply_markup: stopKeyboard() } : {}),
+  };
   if (workLoaderSupported) {
     const res = await tg.request("sendMessage", {
       ...base,
-      text: `${WORK_LOADER.alt} ${tr("Working…", "Работаю…")}`,
+      text: `${WORK_LOADER.alt} ${tr("Working", "Работаю")}`,
       entities: [
         {
           type: "custom_emoji",
@@ -97,22 +139,69 @@ export async function sendWorkingStatus(
   }
   const res = await tg.request("sendMessage", {
     ...base,
-    text: `${WORK_LOADER.fallback} ${tr("Working…", "Работаю…")}`,
+    text: `${WORK_LOADER.fallback} ${tr("Working", "Работаю")}`,
   });
   return res.ok ? messageIdFromResponse(res) : null;
 }
 
+export async function sendWorkingStatus(
+  tg: TelegramStatusHandle,
+  { canStop = true } = {},
+): Promise<number | null> {
+  const withStop = canStop && isPrivateTelegramChatHandle(tg);
+  if (classicMenu()) return sendClassicWorkingStatus(tg, withStop);
+  const base = statusBody(tg);
+  if (richStatusSupported) {
+    const res = await tg.request("sendRichMessage", {
+      ...base,
+      rich_message: { markdown: workingMarkdown({ withStop }) },
+    });
+    if (res.ok) return messageIdFromResponse(res);
+    // 400 на custom_emoji: кнопка остаётся (она в тексте), а анимация — нет.
+    if (workLoaderSupported) {
+      workLoaderSupported = false;
+      const withoutEmoji = await tg.request("sendRichMessage", {
+        ...base,
+        rich_message: { markdown: workingMarkdown({ withStop }) },
+      });
+      if (withoutEmoji.ok) return messageIdFromResponse(withoutEmoji);
+    }
+    richStatusSupported = false;
+    console.error(
+      "[telegram] sendRichMessage для статуса отвергнут, шлю обычный текст:",
+      JSON.stringify(res.body).slice(0, 300),
+    );
+  }
+  // Статус обязан быть виден даже там, где rich не приняли: без кнопки и анимации,
+  // но «Работаю…» в чате есть.
+  const fallback = await tg.request("sendMessage", {
+    ...base,
+    text: workingMarkdown({ animated: false, withStop: false }),
+  });
+  return fallback.ok ? messageIdFromResponse(fallback) : null;
+}
+
 // Ранний статус уходит без кнопки: ход ещё не начался, отменять нечего. Начался — кнопку
-// дорисовываем в то же сообщение и по тому же правилу личного чата.
+// дорисовываем в то же сообщение и по тому же правилу личного чата: кнопка это часть
+// текста, поэтому переписывается весь текст, а не клавиатура под ним.
 export async function enableWorkingStatusStop(
   tg: TelegramStatusHandle,
   messageId: number,
 ): Promise<void> {
   if (!isPrivateTelegramChatHandle(tg)) return;
-  await tg.request("editMessageReplyMarkup", {
+  if (classicMenu()) {
+    await tg.request("editMessageReplyMarkup", {
+      chat_id: tg.chatId,
+      message_id: messageId,
+      reply_markup: stopKeyboard(),
+    });
+    return;
+  }
+  if (!richStatusSupported) return;
+  await tg.request("editMessageText", {
     chat_id: tg.chatId,
     message_id: messageId,
-    reply_markup: stopReplyMarkup(),
+    rich_message: { markdown: workingMarkdown({ withStop: true }) },
   });
 }
 
@@ -158,7 +247,7 @@ export async function finishTelegramStatus(
           await tg.request("editMessageText", {
             chat_id: tg.chatId,
             message_id: msgId,
-            text: stoppedText(),
+            rich_message: { markdown: stoppedText() },
           });
         } else {
           await tg.request("deleteMessage", {

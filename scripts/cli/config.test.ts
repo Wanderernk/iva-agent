@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/require-await -- Node's test runner owns registrations and async stubs preserve production signatures. */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import net from "node:net";
@@ -390,11 +390,12 @@ async function runWizard(
   provider: string,
   stopAt: RegExp,
   answers: readonly string[] = [],
+  patchFixture: (text: string) => string = (text) => text,
 ): Promise<{ candidate: string; output: string }> {
   const root = await sandbox(t);
   const input = join(root, "fixture.env");
   const candidate = join(root, "candidate.env");
-  writeFileSync(input, await fixtureEnv(provider));
+  writeFileSync(input, patchFixture(await fixtureEnv(provider)));
   const repo = fileURLToPath(new URL("../../", import.meta.url));
   const fetchFixture = fileURLToPath(
     new URL("../fixtures/setup-wizard-fetch.ts", import.meta.url),
@@ -530,6 +531,181 @@ test("the setup wizard writes grep without leaking host secrets", async (t) => {
     /No key — hybrid skipped\. Memory search stays on free BM25\. Enable later: iva config\./u,
   );
 });
+
+// Мастер судит о существующей настройке тем же разбором, каким `.env` прочитает сам
+// агент. Ключ, начинающийся с решётки, для процесса пуст — значит настройка не полная,
+// и мастер обязан спросить провайдера заново, а не объявить всё готовым.
+test("the setup wizard sees the key the agent process will get, not the file text", async (t) => {
+  const { output } = await runWizard(
+    t,
+    "ollama",
+    /Provider \(1\/2\/3\/4\/5\)|Reconfigure from scratch/u,
+    [],
+    (text) => text.replace("OLLAMA_API_KEY=key", "OLLAMA_API_KEY=#secret"),
+  );
+
+  assert.doesNotMatch(output, /Iva is already configured/u, output);
+  assert.match(output, /Provider \(1\/2\/3\/4\/5\)/u, output);
+});
+
+// Полный прогон: владелец вставляет ключ с решёткой — сервис и команда прочитали бы
+// его по-разному. Мастер обязан переспросить прямо на этом шаге, а не упасть в конце
+// прогона, потеряв все ответы, и записать годный ключ так, чтобы процесс получил его целиком.
+test("the setup wizard re-asks on an unstorable answer instead of losing the run", async (t) => {
+  const { candidate, output } = await runWizard(
+    t,
+    "invalid",
+    /Ready — settings validated for apply/u,
+    [
+      "2", // Provider (1/2/3/4/5) -> OpenCode
+      "ab#cd", // Paste the OpenCode API key -> hash: .env cannot hold it, ask again
+      "sk-live_ABC-123.xyz", // …and this one both parsers read the same way
+      "", // Model number -> default (deepseek-v4-pro)
+      "", // Vision model (photos) -> default from the same live list
+      "", // Paste the Deepgram API key -> keep fixture dg
+      "", // Recognition language (multi = auto ru/uz/en) -> default (multi)
+      "", // Search provider (number) -> default (tavily)
+      "ab#cd", // tavily API key -> идёт мимо askRequired, через обычный ask: тоже переспрос
+      "sk-tav-123", // …и годный ключ
+      "n", // Enable hybrid memory?
+      "", // Paste the Bot token -> keep fixture tg
+      "", // Timezone -> default (Asia/Almaty)
+      "", // Vault directory (memory + git backup) -> default (vault)
+      "", // Local eve-server port -> default (fixture IVA_PORT)
+    ],
+  );
+  assert.match(output, /cannot hold it/u, output);
+  assert.ok(existsSync(candidate), output);
+
+  // Эталон — сам рантайм: агент стартует через `node --env-file=.env`.
+  const seen = execFileSync(
+    process.execPath,
+    [
+      `--env-file=${candidate}`,
+      "-e",
+      'process.stdout.write(process.env.OPENCODE_API_KEY ?? "")',
+    ],
+    { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } },
+  );
+  assert.equal(seen, "sk-live_ABC-123.xyz", readFileSync(candidate, "utf8"));
+
+  // Второй переспрос — на ключе, который спрашивает обычный ask(), а не askRequired:
+  // именно по этому пути негодное значение раньше доживало до конца прогона и роняло его.
+  const text = readFileSync(candidate, "utf8");
+  assert.match(text, /^TAVILY_API_KEY=sk-tav-123$/mu, text);
+  assert.equal(
+    (output.match(/cannot hold it/gu) ?? []).length,
+    2,
+    `переспросов должно быть два (askRequired и ask): ${output}`,
+  );
+});
+
+// N1: негодное приходит не с клавиатуры, а из уже лежащего .env. Прогон обязан
+// дойти до конца: терять все ответы владельца на последнем шаге нельзя.
+for (const [what, patch] of [
+  [
+    "значение вне латиницы",
+    (text: string) => `${text}ASSISTANT_VAULT_DIR=вольт\n`,
+  ],
+  [
+    "значение с краевым пробелом",
+    (text: string) => `${text}ASSISTANT_VAULT_DIR="my vault "\n`,
+  ],
+  ["чужое имя ключа", (text: string) => `${text}my.key=1\n`],
+] as const) {
+  test(`the setup wizard finishes when the existing .env carries ${what}`, async (t) => {
+    const { candidate, output } = await runWizard(
+      t,
+      "invalid",
+      /Ready — settings validated for apply|Setup aborted/u,
+      [
+        "2", // Provider -> OpenCode
+        "sk-opencode-1", // its key
+        "", // Model number -> default
+        "", // Vision model -> default
+        "", // Deepgram key -> keep fixture
+        "", // Recognition language -> default
+        "", // Search provider -> default
+        "", // tavily key -> skip
+        "n", // hybrid memory?
+        "", // Bot token -> keep fixture
+        "", // Timezone -> default
+        "", // Vault directory -> Enter: подставляется значение из .env
+        "", // Port -> default
+      ],
+      patch,
+    );
+    assert.doesNotMatch(output, /Setup aborted/u, output);
+    assert.ok(existsSync(candidate), `кандидат не записан:\n${output}`);
+  });
+}
+
+// N7/N8: строку, которую нельзя записать в безопасном подмножестве, мастер не выписывает
+// дословно. Для значения с переносом строки «как есть» вообще не перенос: строка
+// разваливается надвое, и вторая половина становится настоящей переменной — так в приёмке
+// молча подменился ASSISTANT_DATA_DIR. Поэтому такая строка выбрасывается, а ключ
+// называется вслух: смолчать о выброшенной строке владельца нельзя.
+for (const [what, patch, key] of [
+  [
+    "значение с переносом строки",
+    (text: string) =>
+      `${text}OTHER="one\nASSISTANT_DATA_DIR=/tmp/pwned\ntwo"\n`,
+    "OTHER",
+  ],
+  ["чужое имя ключа", (text: string) => `${text}my.key=1\n`, "my.key"],
+] as const) {
+  test(`the setup wizard drops ${what} from the existing .env and names the key`, async (t) => {
+    const { candidate, output } = await runWizard(
+      t,
+      "invalid",
+      /Ready — settings validated for apply|Setup aborted/u,
+      [
+        "2", // Provider -> OpenCode
+        "sk-opencode-1", // its key
+        "", // Model number -> default
+        "", // Vision model -> default
+        "", // Deepgram key -> keep fixture
+        "", // Recognition language -> default
+        "", // Search provider -> default
+        "", // tavily key -> skip
+        "n", // hybrid memory?
+        "", // Bot token -> keep fixture
+        "", // Timezone -> default
+        "", // Vault directory -> default
+        "", // Port -> default
+      ],
+      patch,
+    );
+    assert.doesNotMatch(output, /Setup aborted/u, output);
+    assert.ok(existsSync(candidate), `кандидат не записан:\n${output}`);
+
+    const text = readFileSync(candidate, "utf8");
+
+    // Эталон — сам рантайм. В файле не должно появиться переменной, которой владелец не
+    // задавал: каталог данных обязан остаться тем, что мастер выбрал сам.
+    const seen = execFileSync(
+      process.execPath,
+      [
+        `--env-file=${candidate}`,
+        "-e",
+        'process.stdout.write(process.env.ASSISTANT_DATA_DIR ?? "")',
+      ],
+      { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } },
+    );
+    assert.equal(seen, "data", text);
+
+    assert.ok(
+      !text.split("\n").some((line) => line.startsWith(`${key}=`)),
+      `строка ${key} всё-таки записана:\n${text}`,
+    );
+
+    // Предупреждение обязано назвать ключ: иначе владелец не узнает, что строки не стало.
+    assert.ok(
+      output.includes(`Dropped ${key}`),
+      `мастер не назвал выброшенный ключ ${key}:\n${output}`,
+    );
+  });
+}
 
 // IVA_CONFIG_INPUT существует ради одного: прогнать мастера против фикстуры в тесте.
 // Унаследованный из окружения оператора он молча подменил бы источник — мастер прочитал бы

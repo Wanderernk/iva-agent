@@ -33,7 +33,7 @@ import {
 type UpdateOfferRequest = {
   token: string;
   chatId: string;
-  offer: { text: string; replyMarkup: { inline_keyboard: unknown[][] } };
+  offer: { text: string };
 };
 type DailyUpdateResult = {
   status: string;
@@ -61,6 +61,11 @@ const { runDailyUpdateCheck } = require("../check-update.mjs") as unknown as {
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+
+/** callback_data кнопок в порядке появления в rich-тексте сообщения. */
+function actionCallbacks(text: string): string[] {
+  return [...text.matchAll(/data="([^"]+)"/gu)].map((match) => match[1]);
+}
 
 function repoFixture() {
   const temp = mkdtempSync(join(tmpdir(), "iva-update-check-"));
@@ -199,7 +204,7 @@ test("notification target prefers digest chat and falls back to the first truste
   assert.equal(notificationChat({}), "");
 });
 
-test("installer persists the selected update channel and integrates the fetched oid", () => {
+test("installer persists the selected update channel", () => {
   const installer = readFileSync(
     new URL("../../install.sh", import.meta.url),
     "utf8",
@@ -212,11 +217,6 @@ test("installer persists the selected update channel and integrates the fetched 
     installer,
     /UPDATE_CHANNEL="\$\(git -C "\$PROJECT_DIR" branch --show-current/,
   );
-  assert.match(
-    installer,
-    /remote_ref="\$\(git -C "\$PROJECT_DIR" rev-parse FETCH_HEAD\)"/,
-  );
-  assert.doesNotMatch(installer, /remote_ref="origin\/\$BRANCH"/);
 });
 
 test("notification state is atomic, private and readable", async () => {
@@ -248,7 +248,11 @@ test("daily check sends one offer per version and records only successful sends"
   };
   assert.equal((await runDailyUpdateCheck(options)).status, "notified");
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].offer.replyMarkup.inline_keyboard[0].length, 2);
+  // Кнопки — строки rich-текста: обе на месте, рядом со своими пояснениями.
+  assert.deepEqual(actionCallbacks(sent[0].offer.text), [
+    "iva_update:do",
+    "iva_update:skip",
+  ]);
   assert.match(sent[0].offer.text, /Доступна новая версия Ивы/);
   assert.equal((await runDailyUpdateCheck(options)).status, "already-notified");
   assert.equal(sent.length, 1);
@@ -319,11 +323,12 @@ test("the daily notice says what is new, in the language of the notice", async (
     sent[0].offer.text,
     /• 🔁 Reply на старое сообщение больше не вешает бота\n/,
   );
+  // What's New sits between the body and the buttons; the buttons close the message.
   assert.match(
     sent[0].offer.text,
-    /Полный список: https:\/\/github\.com\/smixs\/iva-agent\/releases$/,
+    /Полный список: https:\/\/github\.com\/smixs\/iva-agent\/releases\n\n<tg-button [^]*iva_update:skip[^]*<\/tg-button> — напомню завтра$/,
   );
-  // Sent without parse_mode: no markdown marker may reach the chat.
+  // Rich markdown: no stray markdown marker may reach the chat.
   assert.doesNotMatch(sent[0].offer.text, /[`*]/);
 });
 
@@ -395,10 +400,10 @@ test("offer copy is bilingual and keeps existing callback actions", () => {
   const ru = updateOffer("1.2.3", "1.2.4", "ru");
   assert.match(en.text, /new Iva version/);
   assert.match(ru.text, /новая версия Ивы/);
-  assert.deepEqual(
-    en.replyMarkup.inline_keyboard[0].map((button) => button.callback_data),
-    ["iva_update:do", "iva_update:skip"],
-  );
+  assert.deepEqual(actionCallbacks(en.text), [
+    "iva_update:do",
+    "iva_update:skip",
+  ]);
 });
 
 test("systemd templates schedule a persistent 10:00 local check and lifecycle commands include it", () => {
@@ -423,10 +428,6 @@ test("systemd templates schedule a persistent 10:00 local check and lifecycle co
     join(root, "scripts", "cli", "systemd.ts"),
     "utf8",
   );
-  const cliUpdate = readFileSync(
-    join(root, "scripts", "cli", "update.ts"),
-    "utf8",
-  );
   const installer = readFileSync(join(root, "install.sh"), "utf8");
   assert.match(timer, /OnCalendar=\*-\*-\* 10:00:00 __TIMEZONE__/);
   assert.match(timer, /Persistent=true/);
@@ -434,32 +435,10 @@ test("systemd templates schedule a persistent 10:00 local check and lifecycle co
   assert.match(service, /EnvironmentFile=__PROJECT_DIR__\/\.env/);
   assert.match(cliRuntime, /const TIMERS = \[BRAIN_TIMER, UPDATE_TIMER\]/);
   assert.match(cliSystemd, /replaceAll\("__TIMEZONE__", timezone\)/);
-  assert.match(cliUpdate, /systemd\.activate\(\[UPDATE_TIMER\]\)/);
   assert.match(installer, /bin\/iva\.mjs" _activate-units/);
   assert.match(
     pollService,
     /ExecStartPost=-\/usr\/bin\/systemctl --user enable --now iva-update-check\.timer/,
-  );
-});
-
-test("a post-commit timer failure exits without rollback or a false update claim", () => {
-  const cliUpdate = readFileSync(
-    new URL("../cli/update.ts", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(
-    cliUpdate,
-    /Iva is ready, but the automatic update timer could not be activated/,
-  );
-  assert.doesNotMatch(cliUpdate, /timerFailure: "Iva updated/);
-  assert.match(
-    cliUpdate,
-    /const finalizeUpdate = async \(\): Promise<boolean> => \{[\s\S]*?commitThenRunPostCommit[\s\S]*?terminal\.fail\(text\.timerFailure\)[\s\S]*?process\.exitCode = 1;[\s\S]*?return false;/,
-  );
-  assert.equal(
-    cliUpdate.match(/if \(!\(await finalizeUpdate\(\)\)\) return;/g)?.length,
-    2,
   );
 });
 
@@ -764,19 +743,17 @@ test("this checkout names its own release, and the refusal says how to repair it
 test("the update Alert carries the repair command only for an updater that is too old", async () => {
   const plain = updateOffer("1.2.3", "1.2.4", "en");
   assert.doesNotMatch(plain.text, /repair\.sh/);
-  assert.match(plain.text, /Settings and local changes will be preserved\./);
+  assert.match(plain.text, /Edits to Iva's own code are not carried over\./u);
 
   for (const locale of ["en", "ru"]) {
     const stuck = updateOffer("1.2.3", "1.2.4", locale, true);
     assert.match(stuck.text, /v1\.2\.3 → v1\.2\.4/);
     assert.ok(stuck.text.includes(REPAIR_COMMAND), stuck.text);
     // The buttons stay: the tap now earns the same words instead of a broken update.
-    assert.deepEqual(
-      stuck.replyMarkup.inline_keyboard[0].map(
-        (button) => button.callback_data,
-      ),
-      ["iva_update:do", "iva_update:skip"],
-    );
+    assert.deepEqual(actionCallbacks(stuck.text), [
+      "iva_update:do",
+      "iva_update:skip",
+    ]);
   }
 
   // End to end: the flag comes off the remote marker the daily check already fetched.

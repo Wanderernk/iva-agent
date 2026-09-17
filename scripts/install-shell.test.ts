@@ -166,6 +166,11 @@ nvm() {
 IVA_NVM_SH
 IVA_NVM_INSTALLER
     ;;
+  */repair.sh)
+    # The repair script of the channel, which is what the installer hands an existing
+    # installation to. The bytes are the real file in the repository.
+    cat "$IVA_TEST_REPAIR_SH" >"$out"
+    ;;
   *agent-browser-0.34.0.tgz|*cli-0.22.5.tgz)
     case "$url" in
       *agent-browser*) artifact=agent-browser ;;
@@ -371,6 +376,8 @@ type RunOptions = {
 type World = {
   readonly dir: string;
   readonly install: string;
+  /** The installer copy outside the installation: how `curl | bash` arrives. */
+  readonly piped: string;
   readonly home: string;
   readonly tmp: string;
   run(options?: RunOptions): SpawnSyncReturns<string>;
@@ -445,8 +452,11 @@ after(() => rmSync(TOOLS, { recursive: true, force: true }));
 
 /**
  * A whole installed Iva as the reported failure had it: a checkout at INSTALL_DIR with an
- * origin to fetch from, the installer running from somewhere else (which is what
- * `curl | bash` does), and a HOME of its own. install.sh itself is the real file.
+ * origin to fetch from and a HOME of its own. install.sh itself is the real file, and it
+ * runs from inside the installation - `cd ~/iva && bash install.sh`, the command the
+ * installer prints and docs/install.md promises. A copy sits outside too, for the runs that
+ * have to arrive the way `curl | bash` does: over an installation the installer no longer
+ * updates itself but hands to the updater.
  */
 function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "iva-install-shell-")));
@@ -467,8 +477,6 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
     join(ghEtc, "sources.list.d"),
   ])
     mkdirSync(path, { recursive: true });
-  // The installer never sits next to a package.json here, so it takes the branch a piped
-  // `curl | bash` takes: the checkout at INSTALL_DIR.
   cpSync(join(ROOT, "install.sh"), join(dir, "install.sh"));
 
   mkdirSync(join(install, "bin"), { recursive: true });
@@ -507,13 +515,25 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
   );
   writeFileSync(join(install, "bin/iva.mjs"), IVA_CLI);
   writeFileSync(join(install, "scripts/init-vault.mjs"), "");
-  cpSync(
-    join(ROOT, "packages/data-dir/index.ts"),
-    join(install, "packages/data-dir/index.ts"),
-  );
-  for (const name of ["env-file.ts", "version-layout.ts", "version-store.ts"])
+  for (const name of ["data-dir", "vault-dir"]) {
+    mkdirSync(join(install, "packages", name), { recursive: true });
+    cpSync(
+      join(ROOT, "packages", name, "index.ts"),
+      join(install, "packages", name, "index.ts"),
+    );
+  }
+  for (const name of [
+    "env-file.ts",
+    "link-target.ts",
+    "process-command.ts",
+    "version-layout.ts",
+    "version-store.ts",
+  ])
     cpSync(join(ROOT, "scripts/lib", name), join(install, "scripts/lib", name));
   writeFileSync(join(install, "README.md"), "# fixture\n");
+  // The installation carries the installer, as the repository does: it is the one a re-run
+  // over it executes.
+  cpSync(join(ROOT, "install.sh"), join(install, "install.sh"));
   // A patched dependency, like the real installation has: the hook that applies it is
   // npm's, so skipping npm has to apply it instead.
   mkdirSync(join(install, "patches"), { recursive: true });
@@ -555,6 +575,7 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
     IVA_TEST_GH_ETC_DIR: ghEtc,
     IVA_TEST_GH_READY_AFTER_INSTALL: "",
     IVA_TEST_GH_READY_MARKER: join(dir, "gh-ready"),
+    IVA_TEST_REPAIR_SH: join(ROOT, "repair.sh"),
     IVA_TEST_MISSING_COMMANDS: "",
     BASH_ENV: COMMAND_MASK_PATH,
     ...runOptions.env,
@@ -563,13 +584,14 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
   return {
     dir,
     install,
+    piped: join(dir, "install.sh"),
     home,
     tmp,
     git,
     calls: (path = defaultCalls) =>
       existsSync(path) ? readFileSync(path, "utf8") : "",
     run: (runOptions = {}) => {
-      const installer = runOptions.script ?? join(dir, "install.sh");
+      const installer = runOptions.script ?? join(install, "install.sh");
       const argv = runOptions.closedStderr
         ? [
             "-c",
@@ -587,7 +609,7 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
     runAsync: (runOptions = {}) => {
       const child = spawn(
         "bash",
-        [runOptions.script ?? join(dir, "install.sh"), "--non-interactive"],
+        [runOptions.script ?? join(install, "install.sh"), "--non-interactive"],
         { cwd: dir, env: environment(runOptions) },
       );
       let output = "";
@@ -1119,71 +1141,6 @@ void test("a stage killed mid-way fails the install and gives the old build back
   assert.doesNotMatch(world.calls(), /iva _install-units/u);
 });
 
-void test("the installer run from inside the checkout undoes its own failure too", (t) => {
-  const world = createWorld(t);
-  // Path B: the command the installer prints, and the one docs/install.md promises is
-  // undone on failure - `cd ~/iva && bash install.sh`, no git update involved.
-  cpSync(join(ROOT, "install.sh"), join(world.install, "install.sh"));
-  const script = join(world.install, "install.sh");
-  writeFileSync(join(world.install, "README.md"), "# fixture\nlocal edit\n");
-  writeFileSync(join(world.install, "mine.txt"), "mine\n");
-  mkdirSync(join(world.install, ".output"), { recursive: true });
-  writeFileSync(join(world.install, ".output/marker"), "previous build\n");
-  const before = readFileSync(join(world.install, ".env"), "utf8");
-
-  const result = world.run({ script, env: { IVA_TEST_BUILD_EXIT: "137" } });
-
-  assert.notEqual(result.status, 0, result.stdout + result.stderr);
-  assert.doesNotMatch(result.stdout, /Installation complete/u);
-  // Exactly what path A gives back: the previous build, the edits, the untracked file.
-  assert.equal(
-    readFileSync(join(world.install, ".output/marker"), "utf8"),
-    "previous build\n",
-  );
-  assert.equal(existsSync(join(world.install, ".output/server.mjs")), false);
-  assert.deepEqual(outputBackups(world.install), []);
-  assert.equal(
-    readFileSync(join(world.install, "README.md"), "utf8"),
-    "# fixture\nlocal edit\n",
-  );
-  assert.equal(readFileSync(join(world.install, "mine.txt"), "utf8"), "mine\n");
-  assert.equal(readFileSync(join(world.install, ".env"), "utf8"), before);
-  assert.deepEqual(
-    backups(world.install).filter((name) => name.startsWith(".env")),
-    [],
-  );
-  assert.deepEqual(leftovers(world.tmp), []);
-  // And it never touched the units, because it stopped at the build.
-  assert.doesNotMatch(world.calls(), /iva _install-units/u);
-});
-
-void test("a restore that could not finish keeps the stash and says where it is", (t) => {
-  const world = createWorld(t);
-  writeFileSync(join(world.install, "README.md"), "# fixture\nlocal edit\n");
-  writeFileSync(join(world.install, "mine.txt"), "mine\n");
-
-  // The units fail, and by then a directory sits where the stashed file has to go back, so
-  // the rollback's `stash apply` cannot finish. The one copy of the user's work is the
-  // stash entry: dropping it here would destroy it.
-  const result = world.run({
-    env: { IVA_TEST_UNITS_FAIL: "1", IVA_TEST_BLOCK_RESTORE: "mine.txt" },
-  });
-
-  assert.notEqual(result.status, 0, result.stdout + result.stderr);
-  const stash = world.git("stash", "list");
-  assert.match(
-    stash,
-    /iva-install-/u,
-    "the stash entry was dropped after a failed restore",
-  );
-  const refs = world.git("for-each-ref", "refs/iva/update-backups");
-  assert.match(refs, /refs\/iva\/update-backups\//u);
-  // And the user is told where both are, by name.
-  const said = result.stdout + result.stderr;
-  assert.match(said, /git stash list/u);
-  assert.match(said, /refs\/iva\/update-backups\//u);
-});
-
 void test("a build that could not be put back is kept and named", (t) => {
   if (process.getuid?.() === 0) {
     t.skip("root writes into a read-only directory, so nothing fails here");
@@ -1529,49 +1486,8 @@ void test("a failure while preserving the checkout keeps the files it was preser
     readFileSync(join(world.install, "README.md"), "utf8"),
     "# fixture\nlocal edit\n",
   );
-  // And the ref it had already written is gone with it.
-  assert.equal(world.git("for-each-ref", "refs/iva/update-backups"), "");
-  assert.equal(world.git("stash", "list"), "");
   assert.deepEqual(leftovers(world.tmp), []);
   assert.deepEqual(backups(world.install), []);
-});
-
-void test("a failure between the backup ref and the stash orphans neither", (t) => {
-  if (process.getuid?.() === 0) {
-    t.skip("root reads a file with no permissions, so the stash does not fail");
-    return;
-  }
-  const world = createWorld(t);
-  writeFileSync(join(world.install, "README.md"), "# fixture\nlocal edit\n");
-  // git cannot put this into a stash, so the run dies after the backup ref is written and
-  // before the stash that ref exists to accompany - the one window the arming order is for.
-  writeFileSync(join(world.install, "unreadable.txt"), "mine\n");
-  chmodSync(join(world.install, "unreadable.txt"), 0o000);
-
-  const result = world.run();
-  chmodSync(join(world.install, "unreadable.txt"), 0o600);
-
-  assert.notEqual(result.status, 0, result.stdout + result.stderr);
-  assert.match(result.stderr, /Install stopped during: saving your changes/u);
-  // The ref was written and then taken back with the rest of the run: not left behind for
-  // the next one to trip over, and not silently reported as changes that were saved.
-  assert.equal(world.git("for-each-ref", "refs/iva/update-backups"), "");
-  assert.equal(world.git("stash", "list"), "");
-  assert.doesNotMatch(result.stdout, /changes are in the stash/u);
-  // And everything of the user's is still where it was.
-  assert.equal(
-    readFileSync(join(world.install, "README.md"), "utf8"),
-    "# fixture\nlocal edit\n",
-  );
-  assert.equal(
-    readFileSync(join(world.install, "unreadable.txt"), "utf8"),
-    "mine\n",
-  );
-  assert.deepEqual(leftovers(world.tmp), []);
-  assert.deepEqual(
-    backups(world.install).filter((name) => name.startsWith(".env")),
-    [],
-  );
 });
 
 void test("a run that can save nothing at all leaves nothing behind", (t) => {
@@ -1784,7 +1700,11 @@ void test("a first install into an empty directory still runs every stage", (t) 
   const world = createWorld(t);
   const fresh = join(world.dir, "fresh");
 
-  const result = world.run({ env: { INSTALL_DIR: fresh } });
+  // Пришли как `curl | bash`: установщик вне установки, ставить некуда - значит клон.
+  const result = world.run({
+    script: world.piped,
+    env: { INSTALL_DIR: fresh },
+  });
 
   assert.equal(result.status, 0, result.stdout + result.stderr);
   const calls = world.calls();
@@ -1840,15 +1760,113 @@ void test("the deferred wizard ends with enabled units and lingering, in that or
   );
 });
 
-void test("a versioned install is refused instead of cloned into", (t) => {
+/**
+ * Один обновлятор: установщик над существующей установкой ничего не обновляет сам, а
+ * отдаёт дерево repair.sh того же канала - тому же пути, которым идут `iva update`, мост
+ * и команда ремонта. Своей копии решения «можно ли обновлять это дерево» у него нет.
+ *
+ * Сеть не нужна: repair.sh приходит через стаб curl из файла репозитория, origin
+ * установки - локальный bare, а обновлятор в дереве - стаб `bin/iva.mjs`.
+ */
+void test("a re-run over a checkout puts it back on the release and hands the update over", (t) => {
+  const world = createWorld(t);
+  writeFileSync(join(world.install, "bin/iva.mjs"), "// my own updater\n");
+  writeFileSync(join(world.install, "mine.txt"), "mine\n");
+  const released = world.git("rev-parse", "HEAD");
+  world.git("commit", "--quiet", "-am", "an edit of the owner's");
+
+  const result = world.run({
+    script: world.piped,
+    env: { REPO_URL: "https://github.com/smixs/iva-agent.git" },
+  });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  // Дерево - на релизе, правка в коде Ивы затёрта, неотслеживаемое на месте.
+  assert.equal(world.git("rev-parse", "HEAD"), released);
+  assert.equal(readFileSync(join(world.install, "mine.txt"), "utf8"), "mine\n");
+  // И работу дальше делает обновлятор, а не установщик: своих стадий он не проходил.
+  const calls = world.calls();
+  assert.match(calls, /^iva update$/mu);
+  assert.doesNotMatch(calls, /eve build/u);
+  assert.doesNotMatch(calls, /^npm ci$/mu);
+});
+
+void test("a second installer over the same checkout is refused by name before the hand-over", (t) => {
+  const world = createWorld(t);
+  const lock = join(world.install, "data/install.lock");
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(join(lock, "pid"), `${process.pid}\n`);
+  const head = world.git("rev-parse", "HEAD");
+
+  const refused = world.run({
+    script: world.piped,
+    env: { REPO_URL: "https://github.com/smixs/iva-agent.git" },
+  });
+  assert.notEqual(refused.status, 0, refused.stdout + refused.stderr);
+  assert.match(refused.stderr, new RegExp(`pid ${process.pid}`, "u"));
+  // Дерево не двигалось и обновлятор не вызывался.
+  assert.equal(world.git("rev-parse", "HEAD"), head);
+  assert.doesNotMatch(world.calls(), /iva update/u);
+});
+
+void test("a checkout too old to resolve its data directory is still handed over", (t) => {
+  const world = createWorld(t);
+  rmSync(join(world.install, "packages/data-dir"), {
+    recursive: true,
+    force: true,
+  });
+  const result = world.run({
+    script: world.piped,
+    env: { REPO_URL: "https://github.com/smixs/iva-agent.git" },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(world.calls(), /^iva update$/mu);
+});
+
+void test("a re-run over a development checkout is refused and changes nothing", (t) => {
+  const world = createWorld(t);
+  writeFileSync(join(world.install, ".iva-dev"), "");
+  writeFileSync(join(world.install, "bin/iva.mjs"), "// work in progress\n");
+  const head = world.git("rev-parse", "HEAD");
+
+  const result = world.run({
+    script: world.piped,
+    env: { REPO_URL: "https://github.com/smixs/iva-agent.git" },
+  });
+
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stderr, /development checkout \(\.iva-dev\)/u);
+  // Работа на месте, история не двинулась, обновление никому не передано.
+  assert.equal(
+    readFileSync(join(world.install, "bin/iva.mjs"), "utf8"),
+    "// work in progress\n",
+  );
+  assert.equal(world.git("rev-parse", "HEAD"), head);
+  assert.doesNotMatch(world.calls(), /^iva update$/mu);
+});
+
+void test("a re-run over a versioned installation starts the updater it already has", (t) => {
   const world = createWorld(t);
   const versioned = join(world.dir, "v2");
-  mkdirSync(join(versioned, "versions/0.3.20-0123456789ab"), {
+  mkdirSync(join(versioned, "versions/0.3.20-0123456789ab/bin"), {
     recursive: true,
   });
-  const result = world.run({ env: { INSTALL_DIR: versioned } });
-  assert.equal(result.status, 1, result.stdout + result.stderr);
-  assert.match(result.stderr, /iva update/u);
-  assert.match(result.stderr, /iva rollback/u);
+  mkdirSync(join(versioned, "current/bin"), { recursive: true });
+  cpSync(
+    join(world.install, "bin/iva.mjs"),
+    join(versioned, "current/bin/iva.mjs"),
+  );
+
+  const result = world.run({
+    script: world.piped,
+    env: {
+      INSTALL_DIR: versioned,
+      REPO_URL: "https://github.com/smixs/iva-agent.git",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(world.calls(), /^iva update$/mu);
+  // Клона в версионную раскладку не бывает: чекаута там нет и не появляется.
   assert.equal(existsSync(join(versioned, ".git")), false);
 });

@@ -63,7 +63,8 @@ const {
   retireSettledSessions,
 } = queue;
 const { drainReadyQueueHeads, routeMessageUpdate } = routing;
-const { reconcileUpdateJobs, removeStaleUpdateJobs } = updateFlow;
+const { launchSelfUpdate, reconcileUpdateJobs, removeStaleUpdateJobs } =
+  updateFlow;
 const { handleControl, registerBotCommands } = control;
 
 export { readCappedStream } from "./transport.ts";
@@ -194,11 +195,15 @@ export async function processTelegramUpdate(
     return { offset: nextOffset, ingressBlocked: false };
   }
   const admitted = await admitImpl(update);
-  if (admitted === "write-failed" || admitted === "unownable") {
-    if (admitted === "unownable") {
-      logImpl(`update ${update.update_id} has no durable ingress key`);
-    }
+  // write-failed транзиентен: диск может ожить, повтор обязателен и вход ждёт.
+  if (admitted === "write-failed") {
     return { offset, ingressBlocked: true };
+  }
+  // unownable структурен и постоянен: повтор не сделает апдейт опознаваемым, а
+  // задержанный offset крутит один и тот же батч вечно. Подтверждаем и идём дальше;
+  // строка в журнале называет update_id и причину.
+  if (admitted === "unownable") {
+    logImpl(`update ${update.update_id} has no durable ingress key`);
   }
   const nextOffset = update.update_id + 1;
   if (admitted === "terminal-drop") {
@@ -289,7 +294,7 @@ export async function main({
   // The update that restarted this bridge left its final screen to us: its own
   // process died with the restart. Delivered before the first poll; the jobs with
   // nothing to say yet are watched beside it.
-  const watched = await reconcileUpdateJobs();
+  const watched = await reconcileUpdateJobs({ launchImpl: launchSelfUpdate });
   if (watched.length > 0)
     log(`watching ${watched.length} unfinished update job(s)`);
   // Upgrade the old {chatKey: string[]} queue atomically before polling. A failed

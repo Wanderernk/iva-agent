@@ -14,15 +14,17 @@ const languageModule: unknown = await import(
 
 after(() => rmSync(dataDir, { recursive: true, force: true }));
 
-interface Button {
-  text: string;
-  callback_data: string;
-}
-
 interface MenuView {
   text: string;
-  rows: Button[][];
 }
+
+// Кнопка — тег в markdown: подпись и data достаём из строки.
+const buttonsOf = (text: string): Array<[string, string]> =>
+  [
+    ...text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
 
 interface MenuState {
   page: number;
@@ -33,8 +35,6 @@ interface MenuContext {
   deps: { envPath: string };
   getLang: () => string;
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screenId: string) => Button[];
   show: (state: MenuState, screenId: string) => Promise<void>;
 }
 
@@ -88,10 +88,6 @@ function makeContext(
     deps: { envPath },
     getLang: () => lang,
     tr: (english, russian) => (lang === "ru" ? russian : english),
-    btn: (text, callbackData) => ({ text, callback_data: callbackData }),
-    backRow: (screenId) => [
-      { text: "Back", callback_data: `iva_menu:${screenId}:o` },
-    ],
     show: (_state, screenId) => {
       assert.equal(screenId, "r");
       onShow();
@@ -101,7 +97,7 @@ function makeContext(
 }
 
 test("language menu renders current-language checkmarks with stable callbacks", () => {
-  for (const [current, expectedText, expectedRows] of [
+  for (const [current, expectedHeading, expectedButtons, expectedBack] of [
     [
       "ru",
       "🌐 Язык интерфейса",
@@ -109,6 +105,7 @@ test("language menu renders current-language checkmarks with stable callbacks", 
         ["Русский ✓", "iva_menu:lang:set:ru"],
         ["English", "iva_menu:lang:set:en"],
       ],
+      "‹ Меню",
     ],
     [
       "en",
@@ -117,21 +114,18 @@ test("language menu renders current-language checkmarks with stable callbacks", 
         ["Русский", "iva_menu:lang:set:ru"],
         ["English ✓", "iva_menu:lang:set:en"],
       ],
+      "‹ Menu",
     ],
   ] as const) {
     const context = makeContext(current, join(dataDir, `${current}.env`));
     const view = language.render({ page: 4 }, context);
 
-    assert.equal(view.text, expectedText);
-    assert.deepEqual(
-      view.rows
-        .slice(0, 1)
-        .flat()
-        .map((button: Button) => [button.text, button.callback_data]),
-      expectedRows,
-    );
-    assert.deepEqual(view.rows[1], [
-      { text: "Back", callback_data: "iva_menu:r:o" },
+    assert.match(view.text, new RegExp(`^# ${expectedHeading}$`, "m"));
+    assert.deepEqual(buttonsOf(view.text).slice(0, 2), expectedButtons);
+    // Языки — равноправный ряд, «назад» — отдельной строкой с пояснением.
+    assert.deepEqual(buttonsOf(view.text).at(-1), [
+      expectedBack,
+      "iva_menu:r:o",
     ]);
   }
   assert.equal(language.parent, "r");

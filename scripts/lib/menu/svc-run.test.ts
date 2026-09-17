@@ -3,7 +3,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  LOADERS,
   stripAnsi,
   elapsed,
   tailText,
@@ -19,49 +18,26 @@ import type {
   ServiceRun,
 } from "./svc-run.ts";
 
-interface TestTelegramBody {
-  entities?: Array<{ custom_emoji_id: string }>;
-  text?: string;
-}
-
-interface TestTelegramCall {
-  method: string;
-  body: TestTelegramBody;
-}
-
-// tg-мок: копит вызовы; fail400First — первый editMessageText с entities получает 400.
-function makeTg({ fail400First = false }: { fail400First?: boolean } = {}) {
-  const calls: TestTelegramCall[] = [];
-  let failed = false;
-  const tg: RunOptions["tg"] = (method, body) => {
-    const testBody = body as TestTelegramBody;
-    calls.push({ method, body: testBody });
-    if (fail400First && testBody.entities && !failed) {
-      failed = true;
-      return Promise.resolve({
-        ok: false,
-        error_code: 400,
-        description: "CUSTOM_EMOJI_INVALID",
-      });
-    }
+// edit-мок: копит markdown, который тикер отдаёт движку (своей дороги в Telegram у
+// раннера нет — кнопка отмены живёт строкой в тексте прогресса).
+function makeEdit() {
+  const calls: string[] = [];
+  const edit: RunOptions["edit"] = (markdown) => {
+    calls.push(markdown);
     return Promise.resolve({ ok: true });
   };
-  return { tg, calls };
+  return { edit, calls };
 }
 
 const baseOpts = (
-  tg: ReturnType<typeof makeTg>["tg"],
+  edit: RunOptions["edit"],
   over: Partial<RunOptions> = {},
 ) => ({
-  tg,
+  edit,
   chatId: 10,
   messageId: 7,
-  loader: LOADERS.doc,
   attached: () => true,
-  progressView: (run: ServiceRun) => ({
-    text: `работаю ${run.lastLine}`,
-    rows: [[{ text: "✖", callback_data: "iva_menu:svc:ab" }]],
-  }),
+  progressView: (run: ServiceRun) => ({ text: `работаю ${run.lastLine}` }),
   onFinish: () => {},
   tickMs: 15,
   timeoutMs: 5_000,
@@ -83,9 +59,9 @@ test("stripAnsi: срезает цветовые и курсорные коды"
   assert.equal(stripAnsi("\x1b[?25lstep\x1b[?25h"), "step");
 });
 
-test("startProcess: успех — done, tail собран, прогресс шёл с custom_emoji entity", async () => {
+test("startProcess: успех — done, tail собран, прогресс шёл markdown-строками", async () => {
   resetForTests();
-  const { tg, calls } = makeTg();
+  const { edit, calls } = makeEdit();
   const finished: { value: ServiceRun | null } = { value: null };
   const run = startProcess(
     "doc",
@@ -96,7 +72,7 @@ test("startProcess: успех — done, tail собран, прогресс ш�
         "console.log('step one'); console.log('step two')",
       ],
     },
-    baseOpts(tg, {
+    baseOpts(edit, {
       onFinish: (r) => {
         finished.value = r;
       },
@@ -108,25 +84,21 @@ test("startProcess: успех — done, tail собран, прогресс ш�
   assert.equal(finished.value.status, "done");
   assert.deepEqual(finished.value.tail, ["step one", "step two"]);
   assert.equal(currentRun(), run);
-  // хотя бы один прогресс-эдит и он нёс entity нужного лоадера
-  const rich = calls.find((c) => c.body.entities);
-  assert.ok(rich);
-  assert.ok(rich.body.entities);
-  assert.ok(rich.body.text);
-  assert.equal(rich.body.entities[0].custom_emoji_id, LOADERS.doc.id);
-  assert.ok(rich.body.text.startsWith(`${LOADERS.doc.alt} `));
+  // хотя бы один прогресс-эдит, и он ушёл движку готовым markdown-текстом
+  assert.ok(calls.length >= 1);
+  assert.ok(calls.some((markdown) => markdown.startsWith("работаю ")));
 });
 
 test("startProcess: exit 1 — failed; второй старт при running — null", async () => {
   resetForTests();
-  const { tg } = makeTg();
+  const { edit } = makeEdit();
   const finished: { value: ServiceRun | null } = { value: null };
   const run = startProcess(
     "doc",
     {
       argv: [process.execPath, "-e", "setTimeout(()=>process.exit(1), 150)"],
     },
-    baseOpts(tg, {
+    baseOpts(edit, {
       onFinish: (r) => {
         finished.value = r;
       },
@@ -134,7 +106,11 @@ test("startProcess: exit 1 — failed; второй старт при running �
   );
   assert.ok(run);
   assert.equal(
-    startProcess("cln", { argv: [process.execPath, "-e", "0"] }, baseOpts(tg)),
+    startProcess(
+      "cln",
+      { argv: [process.execPath, "-e", "0"] },
+      baseOpts(edit),
+    ),
     null,
   );
   await waitFor(() => finished.value);
@@ -144,15 +120,14 @@ test("startProcess: exit 1 — failed; второй старт при running �
 
 test("cancelRun: SIGTERM ребёнку, статус cancelled", async () => {
   resetForTests();
-  const { tg } = makeTg();
+  const { edit } = makeEdit();
   const finished: { value: ServiceRun | null } = { value: null };
   startProcess(
     "cln",
     {
       argv: [process.execPath, "-e", "setTimeout(()=>{}, 60000)"],
     },
-    baseOpts(tg, {
-      loader: LOADERS.cln,
+    baseOpts(edit, {
       onFinish: (r) => {
         finished.value = r;
       },
@@ -168,14 +143,14 @@ test("cancelRun: SIGTERM ребёнку, статус cancelled", async () => {
 
 test("startProcess: таймаут убивает и даёт status timeout", async () => {
   resetForTests();
-  const { tg } = makeTg();
+  const { edit } = makeEdit();
   const finished: { value: ServiceRun | null } = { value: null };
   startProcess(
     "doc",
     {
       argv: [process.execPath, "-e", "setTimeout(()=>{}, 60000)"],
     },
-    baseOpts(tg, {
+    baseOpts(edit, {
       timeoutMs: 100,
       onFinish: (r) => {
         finished.value = r;
@@ -187,48 +162,16 @@ test("startProcess: таймаут убивает и даёт status timeout", a
   assert.equal(finished.value.status, "timeout");
 });
 
-test("прогресс: 400 на entity — даунгрейд на fallback до конца процесса", async () => {
-  resetForTests();
-  const { tg, calls } = makeTg({ fail400First: true });
-  const finished: { value: ServiceRun | null } = { value: null };
-  startProcess(
-    "mem",
-    {
-      argv: [process.execPath, "-e", "setTimeout(()=>{}, 300)"],
-    },
-    baseOpts(tg, {
-      loader: LOADERS.mem,
-      tickMs: 30,
-      onFinish: (r) => {
-        finished.value = r;
-      },
-    }),
-  );
-  await waitFor(() => finished.value);
-  const after400 = calls
-    .slice(calls.findIndex((c) => c.body.entities) + 1)
-    .filter(
-      (c) =>
-        c.method === "editMessageText" &&
-        c.body.text?.startsWith(LOADERS.mem.fallback),
-    );
-  assert.ok(
-    after400.length >= 1,
-    "после 400 эдиты идут с fallback-символом без entities",
-  );
-  assert.ok(after400.every((c) => !c.body.entities));
-});
-
 test("attached()=false: тикер молчит, процесс всё равно доезжает", async () => {
   resetForTests();
-  const { tg, calls } = makeTg();
+  const { edit, calls } = makeEdit();
   const finished: { value: ServiceRun | null } = { value: null };
   startProcess(
     "doc",
     {
       argv: [process.execPath, "-e", "console.log('quiet')"],
     },
-    baseOpts(tg, {
+    baseOpts(edit, {
       attached: () => false,
       onFinish: (r) => {
         finished.value = r;
@@ -238,17 +181,17 @@ test("attached()=false: тикер молчит, процесс всё равн�
   await waitFor(() => finished.value);
   assert.ok(finished.value);
   assert.equal(finished.value.status, "done");
-  assert.equal(calls.filter((c) => c.method === "editMessageText").length, 0);
+  assert.equal(calls.length, 0);
 });
 
 test("a synchronous onFinish failure is contained after process completion", async () => {
   resetForTests();
-  const { tg } = makeTg();
+  const { edit } = makeEdit();
   let finishCalled = false;
   const run = startProcess(
     "doc",
     { argv: [process.execPath, "-e", "process.exit(0)"] },
-    baseOpts(tg, {
+    baseOpts(edit, {
       onFinish: () => {
         finishCalled = true;
         throw new Error("injected synchronous finish failure");
@@ -264,7 +207,7 @@ test("a synchronous onFinish failure is contained after process completion", asy
 
 test("startUnit: oneshot activating→inactive = done, журнал в tail", async () => {
   resetForTests();
-  const { tg } = makeTg();
+  const { edit } = makeEdit();
   const active = ["activating", "activating", "inactive"];
   const execFileImpl: ExecFileImplementation = (
     cmd,
@@ -284,8 +227,7 @@ test("startUnit: oneshot activating→inactive = done, журнал в tail", as
   startUnit(
     "mem",
     { unit: "iva-brain.service" },
-    baseOpts(tg, {
-      loader: LOADERS.mem,
+    baseOpts(edit, {
       execFileImpl,
       onFinish: (r) => {
         finished.value = r;
@@ -300,7 +242,7 @@ test("startUnit: oneshot activating→inactive = done, журнал в tail", as
 
 test("startUnit: failed юнит — status failed", async () => {
   resetForTests();
-  const { tg } = makeTg();
+  const { edit } = makeEdit();
   const execFileImpl: ExecFileImplementation = (
     cmd,
     args,
@@ -320,7 +262,7 @@ test("startUnit: failed юнит — status failed", async () => {
   startUnit(
     "mem",
     { unit: "iva-brain.service" },
-    baseOpts(tg, {
+    baseOpts(edit, {
       execFileImpl,
       onFinish: (r) => {
         finished.value = r;

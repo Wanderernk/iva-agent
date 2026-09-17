@@ -1,8 +1,10 @@
 // Brain: deterministic nightly vault care (no LLM) + git commit&push.
 // Runs nightly via systemd timer (deploy/iva-brain.{service,timer}).
 //
-//   node --env-file=.env scripts/memory/brain.ts
+//   node --env-file-if-exists=.env scripts/memory/brain.ts
 //
+// Файл читается, только если он есть: юнит несёт EnvironmentFile, а сам brain чинит
+// установку и в том состоянии, где .env потерян.
 // Runs the autograph scripts (graph.health / engine.decay / moc.generate /
 // dedup / link_cleanup) on the vault via `uv run`, then commits and pushes the vault repo.
 // Guards: no git-remote/credentials → alert admin on Telegram (gh auth login + git remote),
@@ -28,11 +30,15 @@ import { notificationChat } from "../lib/notification-chat.ts";
 import { redactNotice } from "../lib/notice.ts";
 import { resolveDataDir } from "../lib/data-dir.ts";
 import { resolveTimeZone } from "../lib/timezone.ts";
+import { vaultDirOrExit } from "../lib/vault-boundary.ts";
 
-const VAULT = resolve(process.env.ASSISTANT_VAULT_DIR ?? "vault");
+let vaultCache: string | null = null;
+// Лениво: неверная настройка вольта всплывает на первом использовании, где её ловит
+// граница процесса — одна строка причины и код 1, а не стек на импорте модуля.
+const VAULT = (): string => (vaultCache ??= vaultDirOrExit());
 const DATA_DIR = resolveDataDir(process.cwd());
 // The autograph code lives in THIS repo, not in the vault: the vault is user data only.
-// Absolute paths, because every script is spawned with cwd = VAULT (they take "." as the vault).
+// Absolute paths, because every script is spawned with cwd = vault (they take "." as the vault).
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SCRIPTS = resolve(ROOT, "scripts/autograph");
 const BOT = process.env.TELEGRAM_BOT_TOKEN;
@@ -51,6 +57,34 @@ interface HealthHistoryEntry {
 interface SupersedeSkip {
   path: string;
   reason: "invalid_utf8" | "malformed_frontmatter" | "read_error";
+}
+
+/** Причины, которые эмитит scripts/autograph/supersede.py (CardSkip.reason). */
+const SUPERSEDE_REASONS = new Set([
+  "invalid_utf8",
+  "malformed_frontmatter",
+  "read_error",
+]);
+
+/**
+ * Чем запись отчёта supersede не похожа на запись отчёта supersede, или null.
+ *
+ * Наружу отдаётся только имя поля и, если причина похожа на причину, она сама:
+ * значение `path` - путь карточки владельца, в журнал он не идёт.
+ */
+function supersedeSkipProblem(item: unknown): string | null {
+  if (!isRecord(item)) return "is not an object";
+  if (typeof item.path !== "string") return 'has no "path" string';
+  if (typeof item.reason !== "string") return 'has no "reason" string';
+  if (!SUPERSEDE_REASONS.has(item.reason))
+    return /^[a-z0-9_]{1,40}$/.test(item.reason)
+      ? `has an unknown "reason" ${item.reason}`
+      : 'has an unknown "reason"';
+  return null;
+}
+
+function isSupersedeSkip(item: unknown): item is SupersedeSkip {
+  return supersedeSkipProblem(item) === null;
 }
 
 type HealthHistoryState =
@@ -83,8 +117,8 @@ function validIsoDate(value: string): boolean {
   return day >= 1 && day <= (days[month - 1] ?? 0);
 }
 
-if (!existsSync(VAULT)) {
-  console.error(`brain: vault not found: ${VAULT}`);
+if (!existsSync(VAULT())) {
+  console.error(`brain: vault not found: ${VAULT()}`);
   process.exit(1);
 }
 
@@ -98,12 +132,14 @@ function localDate(): string {
 }
 
 // Run a command in the vault directory. Does not throw — returns status/output.
-function run(cmd: string, args: string[], cwd = VAULT) {
+// Null status (signal kill, spawn error) is a failure, never a success: an uv
+// killed mid-step otherwise counted as a passed step.
+function run(cmd: string, args: string[], cwd = VAULT()) {
   const r = spawnSync(cmd, args, { cwd, encoding: "utf8" });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
   if (out) console.log(`$ ${cmd} ${args.join(" ")}\n${out}`);
   return {
-    status: r.status ?? (r.error ? 1 : 0),
+    status: r.status ?? 1,
     stdout: r.stdout ?? "",
     stderr: r.stderr ?? "",
   };
@@ -162,7 +198,7 @@ const cleared = (key: string): void => alertResolved(DATA_DIR, key);
 
 // Health score is read from the history that graph.py health appends after each run.
 function readHealthHistory(): HealthHistoryState {
-  const p = resolve(VAULT, ".graph/health-history.json");
+  const p = resolve(VAULT(), ".graph/health-history.json");
   let raw: Buffer;
   try {
     raw = readFileSync(p);
@@ -220,14 +256,14 @@ const today = localDate();
 // Language of every line below. Resolved once per run: the nightly pass is minutes long,
 // and a translator is a function, so no translated string is frozen in a module constant.
 const T = await noticeTranslator();
-console.log(`=== brain for ${today} (vault: ${VAULT}) ===`);
+console.log(`=== brain for ${today} (vault: ${VAULT()}) ===`);
 
 // ── 0. Schema location: vault root, with a one-time migration off the legacy path ──
 // Up to 0.3.2 the per-vault schema sat in vault/.claude/skills/autograph/schema.json (a
 // leftover of the Claude-skill layout). It is user config, so it now lives at the vault
 // root; the legacy copy is left in place (never delete user data), just no longer read.
-const VAULT_SCHEMA = resolve(VAULT, "schema.json");
-const LEGACY_SCHEMA = resolve(VAULT, ".claude/skills/autograph/schema.json");
+const VAULT_SCHEMA = resolve(VAULT(), "schema.json");
+const LEGACY_SCHEMA = resolve(VAULT(), ".claude/skills/autograph/schema.json");
 if (!existsSync(VAULT_SCHEMA) && existsSync(LEGACY_SCHEMA)) {
   copyFileSync(LEGACY_SCHEMA, VAULT_SCHEMA);
   console.log(`brain: schema migrated to the vault root: ${VAULT_SCHEMA}`);
@@ -263,6 +299,18 @@ maint("cleanup", [`${SCRIPTS}/cleanup.py`, ".", "--apply"]);
 // system fields. Runs FIRST (before graph) so the graph is built on canonical frontmatter.
 // This is the deterministic guarantee that cards written outside write_card stay in-schema.
 maint("enforce", [`${SCRIPTS}/enforce.py`, ".", SCHEMA, "--apply"]);
+// graph.fix rewrites Cards whose wikilinks resolve to exactly one target (path, stem or H1
+// title); ambiguous ones are left as they are. Runs before graph.health so the score is
+// measured after the repair.
+maint("graph.fix", [
+  `${SCRIPTS}/graph.py`,
+  "fix",
+  ".",
+  SCHEMA,
+  "--apply",
+  "--as-of",
+  today,
+]);
 // graph.health rebuilds the graph and writes health-history.json (for drop detection).
 maint("graph.health", [
   `${SCRIPTS}/graph.py`,
@@ -281,47 +329,73 @@ maint("moc.generate", [`${SCRIPTS}/moc.py`, "generate", "."]);
 const supersedeSkippedPaths = new Set<string>();
 const supersedeRepairCommand =
   `cd ${shellQuote(ROOT)} && ` +
-  `uv run scripts/autograph/supersede.py ${shellQuote(VAULT)}`;
+  `uv run scripts/autograph/supersede.py ${shellQuote(VAULT())}`;
 const supersedeReportPath = shellQuote(
-  resolve(VAULT, ".graph/supersede-report.json"),
+  resolve(VAULT(), ".graph/supersede-report.json"),
 );
 const supersede = maint("supersede", [`${SCRIPTS}/supersede.py`, "."]);
 if (supersede.status === 0) {
-  const parsed: unknown = JSON.parse(
-    readFileSync(resolve(VAULT, ".graph/supersede-report.json"), "utf8"),
-  );
-  if (!isRecord(parsed) || !Array.isArray(parsed.skipped))
-    throw new Error("invalid supersede report");
-  const skipped = parsed.skipped.filter(
-    (item): item is SupersedeSkip =>
-      isRecord(item) &&
-      typeof item.path === "string" &&
-      (item.reason === "invalid_utf8" ||
-        item.reason === "malformed_frontmatter" ||
-        item.reason === "read_error"),
-  );
-  for (const item of skipped) supersedeSkippedPaths.add(item.path);
-  if (skipped.length) {
-    const count = skipped.length;
-    const essence = createHash("sha256")
-      .update(JSON.stringify(skipped))
-      .digest("hex");
-    await alert(
-      "supersede-unreadable",
-      essence,
-      T(
-        `Supersede skipped unreadable Cards. Conflicts in ${count} ${count === 1 ? "Card" : "Cards"} will not reach Rollup. ` +
-          `Run this command:\n${supersedeRepairCommand}\n` +
-          `Then open this report:\n${supersedeReportPath}\n` +
-          "Repair the listed Cards.",
-        `Supersede пропустил нечитаемые карточки. Противоречия в ${count} ${count === 1 ? "карточке" : "карточках"} не попадут в Rollup. ` +
-          `Выполни команду:\n${supersedeRepairCommand}\n` +
-          `Потом открой отчёт:\n${supersedeReportPath}\n` +
-          "Почини перечисленные карточки.",
-      ),
+  // Отчёт мог не записаться (обрыв посреди записи, стёртый .graph, чужой формат)
+  // при успешном коде шага: это провал шага с понятной причиной, а не падение
+  // ночи — дальше идёт общий путь провала (алерт maintenance со списком шагов).
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      readFileSync(resolve(VAULT(), ".graph/supersede-report.json"), "utf8"),
     );
-  } else {
-    cleared("supersede-unreadable");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`brain: supersede report unreadable: ${detail}`);
+    failures.push("supersede");
+  }
+  if (parsed !== undefined) {
+    if (!isRecord(parsed) || !Array.isArray(parsed.skipped)) {
+      console.error("brain: supersede report is not a supersede report");
+      failures.push("supersede");
+    } else {
+      // Запись, не подходящую под известную форму, НЕЛЬЗЯ отфильтровать в ноль: ноль
+      // означал бы «пропущенных карточек нет», шаг зелёный и алерт погашен, тогда как
+      // на деле отчёт написан не тем, кого мы читаем. Провал шага - как и у отчёта,
+      // который вовсе не отчёт. В журнал идут только номер записи и имя поля или
+      // причина: путь карточки - данные владельца, им в журнале не место.
+      const wrong = parsed.skipped
+        .map((item, index) => ({ index, problem: supersedeSkipProblem(item) }))
+        .filter((entry) => entry.problem !== null);
+      const skipped = parsed.skipped.filter(isSupersedeSkip);
+      for (const entry of wrong)
+        console.error(
+          `brain: supersede report entry ${entry.index} ${entry.problem}`,
+        );
+      // Пока в отчёте есть чужая запись, про пропущенные карточки не утверждается
+      // ничего: ни алерта (счёт был бы неполон), ни его гашения (гашение сказало бы
+      // «всё чисто»), ни гашения карточек в алерте про незакрытый фенс: список путей
+      // заведомо неполон. Шаг провален, владелец увидит его в общем алерте ночи.
+      if (wrong.length) {
+        failures.push("supersede");
+      } else if (skipped.length) {
+        for (const item of skipped) supersedeSkippedPaths.add(item.path);
+        const count = skipped.length;
+        const essence = createHash("sha256")
+          .update(JSON.stringify(skipped))
+          .digest("hex");
+        await alert(
+          "supersede-unreadable",
+          essence,
+          T(
+            `Supersede skipped unreadable Cards. Conflicts in ${count} ${count === 1 ? "Card" : "Cards"} will not reach Rollup. ` +
+              `Run this command:\n${supersedeRepairCommand}\n` +
+              `Then open this report:\n${supersedeReportPath}\n` +
+              "Repair the listed Cards.",
+            `Supersede пропустил нечитаемые карточки. Противоречия в ${count} ${count === 1 ? "карточке" : "карточках"} не попадут в Rollup. ` +
+              `Выполни команду:\n${supersedeRepairCommand}\n` +
+              `Потом открой отчёт:\n${supersedeReportPath}\n` +
+              "Почини перечисленные карточки.",
+          ),
+        );
+      } else {
+        cleared("supersede-unreadable");
+      }
+    }
   }
 }
 // dedup and link_cleanup — dry-run only (autograph policy: never apply automatically).
@@ -329,13 +403,13 @@ maint("dedup", [`${SCRIPTS}/dedup.py`, ".", "--dry-run"]);
 maint("link_cleanup", [`${SCRIPTS}/link_cleanup.py`, "."]);
 
 // Плагин: пересобрать сайдкар эмбеддингов для hybrid-поиска (только если включён). Запускаем
-// из корня проекта (cwd), а не из VAULT — скрипт лежит в scripts/, ключ читается из .env.
+// из корня проекта (cwd), а не из VAULT() — скрипт лежит в scripts/, ключ читается из .env.
 if (process.env.MEMORY_SEARCH_MODE === "hybrid") {
   // Use process.execPath, not bare "node": the systemd unit's PATH does not include the
   // nvm node dir, so spawning "node" by name fails with ENOENT and falsely reports a failure.
   const r = run(
     process.execPath,
-    ["--env-file=.env", "scripts/memory/embed-index.ts"],
+    ["--env-file-if-exists=.env", "scripts/memory/embed-index.ts"],
     process.cwd(),
   );
   if (r.status !== 0) failures.push("embed-index");
@@ -384,7 +458,7 @@ if (!cards) {
 
 // ── 1b. CORE guard: CORE must stay small (always-on floor stays flat) ──
 // This runs before git add/commit below, so a repaired CORE is included in the nightly backup.
-const corePath = resolve(VAULT, "CORE.md");
+const corePath = resolve(VAULT(), "CORE.md");
 // Забываем проблему только там, где её реально проверили: без authored tree размер CORE
 // измерить нечем, и «почищено» было бы выдумкой. Запись при этом ничего не блокирует — как
 // только дерево вернётся, ближайшая ночь либо снова скажет, либо очистит.
@@ -431,7 +505,7 @@ if (coreChecked && !coreClamped) cleared("core-cap");
 // the files - guessing would rewrite the user's text.
 const unclosed = cards
   ? cards
-      .scanUnclosedFenceCards(VAULT)
+      .scanUnclosedFenceCards(VAULT())
       .filter((path) => !supersedeSkippedPaths.has(path))
   : [];
 if (unclosed.length) {
@@ -502,7 +576,7 @@ if (history.state === "valid" && history.entries.length >= 2) {
 let oversized: Array<{ path: string; size: number }>;
 try {
   oversized = scanOversizeWorkingTreeFiles({
-    vaultPath: VAULT,
+    vaultPath: VAULT(),
     runGit: (args: string[]) => run("git", args),
   });
 } catch (error) {
@@ -510,10 +584,10 @@ try {
   const message = T(
     `The file-size check before the backup failed (${detail}). The memory backup is on hold, ` +
       "so today's memory is not saved off the server yet. On the server run df -h for free space. " +
-      `Then run: cd ${VAULT} && git status`,
+      `Then run: cd ${VAULT()} && git status`,
     `Проверка размеров файлов перед бэкапом не прошла (${detail}). Бэкап памяти отложен, ` +
       "сегодняшняя память ещё не сохранена вне сервера. Выполни на сервере df -h — сколько места. " +
-      `Потом выполни: cd ${VAULT} && git status`,
+      `Потом выполни: cd ${VAULT()} && git status`,
   );
   console.warn(`brain: ${message}`);
   await alert("backup-scan", "unreadable", message);
@@ -523,7 +597,7 @@ cleared("backup-scan");
 
 if (oversized.length) {
   recordSkippedOversize(
-    resolve(VAULT, ".graph/enforce-report.json"),
+    resolve(VAULT(), ".graph/enforce-report.json"),
     oversized.length,
   );
   const lines = oversized.map(({ path, size }) =>
@@ -564,7 +638,7 @@ function ensureRemote(): string {
     "iva-vault",
     "--private",
     "--source",
-    VAULT,
+    VAULT(),
     "--remote",
     "origin",
     "--push",
@@ -604,7 +678,7 @@ cleared("vault-remote");
 // Перед `git add -A`: в .gitignore вольта должны быть шаблоны временных файлов атомарной
 // записи, иначе огрызок убитого писателя уедет в историю памяти как карточка. Идемпотентно
 // и только дозаписью — см. ensureVaultGitignore.
-if (ensureVaultGitignore(VAULT))
+if (ensureVaultGitignore(VAULT()))
   console.log("brain: added temp-file patterns to the vault .gitignore");
 
 run("git", ["add", "-A"]);
@@ -618,13 +692,13 @@ if (push.status !== 0) {
       ? T(
           "Memory backup rejected: the vault history holds a file too big for GitHub. Nothing is " +
             "lost, but new memory stays on the server only. Clean the history by hand on the " +
-            `server, in ${VAULT}.\n` +
+            `server, in ${VAULT()}.\n` +
             "1. Start a clean branch: git checkout --orphan vault-clean\n" +
             '2. Commit the current files: git add -A && git commit -m "vault"\n' +
             "3. Replace the remote history: git push --force origin vault-clean:main",
           "Бэкап памяти отклонён: в истории vault лежит слишком большой файл. Ничего не потеряно, " +
             "но новая память остаётся только на сервере. Почисти историю вручную на сервере, " +
-            `в ${VAULT}.\n` +
+            `в ${VAULT()}.\n` +
             "1. Заведи чистую ветку: git checkout --orphan vault-clean\n" +
             '2. Закоммить текущие файлы: git add -A && git commit -m "vault"\n' +
             "3. Замени историю на remote: git push --force origin vault-clean:main",
@@ -632,15 +706,15 @@ if (push.status !== 0) {
       : error.kind === "auth"
         ? T(
             "Memory backup failed: git has no access to the repo. New memory stays on the server " +
-              `only. On the server run: gh auth login. Then check: cd ${VAULT} && git push`,
+              `only. On the server run: gh auth login. Then check: cd ${VAULT()} && git push`,
             "Бэкап памяти не прошёл: у git нет доступа к репозиторию. Новая память остаётся только " +
-              `на сервере. Выполни на сервере: gh auth login. Потом проверь: cd ${VAULT} && git push`,
+              `на сервере. Выполни на сервере: gh auth login. Потом проверь: cd ${VAULT()} && git push`,
           )
         : T(
             `Memory backup failed: ${error.firstLine}. New memory stays on the server only. ` +
-              `On the server run: cd ${VAULT} && git push`,
+              `On the server run: cd ${VAULT()} && git push`,
             `Бэкап памяти не прошёл: ${error.firstLine}. Новая память остаётся только на сервере. ` +
-              `Выполни на сервере: cd ${VAULT} && git push`,
+              `Выполни на сервере: cd ${VAULT()} && git push`,
           );
   console.warn(`brain: ${message}`);
   await alert("backup-push", error.kind, message);

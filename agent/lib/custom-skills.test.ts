@@ -148,14 +148,24 @@ test("description: frontmatter wins, then the first meaningful line, then the fa
     "```\ncode fence first\n```\n\n> ## Reads the fence-free line\n",
   );
   write(dir, "blank.md", "\n\n");
+  write(dir, "edge.md", `${"b".repeat(120)}\n`);
   write(dir, "long.md", `${"a".repeat(400)}\n`);
 
-  const { skills } = await read(dir);
+  const { skills, log } = await read(dir);
   assert.equal(skills.declared.description, "Declared plainly.");
   assert.equal(skills.titled.description, "Reads the fence-free line");
   assert.equal(skills.blank.description, "Instructions for the blank skill.");
-  assert.equal(skills.long.description.length, 300);
+  assert.equal(skills.edge.description.length, 120);
+  assert.equal(skills.long.description.length, 120);
   assert.ok(skills.long.description.endsWith("…"));
+  assert.deepEqual(log, [
+    "[skills] custom skill long (long.md) description is 400 characters, cap 120; truncated in the prompt index",
+  ]);
+
+  // Скилл читается каждый ход, а жалоба на усечение — один раз за процесс.
+  const again = await read(dir);
+  assert.equal(again.skills.long.description.length, 120);
+  assert.deepEqual(again.log, []);
 });
 
 test("a missing directory is the quiet empty case", async () => {

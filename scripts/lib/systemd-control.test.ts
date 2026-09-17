@@ -4,7 +4,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   chmod,
-  cp,
   copyFile,
   mkdir,
   mkdtemp,
@@ -17,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as systemdControl from "./systemd-control.ts";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const { createSystemdControl } = systemdControl;
 
@@ -42,18 +42,12 @@ async function fixture(t: TestContext) {
   const state = join(dir, "systemd-state");
   const envPath = join(project, ".env");
   const userbotDir = join(project, "services/telegram-userbot");
-  await mkdir(join(project, "bin"), { recursive: true });
-  await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(join(project, ".output/server"), { recursive: true });
   await mkdir(join(userbotDir, ".venv/bin"), { recursive: true });
   await mkdir(home, { recursive: true });
   await mkdir(fakeBin, { recursive: true });
   await mkdir(state, { recursive: true });
-  await copyFile(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts/cli"), join(project, "scripts/cli"), {
-    recursive: true,
-  });
-  await symlink(join(ROOT, "scripts/lib"), join(project, "scripts/lib"), "dir");
+  await plantCliTree(ROOT, project, { copy: ["scripts/cli"] });
   // The real nightly entrypoint: the retained-legacy-unit tests check that the unit kept on
   // disk names a script that actually exists in the tree it will run against.
   await symlink(
@@ -61,7 +55,6 @@ async function fixture(t: TestContext) {
     join(project, "scripts/memory"),
     "dir",
   );
-  await symlink(join(ROOT, "deploy"), join(project, "deploy"), "dir");
   await writeFile(join(project, ".output/server/index.mjs"), "");
   await copyFile(
     join(ROOT, "services/telegram-userbot/requirements.lock"),
@@ -345,6 +338,10 @@ void test("doctor warns on a non-zero last exit code even right after a fresh su
 
   assert.match(output, /memory-daily schedule last succeeded/);
   assert.match(output, /memory-daily schedule's last run exited 1/);
+  // На этой установке нет authored tree: раздел расписаний по data/jobs.json читать
+  // нечем, и он обязан молчать — про дерево доктор уже сказал своей строкой.
+  assert.match(output, /the agent tree is missing/);
+  assert.doesNotMatch(output, /таблица фактов не читается/);
 });
 
 void test("legacy memory-timer cleanup is skipped when the current build doesn't contain the eve schedules yet", async (t) => {

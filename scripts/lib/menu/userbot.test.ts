@@ -13,7 +13,7 @@ type ExecCallback = (
   stdout?: string,
   stderr?: string,
 ) => void;
-type Rendered = { text: string; rows: unknown };
+type Rendered = { text: string };
 
 test("userbot menu setup rejects exit 1 with a redacted error", async () => {
   const secret = "setup-stderr-secret";
@@ -104,8 +104,8 @@ test("userbot menu surfaces setup exit 1 and keeps the beta warning", async () =
   };
   const flows = {
     get: () => state,
-    screen: async (_state: unknown, text: string, rows: unknown) => {
-      state._last = { text, rows };
+    screen: async (_state: unknown, text: string) => {
+      state._last = { text };
       rendered.push(state._last);
     },
   };

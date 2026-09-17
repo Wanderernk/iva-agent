@@ -22,8 +22,18 @@ export async function redactNotice(
   }
 }
 
-// Everything a Bot API body puts in front of the user sits in these two fields.
+// Everything a Bot API body puts in front of the user sits in these fields: the two
+// plain-text ones and, for rich messages, rich_message.markdown just below.
 const CHAT_FIELDS = ["text", "caption"] as const;
+// Rich-сообщение (Bot API 24.08.2026) несёт тот же текст в rich_message.markdown — экраны
+// моста теперь ходят только им, и гейт обязан видеть их так же, как видел text.
+type RichMessage = { markdown?: unknown; [key: string]: unknown };
+
+function richMessageBody(value: unknown): RichMessage | null {
+  return typeof value === "object" && value !== null
+    ? (value as RichMessage)
+    : null;
+}
 
 // A whole Bot API body through the Gate, so the call to Telegram is where the Gate
 // stands and no screen can be written that forgets it. A body with nothing for the chat
@@ -38,6 +48,11 @@ export async function redactTelegramBody<T>(body: T): Promise<T> {
     if (typeof value !== "string") continue;
     const text = await redactNotice(value);
     if (text !== value) gated[field] = text;
+  }
+  const rich = richMessageBody(source.rich_message);
+  if (typeof rich?.markdown === "string") {
+    const markdown = await redactNotice(rich.markdown);
+    if (markdown !== rich.markdown) gated.rich_message = { ...rich, markdown };
   }
   // Same body with two known string fields rewritten: the shape it went in with.
   return Object.keys(gated).length === 0

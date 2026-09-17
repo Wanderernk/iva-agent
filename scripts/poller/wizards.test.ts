@@ -160,8 +160,15 @@ function telegramSpy(t: TestContext): SentCall[] {
   mutableGlobal.fetch = (url, init) => {
     const method = url.split("/").at(-1) ?? "";
     if (url.includes("api.telegram.org")) {
-      const body = JSON.parse(init?.body ?? "{}") as { text?: string };
-      sent.push({ method, text: body.text ?? "" });
+      const body = JSON.parse(init?.body ?? "{}") as {
+        text?: string;
+        rich_message?: { markdown?: string };
+      };
+      // Экраны визарда — rich: текст экрана лежит в rich_message.markdown.
+      sent.push({
+        method,
+        text: body.rich_message?.markdown ?? body.text ?? "",
+      });
       return Promise.resolve({
         ok: true,
         status: 200,

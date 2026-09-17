@@ -394,3 +394,100 @@ test(
     }
   },
 );
+
+test("markTelegramSessionForRetirement помечает ровно нужную сессию", () => {
+  const { markTelegramSessionForRetirement } = status;
+  const running = (over: Record<string, unknown> = {}) => ({
+    status: "running",
+    generation: 3,
+    updatedAt: 1000,
+    sessionId: "s1",
+    turnId: "t1",
+    ...over,
+  });
+  const calls: unknown[][] = [];
+  // Приманки ПЕРЕД целью: выключение любого условия ниже обязано дать лишний вызов.
+  const listStatusesImpl = () => [
+    { chatKey: "tg:3", status: running({ status: "idle" }) },
+    { chatKey: "tg:2", status: running({ sessionId: "other" }) },
+    { chatKey: "tg:4", status: running({ turnId: "other" }) },
+    { chatKey: "tg:1", status: running() },
+  ];
+  const setStatusIfImpl = (...args: unknown[]) => {
+    calls.push(args);
+    return { ok: true };
+  };
+
+  assert.equal(
+    markTelegramSessionForRetirement("s1", "t1", 5000, {
+      listStatusesImpl,
+      setStatusIfImpl,
+    }),
+    true,
+  );
+  assert.ok(
+    calls.every(([chatKey]) => chatKey === "tg:1"),
+    `приманки не помечены: ${JSON.stringify(calls)}`,
+  );
+  assert.deepEqual(calls, [
+    [
+      "tg:1",
+      {
+        status: "running",
+        generation: 3,
+        updatedAt: 1000,
+        sessionId: "s1",
+        turnId: "t1",
+        retireAfterTurn: undefined,
+      },
+      { retireAfterTurn: { replayMs: 5000, sessionId: "s1", turnId: "t1" } },
+    ],
+  ]);
+});
+
+test("markTelegramSessionForRetirement молчит, когда помечать нечего", () => {
+  const { markTelegramSessionForRetirement } = status;
+  let calls = 0;
+  const quiet = {
+    listStatusesImpl: () => [
+      {
+        chatKey: "tg:9",
+        status: {
+          status: "running",
+          sessionId: "s1",
+          turnId: "t1",
+          retiredSessionId: "s1",
+        },
+      },
+      {
+        chatKey: "tg:8",
+        status: {
+          status: "running",
+          sessionId: "s1",
+          turnId: "t1",
+          retireAfterTurn: { replayMs: 1, sessionId: "s1", turnId: "t1" },
+        },
+      },
+    ],
+    setStatusIfImpl: () => {
+      calls += 1;
+      return null;
+    },
+  };
+  assert.equal(
+    markTelegramSessionForRetirement("s1", "t1", 5000, quiet),
+    false,
+  );
+  assert.equal(calls, 0, "setStatusIf не должен вызываться");
+  assert.equal(
+    markTelegramSessionForRetirement("missing", "t1", 5000, {
+      listStatusesImpl: () => [],
+      setStatusIfImpl: () => {
+        calls += 1;
+        return null;
+      },
+    }),
+    false,
+  );
+  assert.equal(calls, 0, "пустой список — тоже молча");
+});

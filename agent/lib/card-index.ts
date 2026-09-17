@@ -5,7 +5,7 @@
 // embed-index: теряла свёрнутые скаляры, блочные списки и карточки с CRLF.
 // Разбор frontmatter — только канонический parseFrontmatter (см. docs/tech-debt.md §13).
 
-import { parseFrontmatter } from "./frontmatter.ts";
+import { parseFrontmatterOrSkip } from "./frontmatter.ts";
 
 // Поля фронтматтера, несущие искомый смысл структурированных карточек (контакты/проекты).
 // BM25 индексирует их отдельной колонкой с высоким весом — иначе поиск по имени/компании
@@ -35,12 +35,20 @@ export interface CardIndex {
 }
 
 /**
- * Frontmatter карточки в плоский поисковый вид: список склеиваем пробелом (FTS всё равно
+ * Frontmatter карточки в плоский поисковый вид. `null` — карточку не разобрать
+ * (владелец сломал кавычку): её пропускают, каталог от этого не останавливается.
+ * список склеиваем пробелом (FTS всё равно
  * токенизирует), ключи приводим к нижнему регистру — регистр ключа не должен решать,
  * найдётся карточка или нет.
  */
-export function cardIndex(text: string): CardIndex {
-  const { fields, body } = parseFrontmatter(text);
+export function cardIndex(
+  text: string,
+  path: string,
+  log?: (message: string) => void,
+): CardIndex | null {
+  const parsed = parseFrontmatterOrSkip(text, path, log);
+  if (parsed === null) return null;
+  const { fields, body } = parsed;
   const fm: Record<string, string> = {};
   for (const [key, value] of Object.entries(fields ?? {}))
     fm[key.toLowerCase()] = Array.isArray(value) ? value.join(" ") : value;
@@ -63,9 +71,17 @@ export function cardTitle(path: string): string {
  * (title/meta/tags/body), в том же порядке и с тем же содержимым — иначе половины
  * поиска в режиме hybrid ранжируют разные карточки. Начало карточки уже несёт её
  * смысл, а провайдеры берут деньги за токены, поэтому хвост обрезаем.
+ *
+ * Битую карточку индексировать нечем — `null`, и вызывающий её пропускает.
  */
-export function embedText(path: string, text: string): string {
-  const { fm, meta, body } = cardIndex(text);
+export function embedText(
+  path: string,
+  text: string,
+  log?: (message: string) => void,
+): string | null {
+  const indexed = cardIndex(text, path, log);
+  if (indexed === null) return null;
+  const { fm, meta, body } = indexed;
   return [cardTitle(path), meta, fm.tags, body]
     .filter(Boolean)
     .join(" ")

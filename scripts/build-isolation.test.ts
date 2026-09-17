@@ -73,9 +73,10 @@ function plantTree(root: string): void {
     recursive: true,
     filter: (source) => !source.endsWith(".test.ts"),
   });
-  cpSync(join(REPO, "packages/data-dir"), join(root, "packages/data-dir"), {
-    recursive: true,
-  });
+  for (const name of ["data-dir", "vault-dir"])
+    cpSync(join(REPO, "packages", name), join(root, "packages", name), {
+      recursive: true,
+    });
   writeFileSync(join(root, "scripts/core-build.mjs"), CORE);
   mkdirSync(join(root, "agent/skills/mine"), { recursive: true });
   writeFileSync(join(root, "agent/agent.ts"), "export const agent = 1;\n");

@@ -35,6 +35,8 @@ type PostAck = OutboxAck & {
 export type TelegramSendOptions = {
   readonly caption?: boolean;
   readonly retryTransient?: boolean;
+  /** Тема форума (message_thread_id), когда сообщение идёт в тему группы. */
+  readonly threadId?: string;
   readonly sleep?: Sleep;
   readonly fetchImpl?: FetchImpl;
   /**
@@ -197,6 +199,7 @@ export async function sendTelegramHtml(
   {
     caption = false,
     retryTransient = false,
+    threadId,
     sleep = realSleep,
     fetchImpl = fetch,
     trace,
@@ -205,10 +208,10 @@ export async function sendTelegramHtml(
   const transport = messageTransport(
     chat,
     poster(bot, retryTransient, fetchImpl, sleep),
-    {},
+    threadId ? { message_thread_id: threadId } : {},
   );
   try {
-    const { ok, delivered, fellBack, error } = await traceOutbox(
+    const { ok, fellBack, error } = await traceOutbox(
       { source: "cron", ...trace },
       String(md),
       () =>
@@ -216,11 +219,8 @@ export async function sendTelegramHtml(
           limit: caption ? 1024 : 4096,
         }),
     );
-    // Пустой отчёт шов наружу не несёт — Telegram такой текст всё равно отвергает.
-    // Но и тишиной это не прикрываем: ночной скрипт должен упасть ненулевым кодом,
-    // как падал на 400 «message text is empty», иначе сломанный rollup незаметен.
-    if (ok && delivered === 0)
-      return { ok: false, fellBack, error: "empty report" };
+    // Пустой рендер шов сам вернул провалом (nothing delivered): ночной скрипт падает
+    // ненулевым кодом, как падал на 400 «message text is empty».
     return { ok, fellBack, error };
   } catch (e) {
     // Шов бросает только на нестроковом md (гейт работает по строке) — контракт
@@ -295,14 +295,14 @@ export async function sendTelegramRich(
     sendPlain: refuse,
   };
   try {
-    const { ok, delivered, fellBack, error } = await traceOutbox(
+    const { ok, fellBack, error } = await traceOutbox(
       { source: "cron", ...trace },
       String(markdown),
       () =>
         sendThroughOutbox(markdown as string, transport, { alwaysRich: true }),
     );
-    if (ok && delivered === 0)
-      return { ok: false, fellBack, error: "empty post" };
+    // Пустой рендер шов сам вернул провалом (nothing delivered): iva post не отчитается
+    // успехом за пост, который никуда не уехал.
     return { ok, fellBack, error };
   } catch (e) {
     return { ok: false, fellBack: false, error: errorMessage(e) };

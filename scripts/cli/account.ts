@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { createCliRuntime } from "./runtime.ts";
 import type { createCliSystemd } from "./systemd.ts";
+import { resolveVaultDir } from "../../packages/vault-dir/index.ts";
 
 type CliRuntime = ReturnType<typeof createCliRuntime>;
 type SystemdLifecycle = ReturnType<typeof createCliSystemd>;
@@ -108,10 +109,7 @@ export function createAccountCommands(
       log("Code and vault kept.");
       return;
     }
-    const vaultRel = readEnv().ASSISTANT_VAULT_DIR || "vault";
-    const vaultPath = vaultRel.startsWith("/")
-      ? vaultRel
-      : join(ROOT, vaultRel);
+    const vaultPath = resolveVaultDir(ROOT, readEnv().ASSISTANT_VAULT_DIR);
     for (const [path, label] of [
       [vaultPath, "vault"],
       [ROOT, "code"],

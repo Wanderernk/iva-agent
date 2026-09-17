@@ -6,10 +6,11 @@ import {
   stopOutcomeText,
   type StopOutcome,
 } from "#lib/telegram-stop.ts";
-import type {
-  TelegramCallbackQuery,
-  TelegramQueueMessage as TelegramMessage,
-  TelegramQueueUpdate as TelegramUpdate,
+import {
+  isTelegramQueueUpdate,
+  type TelegramCallbackQuery,
+  type TelegramQueueMessage as TelegramMessage,
+  type TelegramQueueUpdate as TelegramUpdate,
 } from "../lib/telegram-queue.ts";
 import type { TelegramFlowState } from "../lib/tg-flow.ts";
 import { getChatStatus } from "#lib/run-status.ts";
@@ -151,7 +152,9 @@ function replySucceeded(value: SentMessage | null | undefined): boolean {
   return typeof value?.message_id === "number";
 }
 
-function isTelegramFlowState(value: PendingFlow): value is TelegramFlowState {
+export function isTelegramFlowState(
+  value: PendingFlow,
+): value is TelegramFlowState {
   return (
     typeof value.flow === "string" &&
     (typeof value.chatId === "string" || typeof value.chatId === "number") &&
@@ -206,6 +209,56 @@ const privateChatOnlyText = () =>
     "Open a private chat with me to use this control.",
     "Открой личный чат со мной, чтобы использовать это управление.",
   );
+
+// Колбэки САМОГО eve — не наши: подтверждения HITL и кнопки входа в подключения
+// разбирает канал (dispatchCallbackQuery), и подмена их сообщением молча потеряла бы
+// подтверждение или вход. Оба префикса — значения eve (`TELEGRAM_HITL_CALLBACK_PREFIX`
+// и `TELEGRAM_AUTHORIZATION_CALLBACK_PREFIX`); в публичный экспорт входит только
+// первый, поэтому оба лежат здесь копией: тест рядом пинит первый к eve, второй —
+// к поведению. Смена префикса в eve обязана правиться здесь тем же коммитом.
+export const TELEGRAM_EVE_CALLBACK_PREFIXES = ["eve:", "eve_auth:"] as const;
+
+function isEveCallbackData(data: string): boolean {
+  return TELEGRAM_EVE_CALLBACK_PREFIXES.some((prefix) =>
+    data.startsWith(prefix),
+  );
+}
+
+// Кнопка, написанная моделью: её data — это реплика пользователя, а не команда моста,
+// поэтому тап уходит дальше обычным сообщением: у колбэка нет ни тишины-окна
+// коллектора, ни групповой политики, ни admission-ключа сообщения. Конверт подменяется
+// НА МЕСТЕ: следующий шаг моста (admission и очередь) читает тот же объект. Чат и тред
+// берём у колбэка — тап отвечает в тот же чат, где стоит кнопка, а message_id остаётся
+// за сообщением с кнопкой: в группе eve якорит сессию как раз на него. Собранный апдейт
+// проверяем тем же валидатором, что читает очередь: битый конверт обязан отсечься
+// здесь, иначе запись в inbox упадёт и очередь встанет на повторе (write-failed).
+export function applyTelegramButtonTap(
+  update: TelegramUpdate,
+  callback: ControlCallbackQuery,
+): boolean {
+  const message = callback.message;
+  const chat = message?.chat;
+  const from = callback.from;
+  if (message === undefined || chat === undefined || from === undefined)
+    return false;
+  const tap: TelegramUpdate = {
+    update_id: update.update_id,
+    message: {
+      message_id: message.message_id,
+      chat: { ...chat },
+      from: { ...from, is_bot: false },
+      text: callback.data,
+      ...(message.date === undefined ? {} : { date: message.date }),
+      ...(message.message_thread_id === undefined
+        ? {}
+        : { message_thread_id: message.message_thread_id }),
+    },
+  };
+  if (!isTelegramQueueUpdate(tap)) return false;
+  update.message = tap.message;
+  delete update.callback_query;
+  return true;
+}
 
 const PRIVATE_ONLY_COMMANDS = new Set(["/menu", "/model", "/think"]);
 
@@ -413,9 +466,6 @@ async function handleControl(
     // мост делает сам через cancel-роут канала. У канала есть свой обработчик той же
     // кнопки (agent/lib/telegram-stop.ts), но он для webhook-режима, где моста нет:
     // здесь апдейт перехватывается раньше любой доставки.
-    // NB: колбэк с ЧУЖИМИ данными уходит в eve и там попадает в тот же
-    // onCallbackQuery канала — дефолтная ветка eve «Unsupported action.» из-за него
-    // отключена, поэтому спиннер гасит сам канал пустым answerCallbackQuery.
     if (callback.data === TELEGRAM_STOP_CALLBACK) {
       const from = String(callback.from?.id ?? "");
       // Чужой тап в группе: гасим спиннер молча и ничего не отменяем.
@@ -446,6 +496,30 @@ async function handleControl(
         log("menu callback error:", errorDetails(e).message);
         return true;
       });
+    }
+    // Кнопка, написанная моделью: её data — это реплика пользователя. Спиннер гасим
+    // сами и сразу: дальше тап едет сообщением, колбэком его уже никто не увидит
+    // (сессию наполняет только inbound pipeline, а он читает сообщения). Чужому —
+    // пустой ack без подсказок, контрол ему знать нечего. В группе тап сообщением не
+    // станет: там текст принимается лишь как упоминание, команда или reply боту, а
+    // нажатие кнопки — ни то, ни другое, поэтому говорим про личку прямо.
+    if (
+      !callback.data.startsWith("iva_") &&
+      !isEveCallbackData(callback.data)
+    ) {
+      const groupHint =
+        callbackAllowed &&
+        callback.message?.chat !== undefined &&
+        !isPrivateTelegramChat(callback.message.chat)
+          ? privateChatOnlyText()
+          : undefined;
+      await ackImpl(callback.id, groupHint).catch(() => {});
+      // Чужой тап дальше снимет admission по allowlist — со строкой в журнале.
+      if (!callbackAllowed) return false;
+      if (groupHint !== undefined) return true;
+      // Неполный конверт (нет чата, отправителя или номера сообщения) сообщением
+      // стать не может: гасим тап здесь, дальше ему делать нечего.
+      return !applyTelegramButtonTap(update, callback);
     }
   }
   const msg = update.message;
@@ -554,7 +628,9 @@ async function handleControl(
   }
   // /update — check upstream; if newer, offer inline Update/Skip buttons. Out-of-band.
   if (cmd === "/update") {
-    return handleUpdateCheck(chatId);
+    return handleUpdateCheck(chatId, {
+      force: text.split(/\s+/).includes("--force"),
+    });
   }
   // /model, /think — provider/model/effort wizard (writes .env; applied on restart).
   if (cmd === "/model") {

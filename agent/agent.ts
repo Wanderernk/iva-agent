@@ -1,4 +1,4 @@
-import { defineAgent } from "eve";
+import { defineAgent, defineDynamic } from "eve";
 // Провайдер и его модели — единый источник в provider.ts (тот же конфиг у agent/vision.ts
 // и agent/subagents/planner/agent.ts).
 // codex = подписка ChatGPT (Responses API + OAuth); ollama/opencode = OpenAI-совместимый chat.
@@ -8,15 +8,37 @@ import {
   withReasoningStripped,
   makeTextModel,
 } from "./provider.js";
+import { chatModelSeesImages } from "./vision.js";
 
 export default defineAgent({
-  model: withReasoningStripped(makeTextModel()),
+  // Модель строится на каждом шаге хода, а не при сборке: OpenCode Go требует ID диалога в
+  // заголовке каждого запроса, а sessionId известен только здесь. Для остальных провайдеров
+  // это та же модель, что раньше была статической (см. provider.ts, providerRequestHeaders).
+  // step.started, не session.started: на self-host сессия — durable workflow, и выбор на
+  // session.started eve сохраняет в журнал, а объект модели не сериализуется
+  // (DynamicModelSelectionError). Шаговый резолвер живёт только в памяти. Модель та же на
+  // каждом шаге, поэтому кэш промпта у провайдера не сбрасывается.
+  model: defineDynamic({
+    events: {
+      "step.started": (_event, ctx) => ({
+        model: withReasoningStripped(
+          makeTextModel({
+            sessionId: ctx.session.id,
+            chatModelSeesImages,
+          }),
+        ),
+        // Кастомный провайдер не отдаёт метаданные окна через AI Gateway — задаём вручную;
+        // без явного значения eve пошёл бы за ним в Gateway, которого у self-host нет.
+        modelContextWindowTokens: cfg.contextWindow,
+      }),
+    },
+  }),
   // eve maps this provider-agnostic setting to reasoning_effort for the
   // OpenAI-compatible Ollama Cloud and OpenCode Go endpoints.
   reasoning: compatibleThinkingEffort,
-  // Кастомный провайдер не отдаёт метаданные окна через AI Gateway — задаём вручную.
-  // ВАЖНО: значение ОБЯЗАНО быть ≤ реального окна модели, иначе запрос переполнит окно до компактации.
-  modelContextWindowTokens: cfg.contextWindow,
+  // Окно контекста едет вместе с выбором модели выше (у динамической модели место ему
+  // только там). ВАЖНО: значение ОБЯЗАНО быть ≤ реального окна модели, иначе запрос
+  // переполнит окно до компактации.
   // Защита от overflow: компактуем заранее (0.7 вместо дефолтных 0.9), оставляя запас на
   // summary-вызов и следующий ход. eve сам саммаризирует старые ходы, сохраняя todo и read-tracking.
   compaction: { thresholdPercent: 0.7 },

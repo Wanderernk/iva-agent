@@ -9,15 +9,13 @@
 // render() через ctx.tr, иначе язык замёрзнет до рестарта.
 import { readSettings, writeSettings } from "#lib/settings.ts";
 import { memoryReportsEnabled } from "../notice-policy.ts";
+import { button } from "./buttons.ts";
 
 const PARENT = "r";
 
-type Button = { text: string; callback_data: string };
 type MenuState = { page: number };
 type MenuContext = {
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screen: string) => Button[];
   show: (state: MenuState, screen: string) => Promise<void>;
 };
 
@@ -47,39 +45,47 @@ export default {
     const T = ctx.tr;
     // Кнопка несёт значение, которое надо получить, а не «переключи»: повторный тап по
     // протухшему меню приводит к тому же состоянию, а не мигает туда-обратно.
-    const toggle = (on: boolean, label: string, target: Toggle) =>
-      ctx.btn(
+    const toggle = (on: boolean, label: string, target: Toggle, what: string) =>
+      `${button(
         `${on ? "✓" : "○"} ${label}`,
         `iva_menu:ntc:set:${target}:${on ? "0" : "1"}`,
-      );
-    const rows = [
-      [
-        toggle(
-          memoryReportsEnabled(settings),
-          T("Memory reports", "Отчёты памяти"),
-          "rep",
-        ),
-      ],
-      [
-        toggle(
-          digestEnabled(settings),
-          T("Morning digest", "Утренний дайджест"),
-          "dig",
-        ),
-      ],
-      ctx.backRow(PARENT),
-    ];
-    return {
-      text: T(
-        "🔔 Notices\n\nMemory reports: what Iva filed overnight and over the week.\n" +
-          "Morning digest: your day ahead at 08:00.\n\n" +
-          "Alerts — problems and updates — always arrive.",
-        "🔔 Уведомления\n\nОтчёты памяти: что Ива разложила за ночь и за неделю.\n" +
-          "Утренний дайджест: план дня в 08:00.\n\n" +
-          "Алерты — о проблемах и обновлениях — приходят всегда.",
+      )} — ${what}`;
+    const text = [
+      `# ${T("🔔 Notices", "🔔 Уведомления")}`,
+      T(
+        "Memory reports: what Iva filed overnight and over the week.\n" +
+          "Morning digest: your day ahead at 08:00.",
+        "Отчёты памяти: что Ива разложила за ночь и за неделю.\n" +
+          "Утренний дайджест: план дня в 08:00.",
       ),
-      rows,
-    };
+      toggle(
+        memoryReportsEnabled(settings),
+        T("Memory reports", "Отчёты памяти"),
+        "rep",
+        T(
+          "turn the overnight reports on or off.",
+          "включить или выключить отчёты.",
+        ),
+      ),
+      toggle(
+        digestEnabled(settings),
+        T("Morning digest", "Утренний дайджест"),
+        "dig",
+        T(
+          "turn the 08:00 digest on or off.",
+          "включить или выключить дайджест.",
+        ),
+      ),
+      T(
+        "Alerts — problems and updates — always arrive.",
+        "Алерты — о проблемах и обновлениях — приходят всегда.",
+      ),
+      `${button(T("‹ Menu", "‹ Меню"), `iva_menu:${PARENT}:o`)} — ${T(
+        "back to the settings.",
+        "вернуться в настройки.",
+      )}`,
+    ];
+    return { text: text.join("\n\n") };
   },
   async on(
     verb: string,

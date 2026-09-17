@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   acquireLock,
@@ -7,6 +7,7 @@ import {
   saveJsonAtomic,
 } from "./json-store.ts";
 import { dataDir as configuredDataDir } from "./data-dir.ts";
+import { resolveVaultDir } from "@iva/vault-dir";
 
 export const TELEGRAM_MEDIA_CACHE_LIMIT = 500;
 
@@ -71,15 +72,27 @@ async function loadCache(
  */
 export function resolveAttachmentPath(
   rel: string,
-  vaultDir = process.env.ASSISTANT_VAULT_DIR ?? "vault",
+  vaultDir = resolveVaultDir(process.cwd()),
 ): string | null {
   const attachments = resolve(vaultDir, "attachments");
   const target = resolve(vaultDir, rel);
   const inside = relative(attachments, target);
   if (!inside || inside.startsWith("..") || isAbsolute(inside)) return null;
   try {
-    return existsSync(target) && statSync(target).isFile() ? target : null;
-  } catch {
+    if (!existsSync(target) || !statSync(target).isFile()) return null;
+    // Симлинк внутри attachments читается как обычный файл, поэтому границу проверяем
+    // по РЕАЛЬНОМУ пути - так же поступает постовый путь (physical в scripts/cli/post.ts).
+    // Наружу отдаём реальный путь: читать будут ровно проверенное.
+    const root = realpathSync(attachments);
+    const real = realpathSync(target);
+    const insideReal = relative(root, real);
+    if (!insideReal || insideReal.startsWith("..") || isAbsolute(insideReal))
+      return null;
+    return real;
+  } catch (error) {
+    console.error(
+      `[telegram] не смог проверить вложение из кэша (${rel}): ${String(error)}`,
+    );
     return null;
   }
 }
@@ -95,7 +108,7 @@ export async function getTelegramMediaCacheEntry(
   fileUniqueId: string,
   {
     dataDir = configuredDataDir(),
-    vaultDir = process.env.ASSISTANT_VAULT_DIR ?? "vault",
+    vaultDir = resolveVaultDir(process.cwd()),
     log = console.error,
   }: CacheOptions = {},
 ): Promise<TelegramMediaCacheEntry | null> {

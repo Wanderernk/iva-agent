@@ -413,6 +413,58 @@ test("a customization that builds is layered into the new version", async (t) =>
   assert.deepEqual(iva.notices, []);
 });
 
+test("a markdown rule file in the slot is live, not built", async (t) => {
+  const iva = world(t);
+  customFile(iva.home, "agent/instructions/rules.md", "- mine\n");
+
+  const stock = updated(await iva.update());
+  assert.equal(stock.custom, "none");
+  assert.equal(
+    existsSync(join(iva.home, "current/agent/instructions/rules.md")),
+    false,
+  );
+  assert.deepEqual(iva.notices, []);
+
+  // Правка живого правила не рождает новую Version: дайджест слоя её не видит.
+  customFile(iva.home, "agent/instructions/rules.md", "- mine\n- also mine\n");
+  assert.deepEqual(await iva.update(), {
+    status: "current",
+    version: stock.version,
+  });
+
+  // Файл слота с кодом по-прежнему проходит через сборку.
+  customFile(iva.home, "agent/instructions/30-mine.ts", "export default 1;\n");
+  const applied = updated(await iva.update());
+  assert.equal(applied.custom, "applied");
+  assert.equal(
+    readFileSync(
+      join(iva.home, "current/agent/instructions/30-mine.ts"),
+      "utf8",
+    ),
+    "export default 1;\n",
+  );
+});
+
+test("a slot file with a bundled name refuses the version and keeps the running one", async (t) => {
+  const iva = world(t);
+  const first = updated(await iva.update());
+  mkdirSync(join(iva.repo, "agent/instructions"), { recursive: true });
+  writeFileSync(
+    join(iva.repo, "agent/instructions/20-core.ts"),
+    "export default 1;\n",
+  );
+  iva.release("0.3.15");
+  customFile(iva.home, "agent/instructions/20-core.ts", "export default 2;\n");
+
+  await assert.rejects(
+    iva.update(),
+    /collides with a bundled file: agent\/instructions\/20-core\.ts/u,
+  );
+  const store = createVersionStore(iva.home);
+  assert.equal(store.currentName(), first.version);
+  assert.deepEqual(readdirSync(store.layout.versions), [first.version]);
+});
+
 test("the custom layer's own bookkeeping is not mistaken for the user's code", async (t) => {
   const iva = world(t);
   const data = layoutFor(iva.home).data;
@@ -1298,7 +1350,32 @@ test("the chores of the installation are run around the restart, out of the vers
   ]);
   assert.equal(createVersionStore(iva.home).settled(), outcome.version);
   assert.ok(
-    logged.some((message) => /Google CLI update did not run/.test(message)),
+    logged.some((message) =>
+      /Google CLI update did not run \(exit 1: no registry\)/.test(message),
+    ),
+    logged.join("\n"),
+  );
+});
+
+test("an errand without output names the exit code alone", async (t) => {
+  const iva = world(t);
+  const logged: string[] = [];
+  const build = fixtureRunner();
+  updated(
+    await iva.update({
+      log: (message) => logged.push(message),
+      run: (command, args, cwd) =>
+        command === "uv"
+          ? Promise.resolve({ code: 127, output: "\n  \n" })
+          : build(command, args, cwd),
+    }),
+  );
+  assert.ok(
+    logged.some((message) =>
+      /the vault cleanup did not run \(exit 127\); the update continues without it/.test(
+        message,
+      ),
+    ),
     logged.join("\n"),
   );
 });

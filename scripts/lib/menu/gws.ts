@@ -20,6 +20,7 @@ import {
   childEnv,
   AUTH_SERVICES,
 } from "./gws-auth.ts";
+import { button } from "./buttons.ts";
 
 const SID = "gws";
 const PARENT = "r";
@@ -28,7 +29,6 @@ const SECRET_PATH = join(CONFIG_DIR, "client_secret.json");
 const CACHE_TTL_MS = 60_000;
 const SCOPES = AUTH_SERVICES.split(",").join(", ");
 type AuthStatus = "missing" | "unauth" | "ok";
-type Button = { text: string; callback_data: string };
 type GwsAuth = { pid?: number; port?: number; logPath?: string };
 type AwaitText = {
   kind: string;
@@ -43,15 +43,9 @@ type MenuState = {
 };
 type MenuContext = {
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screen: string) => Button[];
   show: (state: MenuState, screen: string) => Promise<void>;
   flows: {
-    screen: (
-      state: MenuState,
-      text: string,
-      rows: Button[][] | null,
-    ) => Promise<void>;
+    screen: (state: MenuState, text: string) => Promise<void>;
   };
 };
 type ClientSecret = {
@@ -63,6 +57,27 @@ let cache: { at: number; status: AuthStatus | null } = { at: 0, status: null };
 const isPrivate = (st: MenuState) => Number(st.chatId) > 0;
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const backLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("‹ Menu", "‹ Меню"), `iva_menu:${PARENT}:o`)} — ${ctx.tr(
+    "back to the settings.",
+    "вернуться в настройки.",
+  )}`;
+const cancelLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`, "danger")} — ${ctx.tr(
+    "leave the login without changes.",
+    "выйти из входа, ничего не меняя.",
+  )}`;
+const connectLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("Connect", "Подключить"), `iva_menu:${SID}:do:connect`, "success")} — ${ctx.tr(
+    "get a Google link and finish the login.",
+    "получить ссылку Google и завершить вход.",
+  )}`;
+const checkLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("Check again", "Проверить"), `iva_menu:${SID}:do:check`)} — ${ctx.tr(
+    "re-probe the connection.",
+    "проверить подключение заново.",
+  )}`;
 
 function errorMessage(error: unknown): string {
   return (error as { readonly message: string }).message;
@@ -116,8 +131,7 @@ function reapAuth(st: MenuState) {
 function instructions(ctx: MenuContext) {
   const T = ctx.tr;
   const text = [
-    T("🔗 Google Workspace", "🔗 Google Workspace"),
-    "",
+    `# ${T("🔗 Google Workspace", "🔗 Google Workspace")}`,
     T(
       "No OAuth client yet. In a browser on your computer:",
       "OAuth-клиента ещё нет. В браузере на компьютере:",
@@ -126,24 +140,20 @@ function instructions(ctx: MenuContext) {
       "1) console.cloud.google.com → create/pick a project.\n2) OAuth consent screen: External, add yourself to Test users.\n3) Credentials → Create → OAuth client ID → type Desktop app → Download JSON.",
       "1) console.cloud.google.com → создай/выбери проект.\n2) Экран согласия: External, добавь себя в Test users.\n3) Credentials → Create → OAuth client ID → тип Desktop app → скачай JSON.",
     ),
-    "",
     T(
       "Then paste the downloaded JSON here.",
       "Затем пришли содержимое скачанного JSON сюда.",
     ),
-  ].join("\n");
-  return {
-    text,
-    rows: [
-      [
-        ctx.btn(
-          T("Send client JSON", "Прислать client JSON"),
-          `iva_menu:${SID}:do:secret`,
-        ),
-      ],
-      ctx.backRow(PARENT),
-    ],
-  };
+    `${button(
+      T("Send client JSON", "Прислать client JSON"),
+      `iva_menu:${SID}:do:secret`,
+    )} — ${T(
+      "paste the JSON or attach the file in a private chat.",
+      "вставить JSON или приложить файл в личном чате.",
+    )}`,
+    backLine(ctx),
+  ].join("\n\n");
+  return { text };
 }
 
 export default {
@@ -157,69 +167,59 @@ export default {
     if (!existsSync(SECRET_PATH)) return instructions(ctx);
 
     const status = await authStatus();
-    const head = T("🔗 Google Workspace", "🔗 Google Workspace");
-    const checkRow = [
-      ctx.btn(T("Check again", "Проверить"), `iva_menu:${SID}:do:check`),
-    ];
+    const head = `# ${T("🔗 Google Workspace", "🔗 Google Workspace")}`;
 
     if (status === "missing") {
       return {
-        text: `${head}\n\n${T("The gws CLI isn't available on the server.", "CLI `gws` не найден на сервере.")}`,
-        rows: [checkRow, ctx.backRow(PARENT)],
+        text: [
+          head,
+          T(
+            "The gws CLI isn't available on the server.",
+            "CLI `gws` не найден на сервере.",
+          ),
+          checkLine(ctx),
+          backLine(ctx),
+        ].join("\n\n"),
       };
     }
     if (status === "unauth") {
       const text = [
         head,
-        "",
         T(
           "Client secret is in place, but gws isn't authorized yet.",
           "client_secret.json на месте, но gws ещё не авторизован.",
         ),
-        "",
         T(
           "Tap «Connect» — I'll give you a Google link and finish the login for you.",
           "Нажми «Подключить» — дам ссылку на Google и завершу вход за тебя.",
         ),
-      ].join("\n");
-      return {
-        text,
-        rows: [
-          [ctx.btn(T("Connect", "Подключить"), `iva_menu:${SID}:do:connect`)],
-          checkRow,
-          ctx.backRow(PARENT),
-        ],
-      };
+        connectLine(ctx),
+        checkLine(ctx),
+        backLine(ctx),
+      ].join("\n\n");
+      return { text };
     }
     // ok. Probing only proves the token works, not which scopes it carries — a token issued before
     // a service was added to AUTH_SERVICES still probes as connected. So name the services the
     // login asks for and keep a re-login button here, the only way to pick up newly added ones.
     const text = [
       head,
-      "",
       T(
         `✅ Google account connected. Login requests: ${SCOPES}.`,
         `✅ Google-аккаунт подключён. При входе запрашиваются: ${SCOPES}.`,
       ),
-      "",
       T(
         "Connected before a service was added? Tap «Reconnect» to grant it.",
         "Подключался раньше, чем в список добавился сервис? Нажми «Переподключить», чтобы выдать права.",
       ),
-    ].join("\n");
-    return {
-      text,
-      rows: [
-        [
-          ctx.btn(
-            T("Reconnect", "Переподключить"),
-            `iva_menu:${SID}:do:connect`,
-          ),
-        ],
-        checkRow,
-        ctx.backRow(PARENT),
-      ],
-    };
+      `${button(T("Reconnect", "Переподключить"), `iva_menu:${SID}:do:connect`)} — ${T(
+        "log in again and grant the current service set.",
+        "войти заново и выдать текущий набор прав.",
+      )}`,
+      checkLine(ctx),
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   },
 
   async on(verb: string, args: string[], st: MenuState, ctx: MenuContext) {
@@ -231,21 +231,23 @@ export default {
         st.awaitText = null;
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             "The client secret is sensitive — open a private chat and send it there.",
             "client_secret — секрет. Открой личный чат и пришли его там.",
-          ),
-          [ctx.backRow(PARENT)],
+          )}\n\n${backLine(ctx)}`,
         );
       }
       st.awaitText = { kind: "gwsjson", secret: true, data: {}, file: true };
       return ctx.flows.screen(
         st,
-        ctx.tr(
-          "Send client_secret.json — either paste its contents as text, or attach the .json file. I'll delete the message right away and store it securely.",
-          "Пришли client_secret.json — вставь содержимое текстом ИЛИ прикрепи сам .json-файл. Сообщение сразу удалю, файл сохраню безопасно.",
-        ),
-        [[ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)]],
+        [
+          `# ${ctx.tr("🔑 Google client secret", "🔑 Google client secret")}`,
+          ctx.tr(
+            "Send client_secret.json — either paste its contents as text, or attach the .json file. I'll delete the message right away and store it securely.",
+            "Пришли client_secret.json — вставь содержимое текстом ИЛИ прикрепи сам .json-файл. Сообщение сразу удалю, файл сохраню безопасно.",
+          ),
+          cancelLine(ctx),
+        ].join("\n\n"),
       );
     }
 
@@ -257,14 +259,15 @@ export default {
         st.awaitText = null;
         return ctx.flows.screen(
           st,
-          T(
-            "Couldn't start gws auth — is the client secret valid? Try again.",
-            "Не удалось запустить gws-авторизацию — проверь client_secret и попробуй снова.",
-          ),
           [
-            [ctx.btn(T("Connect", "Подключить"), `iva_menu:${SID}:do:connect`)],
-            ctx.backRow(PARENT),
-          ],
+            `# ${T("🔗 Google Workspace", "🔗 Google Workspace")}`,
+            T(
+              "Couldn't start gws auth — is the client secret valid? Try again.",
+              "Не удалось запустить gws-авторизацию — проверь client_secret и попробуй снова.",
+            ),
+            connectLine(ctx),
+            backLine(ctx),
+          ].join("\n\n"),
         );
       }
       // pid и logPath — чтобы отмена/повтор могли убить процесс и удалить лог с OAuth-URL.
@@ -276,22 +279,19 @@ export default {
       // secret:true — движок удалит сообщение с одноразовым code из чата после приёма.
       st.awaitText = { kind: "gwsauthcode", secret: true };
       const text = [
-        T("🔗 Connecting Google", "🔗 Подключение Google"),
-        "",
+        `# ${T("🔗 Connecting Google", "🔗 Подключение Google")}`,
         T(
           "1) Open this link, pick your account and approve access:",
           "1) Открой ссылку, выбери аккаунт и подтверди доступ:",
         ),
         challenge.url,
-        "",
         T(
           "2) Your browser will jump to a http://localhost:… page that WON'T load — that's expected. Copy the WHOLE URL from the address bar and paste it back here.",
           "2) Браузер перекинет на страницу http://localhost:… — она НЕ загрузится, это нормально. Скопируй ВЕСЬ URL из адресной строки и пришли сюда.",
         ),
-      ].join("\n");
-      return ctx.flows.screen(st, text, [
-        [ctx.btn(T("Cancel", "Отмена"), `iva_menu:${SID}:o`)],
-      ]);
+        cancelLine(ctx),
+      ].join("\n\n");
+      return ctx.flows.screen(st, text);
     }
 
     if (step === "check") {
@@ -299,7 +299,7 @@ export default {
       // Re-rendering the same status yields an identical message → Telegram "not modified" → the
       // tap looks like it did nothing. Flash a transient "checking…" first so the re-render always
       // differs and the result is visibly refreshed.
-      await ctx.flows.screen(st, ctx.tr("⏳ Checking…", "⏳ Проверяю…"), null);
+      await ctx.flows.screen(st, ctx.tr("⏳ Checking…", "⏳ Проверяю…"));
       return ctx.show(st, SID);
     }
     return ctx.show(st, SID);
@@ -321,11 +321,10 @@ export default {
       } catch {
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             "Couldn't parse that as JSON. Send the file contents again or cancel.",
             "Не удалось разобрать JSON. Пришли содержимое файла ещё раз или отмени.",
-          ),
-          [[ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)]],
+          )}\n\n${cancelLine(ctx)}`,
         );
       }
       // Форма client_secret.json: корневой ключ installed (Desktop app) или web, с client_id.
@@ -334,11 +333,10 @@ export default {
       if (!node || typeof node.client_id !== "string" || !node.client_id) {
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             "That doesn't look like a client_secret.json (need an installed/web section with client_id). Send it again or cancel.",
             "Это не похоже на client_secret.json (нужен раздел installed/web с client_id). Пришли ещё раз или отмени.",
-          ),
-          [[ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)]],
+          )}\n\n${cancelLine(ctx)}`,
         );
       }
       st.awaitText = null;
@@ -348,29 +346,23 @@ export default {
         const message = errorMessage(error);
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             `Couldn't save the file: ${message}`,
             `Не удалось сохранить файл: ${message}`,
-          ),
-          [ctx.backRow(PARENT)],
+          )}\n\n${backLine(ctx)}`,
         );
       }
       invalidate();
       return ctx.flows.screen(
         st,
-        ctx.tr(
-          "Saved. Now tap «Connect» to log in.",
-          "Сохранил. Теперь нажми «Подключить» для входа.",
-        ),
         [
-          [
-            ctx.btn(
-              ctx.tr("Connect", "Подключить"),
-              `iva_menu:${SID}:do:connect`,
-            ),
-          ],
-          ctx.backRow(PARENT),
-        ],
+          ctx.tr(
+            "Saved. Now tap «Connect» to log in.",
+            "Сохранил. Теперь нажми «Подключить» для входа.",
+          ),
+          connectLine(ctx),
+          backLine(ctx),
+        ].join("\n\n"),
       );
     },
 
@@ -385,51 +377,49 @@ export default {
     ) {
       const T = ctx.tr;
       const auth = st.gwsAuth;
-      const cancelRow = [[ctx.btn(T("Cancel", "Отмена"), `iva_menu:${SID}:o`)]];
       if (!auth?.port) {
         st.awaitText = null;
         return ctx.flows.screen(
           st,
-          T(
-            "That login session expired. Tap «Connect» to start over.",
-            "Сессия входа истекла. Нажми «Подключить», чтобы начать заново.",
-          ),
           [
-            [ctx.btn(T("Connect", "Подключить"), `iva_menu:${SID}:do:connect`)],
-            ctx.backRow(PARENT),
-          ],
+            T(
+              "That login session expired. Tap «Connect» to start over.",
+              "Сессия входа истекла. Нажми «Подключить», чтобы начать заново.",
+            ),
+            connectLine(ctx),
+            backLine(ctx),
+          ].join("\n\n"),
         );
       }
       const query = extractCallbackQuery(text);
       if (!query) {
         return ctx.flows.screen(
           st,
-          T(
+          `${T(
             "Couldn't find an authorization code. Paste the whole redirect URL from the address bar, or cancel.",
             "Не нашёл код авторизации. Пришли ВЕСЬ redirect-URL из адресной строки или отмени.",
-          ),
-          cancelRow,
+          )}\n\n${cancelLine(ctx)}`,
         );
       }
       st.awaitText = null;
       st.gwsAuth = null;
       // The pasted message is gone (secret) and relay+probe takes a couple of seconds — a brief
       // working indicator makes the process feel under control before the final status lands.
-      await ctx.flows.screen(st, T("⏳ Working…", "⏳ Работаю…"), null);
+      await ctx.flows.screen(st, T("⏳ Working…", "⏳ Работаю…"));
       const relay = await relayCode(auth.port, query);
       // Обмен завершён (успех или нет): gws выходит сам, а вот temp-лог с OAuth-URL — наш.
       if (auth.logPath) rm(auth.logPath, { force: true }).catch(() => {});
       if (!relay.ok) {
         return ctx.flows.screen(
           st,
-          T(
-            "Couldn't hand the code to gws (the login window likely timed out). Tap «Connect» to try again.",
-            "Не удалось передать код gws (окно входа, вероятно, истекло по таймауту). Нажми «Подключить» и попробуй снова.",
-          ),
           [
-            [ctx.btn(T("Connect", "Подключить"), `iva_menu:${SID}:do:connect`)],
-            ctx.backRow(PARENT),
-          ],
+            T(
+              "Couldn't hand the code to gws (the login window likely timed out). Tap «Connect» to try again.",
+              "Не удалось передать код gws (окно входа, вероятно, истекло по таймауту). Нажми «Подключить» и попробуй снова.",
+            ),
+            connectLine(ctx),
+            backLine(ctx),
+          ].join("\n\n"),
         );
       }
       await sleep(2500); // let gws exchange the code and write the token before we re-probe
@@ -439,23 +429,22 @@ export default {
       if ((await authStatus()) === "ok") {
         return ctx.flows.screen(
           st,
-          T(
+          `${T(
             `✅ Google account connected. Scopes: ${SCOPES}.`,
             `✅ Google-аккаунт подключён. Права: ${SCOPES}.`,
-          ),
-          [ctx.backRow(PARENT)],
+          )}\n\n${backLine(ctx)}`,
         );
       }
       return ctx.flows.screen(
         st,
-        T(
-          "⚠️ Couldn't confirm the connection. Tap «Connect» to try again.",
-          "⚠️ Не удалось подтвердить подключение. Нажми «Подключить» и попробуй снова.",
-        ),
         [
-          [ctx.btn(T("Connect", "Подключить"), `iva_menu:${SID}:do:connect`)],
-          ctx.backRow(PARENT),
-        ],
+          T(
+            "⚠️ Couldn't confirm the connection. Tap «Connect» to try again.",
+            "⚠️ Не удалось подтвердить подключение. Нажми «Подключить» и попробуй снова.",
+          ),
+          connectLine(ctx),
+          backLine(ctx),
+        ].join("\n\n"),
       );
     },
   },

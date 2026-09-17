@@ -1,20 +1,18 @@
-// Экран языка интерфейса: [Русский ✓] [English]. Переключение применяется мгновенно —
-// settings.json подхватывают свежим чтением оба процесса (мост и канал). Плюс дублируем в
-// .env AGENT_LANGUAGE, чтобы node --env-file потребители (cron-скрипты, init-vault) были
-// согласованы на своём следующем запуске без правок.
+// Экран языка интерфейса: rich-карта с рядом [Русский ✓] [English]. Переключение
+// применяется мгновенно — settings.json подхватывают свежим чтением оба процесса (мост и
+// канал). Плюс дублируем в .env AGENT_LANGUAGE, чтобы node --env-file потребители
+// (cron-скрипты, init-vault) были согласованы на своём следующем запуске без правок.
 import { writeSettings } from "#lib/settings.ts";
 import { upsertEnv } from "../env-file.ts";
+import { button, buttonRow } from "./buttons.ts";
 
 type Lang = "en" | "ru";
-type Button = { text: string; callback_data: string };
 type MenuState = { page: number };
 type MenuContext = {
   lang: Lang;
   deps: { envPath: string };
   getLang: () => Lang;
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screen: string) => Button[];
   show: (state: MenuState, screen: string) => Promise<void>;
 };
 
@@ -23,17 +21,18 @@ export default {
   render(_st: MenuState, ctx: MenuContext) {
     const cur = ctx.getLang();
     const mark = (v: Lang) => (cur === v ? " ✓" : "");
-    const rows = [
-      [
-        ctx.btn(`Русский${mark("ru")}`, "iva_menu:lang:set:ru"),
-        ctx.btn(`English${mark("en")}`, "iva_menu:lang:set:en"),
-      ],
-      ctx.backRow("r"),
+    const text = [
+      `# ${ctx.tr("🌐 Interface language", "🌐 Язык интерфейса")}`,
+      buttonRow([
+        button(`Русский${mark("ru")}`, "iva_menu:lang:set:ru"),
+        button(`English${mark("en")}`, "iva_menu:lang:set:en"),
+      ]),
+      `${button(ctx.tr("‹ Menu", "‹ Меню"), "iva_menu:r:o")} — ${ctx.tr(
+        "back to the settings.",
+        "вернуться в настройки.",
+      )}`,
     ];
-    return {
-      text: ctx.tr("🌐 Interface language", "🌐 Язык интерфейса"),
-      rows,
-    };
+    return { text: text.join("\n\n") };
   },
   async on(verb: string, args: string[], st: MenuState, ctx: MenuContext) {
     if (verb !== "set") return;

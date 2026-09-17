@@ -287,7 +287,11 @@ function embedTexts(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const name of Object.keys(CARDS)) {
     const file = join(VAULT, "cards", name);
-    out[name] = embedText(file, readFileSync(file, "utf8"));
+    const text = embedText(file, readFileSync(file, "utf8"));
+    // Ни одна карточка фикстуры не должна пропускаться: null здесь значит, что
+    // снапшот ниже сравнивал бы дырку, а не текст.
+    assert.ok(text !== null, `${name}: карточка фикстуры не разобралась`);
+    out[name] = text;
   }
   return out;
 }

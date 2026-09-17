@@ -10,14 +10,13 @@
 
 import { readEnvValues, upsertEnv } from "../env-file.ts";
 import { SEARCH_CATALOG, checkSearchKey } from "../search-catalog.ts";
+import { button, buttonRow } from "./buttons.ts";
 
 const SID = "srch";
 const PARENT = "r";
 const DEFAULT_PROVIDER = "tavily"; // web_search.ts: провайдер по умолчанию, когда SEARCH_PROVIDER пуст
 
 type Provider = keyof typeof SEARCH_CATALOG;
-type Button = { text: string; callback_data: string };
-type View = { text: string; rows: Button[][] };
 type AwaitText = {
   kind: string;
   secret: boolean;
@@ -30,14 +29,26 @@ type MenuContext = {
     sc: (action: string, unit: string) => Promise<boolean>;
   };
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screen: string) => Button[];
   show: (state: MenuState, screen: string) => Promise<void>;
   flows: {
-    screen: (state: MenuState, text: string, rows: Button[][]) => Promise<void>;
-    end: (state: MenuState, text: string, rows: Button[][]) => Promise<void>;
+    screen: (state: MenuState, text: string) => Promise<void>;
+    end: (state: MenuState, text: string) => Promise<void>;
   };
 };
+
+function backLine(ctx: MenuContext): string {
+  return `${button(ctx.tr("‹ Menu", "‹ Меню"), `iva_menu:${PARENT}:o`)} — ${ctx.tr(
+    "back to the settings.",
+    "вернуться в настройки.",
+  )}`;
+}
+
+function cancelLine(ctx: MenuContext): string {
+  return `${button(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`, "danger")} — ${ctx.tr(
+    "leave the prompt without entering a key.",
+    "выйти из ввода, ничего не меняя.",
+  )}`;
+}
 
 // Telegram: id личных чатов положительны, групп/супергрупп — отрицательны. Секреты
 // принимаем только в личке (в группе бот может не иметь прав на удаление, и ключ увидят
@@ -63,11 +74,10 @@ async function promptKey(st: MenuState, ctx: MenuContext, provider: Provider) {
     st.awaitText = null;
     return ctx.flows.screen(
       st,
-      ctx.tr(
+      `${ctx.tr(
         "API keys are secrets — open a private chat with me and set the search key there.",
         "Ключи — это секрет. Открой личный чат со мной и введи ключ поиска там.",
-      ),
-      [ctx.backRow(PARENT)],
+      )}\n\n${backLine(ctx)}`,
     );
   }
   st.awaitText = {
@@ -76,18 +86,15 @@ async function promptKey(st: MenuState, ctx: MenuContext, provider: Provider) {
     data: { provider, keyVar: cat.keyVar, returnScreen: SID },
   };
   const text = [
-    ctx.tr(`${cat.label} search key`, `Ключ поиска ${cat.label}`),
-    "",
+    `# ${ctx.tr(`${cat.label} search key`, `Ключ поиска ${cat.label}`)}`,
     ctx.tr(
       "Send it in the next message — I'll delete it from the chat right away.",
       "Пришли его следующим сообщением — я сразу удалю его из чата.",
     ),
     ctx.tr(`Get your key at ${cat.url}`, `Ключ можно получить на ${cat.url}`),
-  ].join("\n");
-  // «Отмена» = вернуться на список (o перерисует экран и снимет awaitText в render).
-  return ctx.flows.screen(st, text, [
-    [ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)],
-  ]);
+    cancelLine(ctx),
+  ].join("\n\n");
+  return ctx.flows.screen(st, text);
 }
 
 // Экран «провайдер выбран — применить рестартом?»: после записи SEARCH_PROVIDER.
@@ -99,22 +106,21 @@ async function restartOffer(
   const cat = SEARCH_CATALOG[provider];
   const label = cat ? cat.label : provider;
   const text = [
-    ctx.tr(`Search provider set: ${label}.`, `Провайдер поиска: ${label}.`),
+    `# ${ctx.tr("🔍 Web search", "🔍 Веб-поиск")}`,
     ctx.tr(
-      "It applies after an agent restart (the search tool reads it at startup).",
-      "Применится после перезапуска агента (инструмент поиска читает провайдера при старте).",
+      `Search provider set: ${label}. It applies after an agent restart (the search tool reads it at startup).`,
+      `Провайдер поиска: ${label}. Применится после перезапуска агента (инструмент поиска читает провайдера при старте).`,
     ),
-  ].join("\n");
-  return ctx.flows.screen(st, text, [
-    [
-      ctx.btn(
+    buttonRow([
+      button(
         ctx.tr("Restart now", "Перезапустить сейчас"),
         `iva_menu:${SID}:rs:now`,
       ),
-      ctx.btn(ctx.tr("Later", "Позже"), `iva_menu:${SID}:rs:later`),
-    ],
-    ctx.backRow(PARENT),
-  ]);
+      button(ctx.tr("Later", "Позже"), `iva_menu:${SID}:rs:later`),
+    ]),
+    backLine(ctx),
+  ].join("\n\n");
+  return ctx.flows.screen(st, text);
 }
 
 export default {
@@ -122,34 +128,33 @@ export default {
 
   // Список провайдеров: ✓ у текущего, 🔑 при наличии ключа (только булевы — значения ключей
   // наружу не выводим). Свежее чтение .env на каждый рендер — состояние всегда актуально.
-  async render(st: MenuState, ctx: MenuContext): Promise<View> {
+  async render(st: MenuState, ctx: MenuContext): Promise<{ text: string }> {
     st.awaitText = null; // возврат на список снимает возможный ждущий ввод ключа
     const env = await readEnvValues(ctx.deps.envPath);
     const current = currentProvider(env);
-    const rows = Object.entries(SEARCH_CATALOG).map(([id, cat]) => {
-      const mark = id === current ? "✓ " : "";
-      const keyBadge = env[cat.keyVar] ? " 🔑" : "";
-      return [
-        ctx.btn(`${mark}${cat.label}${keyBadge}`, `iva_menu:${SID}:set:${id}`),
-      ];
-    });
-    // Сменить ключ текущего провайдера (даже если он уже есть).
-    rows.push([
-      ctx.btn(
-        ctx.tr("🔁 Change key", "🔁 Сменить ключ"),
-        `iva_menu:${SID}:key:${current}`,
-      ),
-    ]);
-    rows.push(ctx.backRow(PARENT));
     const text = [
-      ctx.tr("🔍 Web search", "🔍 Веб-поиск"),
-      "",
+      `# ${ctx.tr("🔍 Web search", "🔍 Веб-поиск")}`,
       ctx.tr(
         "Pick a provider. ✓ — current, 🔑 — its key is set. Tapping a provider without a key asks for one.",
         "Выбери провайдера. ✓ — текущий, 🔑 — ключ задан. Тап по провайдеру без ключа попросит его ввести.",
       ),
-    ].join("\n");
-    return { text, rows };
+      ...Object.entries(SEARCH_CATALOG).map(([id, cat]) => {
+        const mark = id === current ? "✓ " : "";
+        const keyBadge = env[cat.keyVar] ? " 🔑" : "";
+        const host = cat.url.replace(/^https?:\/\//, "");
+        return `${button(`${mark}${cat.label}${keyBadge}`, `iva_menu:${SID}:set:${id}`)} — ${ctx.tr(
+          `search via ${cat.label}; key at ${host}.`,
+          `искать через ${cat.label}; ключ на ${host}.`,
+        )}`;
+      }),
+      // Сменить ключ текущего провайдера (даже если он уже есть).
+      `${button(ctx.tr("🔁 Change key", "🔁 Сменить ключ"), `iva_menu:${SID}:key:${current}`)} — ${ctx.tr(
+        "enter a new key for the current provider.",
+        "ввести новый ключ текущего провайдера.",
+      )}`,
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   },
 
   async on(verb: string, args: string[], st: MenuState, ctx: MenuContext) {
@@ -184,7 +189,6 @@ export default {
                 "⚠️ Couldn't restart (systemctl). Check the service on the server.",
                 "⚠️ Не удалось перезапустить (systemctl). Проверь сервис на сервере.",
               ),
-          [ctx.backRow(PARENT)],
         );
       }
       // later
@@ -194,7 +198,6 @@ export default {
           "Saved. It'll apply on the next restart (/restart).",
           "Сохранил. Применится после перезапуска (/restart).",
         ),
-        [ctx.backRow(PARENT)],
       );
     }
     return ctx.show(st, SID);
@@ -222,7 +225,6 @@ export default {
             "That doesn't look like a key — the prompt is cleared, I deleted the message just in case.",
             "Это не похоже на ключ — ожидание снято, сообщение удалил на всякий случай.",
           ),
-          [ctx.backRow(PARENT)],
         );
       }
       const cat = SEARCH_CATALOG[provider];
@@ -231,11 +233,10 @@ export default {
         // Причина отказа не содержит значения ключа (см. checkSearchKey) — печатать безопасно.
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             `Key rejected (${err}). Send another key or go back.`,
             `Ключ не принят (${err}). Пришли другой ключ или вернись назад.`,
-          ),
-          [[ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)]],
+          )}\n\n${cancelLine(ctx)}`,
         );
       }
       st.awaitText = null;

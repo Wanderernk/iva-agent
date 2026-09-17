@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/require-await -- Node owns test registration; async doubles preserve the I/O boundary. */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,6 +16,10 @@ type CancelCall = {
 };
 type ControlUpdate = Record<string, unknown>;
 type ControlModule = {
+  applyTelegramButtonTap: (
+    update: ControlUpdate,
+    callback: Record<string, unknown>,
+  ) => boolean;
   handleAwaitNonText: (
     message: CaptureMessage & Record<string, unknown>,
     pending: CaptureState,
@@ -43,6 +47,7 @@ type ControlModule = {
     },
   ) => Promise<boolean>;
   OUT_OF_BAND_COMMANDS: string[];
+  TELEGRAM_EVE_CALLBACK_PREFIXES: readonly string[];
 };
 type RunStatusModule = {
   setChatStatus: (chatKey: string, patch: Record<string, unknown>) => void;
@@ -89,6 +94,11 @@ type WizardsModule = {
 // и то и другое ставим ДО загрузки модуля, в свежей data-директории.
 const dataDir = mkdtempSync(join(tmpdir(), "iva-control-"));
 process.env.ASSISTANT_DATA_DIR = dataDir;
+// Экраны моста в тестах проверяются в rich-стиле (по умолчанию у пользователя classic).
+writeFileSync(
+  join(dataDir, "settings.json"),
+  JSON.stringify({ menuStyle: "rich" }),
+);
 process.env.TELEGRAM_BOT_TOKEN = "424242:test-token";
 process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN = "test-secret";
 process.env.TELEGRAM_ALLOWED_USER_IDS = "42";
@@ -104,8 +114,13 @@ const [controlModule, runStatusModule, wizardsModule, queueModule, mainModule] =
     import("./queue.ts"),
     import("./main.ts"),
   ])) as [unknown, unknown, unknown, unknown, unknown];
-const { handleAwaitNonText, handleControl, OUT_OF_BAND_COMMANDS } =
-  controlModule as ControlModule;
+const {
+  applyTelegramButtonTap,
+  handleAwaitNonText,
+  handleControl,
+  OUT_OF_BAND_COMMANDS,
+  TELEGRAM_EVE_CALLBACK_PREFIXES,
+} = controlModule as ControlModule;
 const status = runStatusModule as RunStatusModule;
 const { flows } = wizardsModule as WizardsModule;
 const queue = queueModule as QueueModule;
@@ -710,6 +725,207 @@ test("a non-private rejection does not reveal controls to an untrusted user", as
   assert.deepEqual(acks, [["cq-5", undefined]]);
 });
 
+// Кнопка, написанная моделью: её data — реплика пользователя, поэтому тап уходит
+// дальше обычным сообщением (allowlist, очередь и доставка — как у текста), а не
+// колбэком в eve: сессию наполняет inbound pipeline, а он читает сообщения.
+test("тап по кнопке модели уходит дальше обычным сообщением", async () => {
+  const { acks, deps } = recordingDeps();
+  const update: ControlUpdate = {
+    update_id: 61,
+    callback_query: {
+      id: "cq-tap",
+      from: trustedFrom,
+      data: "Отложи на час",
+      message: {
+        message_id: 77,
+        date: 1_700_000_000,
+        message_thread_id: 5,
+        chat,
+        from: { id: 424242, is_bot: true },
+        text: "Напомнить?",
+      },
+    },
+  };
+
+  assert.equal(
+    await handleControl(update, deps),
+    false,
+    "тап идёт в admission",
+  );
+  assert.deepEqual(acks, [["cq-tap", undefined]]);
+  assert.equal(update.callback_query, undefined, "колбэк больше не колбэк");
+  assert.deepEqual(update.message, {
+    message_id: 77,
+    date: 1_700_000_000,
+    message_thread_id: 5,
+    chat,
+    from: { id: 42, is_bot: false },
+    text: "Отложи на час",
+  });
+});
+
+// Отправителя — нажавшего, не бота, и чат — тот же, где стоит кнопка: иначе ответ
+// уедет в чужой чат, а allowlist будет судить чат-бота.
+test("тап отвечает от нажавшего и в чат кнопки, а не в чат бота", async () => {
+  const update: ControlUpdate = {
+    update_id: 62,
+    callback_query: {
+      id: "cq-sender",
+      from: { id: 42, is_bot: false, username: "owner" },
+      data: "Да",
+      message: {
+        message_id: 78,
+        chat: { id: 7, type: "private", title: "bot chat" },
+        from: { id: 424242, is_bot: true },
+      },
+    },
+  };
+
+  assert.equal(
+    applyTelegramButtonTap(update, update.callback_query as never),
+    true,
+  );
+  const tap = update.message as Record<string, unknown>;
+  assert.deepEqual(tap.from, { id: 42, is_bot: false, username: "owner" });
+  assert.deepEqual(tap.chat, { id: 7, type: "private", title: "bot chat" });
+});
+
+// eve владеет двумя префиксами: подтверждения HITL и кнопки входа в подключения.
+// Подмена их сообщением молча теряет подтверждение или вход, поэтому они уходят в eve.
+test("колбэки eve мост не подменяет сообщением", async () => {
+  const eve = (await import("eve/channels/telegram")) as {
+    TELEGRAM_HITL_CALLBACK_PREFIX: string;
+  };
+  assert.equal(
+    TELEGRAM_EVE_CALLBACK_PREFIXES[0],
+    eve.TELEGRAM_HITL_CALLBACK_PREFIX,
+    "префикс HITL-колбэка обязан совпадать с eve",
+  );
+
+  for (const data of ["eve:1", "eve_auth:42"]) {
+    const { acks, deps } = recordingDeps();
+    const update: ControlUpdate = {
+      update_id: 63,
+      callback_query: {
+        id: `cq-${data}`,
+        from: trustedFrom,
+        message: { message_id: 1, date: 1, chat },
+        data,
+      },
+    };
+
+    assert.equal(await handleControl(update, deps), false, data);
+    assert.equal(update.message, undefined, data);
+    assert.ok(update.callback_query, data);
+    assert.deepEqual(acks, [], data);
+  }
+});
+
+// Пространство `iva_*` — моста: незнакомый его колбэк остаётся колбэком (сегодня его
+// доставляет eve), в сообщение его не превращаем даже когда экрана для него ещё нет.
+test("незнакомый iva-колбэк остаётся в пространстве моста", async () => {
+  const { acks, deps } = recordingDeps();
+  const update: ControlUpdate = {
+    update_id: 64,
+    callback_query: {
+      id: "cq-iva-future",
+      from: trustedFrom,
+      message: { message_id: 1, date: 1, chat },
+      data: "iva_future:x",
+    },
+  };
+
+  assert.equal(await handleControl(update, deps), false);
+  assert.equal(update.message, undefined);
+  assert.deepEqual(acks, []);
+});
+
+// Чужому тапу — пустой ack без подсказок (наличие контрола знать нечего), а решение
+// по allowlist остаётся за admission: он же пишет отброс в журнал.
+test("чужой тап гасит спиннер и не становится сообщением", async () => {
+  const { acks, deps } = recordingDeps();
+  const update: ControlUpdate = {
+    update_id: 65,
+    callback_query: {
+      id: "cq-stranger",
+      from: { id: 999, is_bot: false },
+      message: { message_id: 1, date: 1, chat },
+      data: "Отложи на час",
+    },
+  };
+
+  assert.equal(await handleControl(update, deps), false);
+  assert.deepEqual(acks, [["cq-stranger", undefined]]);
+  assert.equal(update.message, undefined);
+  assert.ok(update.callback_query, "allowlist судит admission, а не мост");
+});
+
+// В группе текст принимается только как упоминание, команда или reply боту, а нажатие
+// кнопки — ни то, ни другое: тап там не доедет, поэтому говорим про личку прямо.
+test("тап в группе отвечает подсказкой про личный чат", async () => {
+  const { acks, deps } = recordingDeps();
+  const update: ControlUpdate = {
+    update_id: 66,
+    callback_query: {
+      id: "cq-group-tap",
+      from: trustedFrom,
+      message: {
+        message_id: 1,
+        date: 1,
+        chat: { id: -1001, type: "supergroup" },
+      },
+      data: "Отложи на час",
+    },
+  };
+
+  assert.equal(await handleControl(update, deps), true, "тап проглочен");
+  assert.equal(acks.length, 1);
+  assert.match(acks[0][1] ?? "", /private|личн/u);
+  assert.equal(update.message, undefined);
+  assert.ok(update.callback_query, "подсказка — не доставка");
+});
+
+// Конверт без сообщения (inline_message_id) или без чата сообщением стать не может —
+// гасим тап здесь, иначе admission запишет его и очередь встанет на повторе.
+test("неполный конверт тапа не превращается в сообщение", async () => {
+  for (const callback of [
+    { id: "cq-inline", from: trustedFrom, data: "Да" },
+    {
+      id: "cq-no-chat",
+      from: trustedFrom,
+      data: "Да",
+      message: { message_id: 1, date: 1 },
+    },
+  ]) {
+    const { acks, deps } = recordingDeps();
+    const update: ControlUpdate = { update_id: 67, callback_query: callback };
+    const label = String(callback.id);
+
+    assert.equal(await handleControl(update, deps), true, label);
+    assert.deepEqual(acks, [[String(callback.id), undefined]], label);
+    assert.equal(update.message, undefined, label);
+    assert.ok(update.callback_query, label);
+  }
+});
+
+// Тап без отправителя — не наш: allowlist судит admission по from, а его нет.
+test("тап без отправителя не подменяется, его снимает admission", async () => {
+  const { acks, deps } = recordingDeps();
+  const update: ControlUpdate = {
+    update_id: 68,
+    callback_query: {
+      id: "cq-no-from",
+      data: "Да",
+      message: { message_id: 1, date: 1, chat },
+    },
+  };
+
+  assert.equal(await handleControl(update, deps), false);
+  assert.deepEqual(acks, [["cq-no-from", undefined]]);
+  assert.equal(update.message, undefined);
+  assert.ok(update.callback_query);
+});
+
 test("malformed update callback is not claimed as a local control", async () => {
   const methods: string[] = [];
   const previousFetch = globalThis.fetch;
@@ -874,10 +1090,11 @@ test("model keep callback is retained when only spinner ack succeeds", async () 
     const consumed = await handleControl(callback);
 
     assert.equal(consumed, false);
+    // Терминальный экран визарда — rich-сообщение: новый экран уходит sendRichMessage'ом.
     assert.deepEqual(methods, [
       "answerCallbackQuery",
       "editMessageText",
-      "sendMessage",
+      "sendRichMessage",
     ]);
 
     globalThis.fetch = async (input) => {
@@ -904,6 +1121,283 @@ test("model keep callback is retained when only spinner ack succeeds", async () 
       "editMessageText",
     ]);
   } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+// Тап по кнопке мёртвого экрана в СТАРОМ сообщении не забирает у живого меню ни его
+// сообщение, ни ожидание ввода. Иначе ожидание переезжает в корень, где обрабатывать
+// его kind нечем, и следующий ОБЫЧНЫЙ текст пользователя мост удаляет как креденшл
+// вместо доставки в eve.
+test("a dead menu tap leaves the live menu's pending input alone", async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    const raw = init?.body;
+    calls.push({
+      method: url.split("/").at(-1) ?? "",
+      body:
+        typeof raw === "string"
+          ? (JSON.parse(raw) as Record<string, unknown>)
+          : {},
+    });
+    return Response.json({ ok: true, result: { message_id: 100 } });
+  };
+  try {
+    const live = flows.start(7, "42", "menu", {
+      screen: "srch",
+      page: 0,
+      msgId: 100,
+      awaitText: { kind: "apikey", secret: true, data: { provider: "tavily" } },
+    });
+
+    const tapped = await handleControl(
+      {
+        update_id: 910,
+        callback_query: {
+          id: "cq-dead-menu",
+          from: trustedFrom,
+          message: { message_id: 55, date: 1, chat },
+          data: "iva_menu:zzz:o",
+        },
+      },
+      recordingDeps().deps,
+    );
+
+    assert.equal(tapped, true);
+    assert.equal(flows.get(7, "42"), live, "живое меню не вытеснено");
+    assert.equal(live.msgId, 100, "меню осталось за своим сообщением");
+    assert.equal(live.awaitText, null, "ожидание ввода снято, а не перенесено");
+    assert.ok(
+      calls.some(
+        (call) =>
+          call.method === "editMessageText" && call.body.message_id === 100,
+      ),
+      "корень перерисован в сообщении живого меню",
+    );
+
+    calls.length = 0;
+    const ordinary = await handleControl(
+      {
+        update_id: 911,
+        message: {
+          message_id: 911,
+          date: 1,
+          chat,
+          from: trustedFrom,
+          text: "сколько времени?",
+        },
+      },
+      recordingDeps().deps,
+    );
+
+    assert.equal(ordinary, false, "обычное сообщение уходит в eve");
+    assert.deepEqual(
+      calls.map((call) => call.method),
+      [],
+      "обычное сообщение не удалено и не перехвачено",
+    );
+  } finally {
+    const stale = flows.get(7, "42");
+    if (stale) {
+      stale.createdAt = 0;
+      flows.get(7, "42");
+    }
+    globalThis.fetch = previousFetch;
+  }
+});
+
+// Усыновление старого сообщения переносит ждущий ввод только на экран, который владеет
+// его kind. Экран-получатель без texts[kind] обработать ввод не может, поэтому ожидание
+// снимается, а корень рисуется в сообщении живого меню: иначе следующий ОБЫЧНЫЙ текст
+// владельца снова удалялся бы из чата как ключ вместо доставки в eve.
+test("adoption drops a pending input the target screen cannot handle", async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    const raw = init?.body;
+    calls.push({
+      method: url.split("/").at(-1) ?? "",
+      body:
+        typeof raw === "string"
+          ? (JSON.parse(raw) as Record<string, unknown>)
+          : {},
+    });
+    return Response.json({ ok: true, result: { message_id: 100 } });
+  };
+  try {
+    // Живое меню ждёт ключ поиска (texts.apikey есть только у srch), тап приходит по
+    // кнопке экрана языка в ДРУГОМ сообщении.
+    const live = flows.start(7, "42", "menu", {
+      screen: "srch",
+      page: 0,
+      msgId: 100,
+      awaitText: { kind: "apikey", secret: true, data: { provider: "tavily" } },
+    });
+
+    const tapped = await handleControl(
+      {
+        update_id: 920,
+        callback_query: {
+          id: "cq-foreign-await",
+          from: trustedFrom,
+          message: { message_id: 55, date: 1, chat },
+          data: "iva_menu:lang:o",
+        },
+      },
+      recordingDeps().deps,
+    );
+
+    assert.equal(tapped, true);
+    assert.equal(flows.get(7, "42"), live, "живое меню не вытеснено");
+    assert.equal(live.msgId, 100, "меню осталось за своим сообщением");
+    assert.equal(live.awaitText, null, "ожидание ввода снято, а не перенесено");
+    assert.ok(
+      calls.some(
+        (call) =>
+          call.method === "editMessageText" && call.body.message_id === 100,
+      ),
+      "корень перерисован в сообщении живого меню",
+    );
+
+    calls.length = 0;
+    const ordinary = await handleControl(
+      {
+        update_id: 921,
+        message: {
+          message_id: 921,
+          date: 1,
+          chat,
+          from: trustedFrom,
+          text: "что по погоде?",
+        },
+      },
+      recordingDeps().deps,
+    );
+
+    assert.equal(ordinary, false, "обычное сообщение уходит в eve");
+    assert.deepEqual(
+      calls.map((call) => call.method),
+      [],
+      "обычное сообщение не удалено и не перехвачено",
+    );
+  } finally {
+    const stale = flows.get(7, "42");
+    if (stale) {
+      stale.createdAt = 0;
+      flows.get(7, "42");
+    }
+    globalThis.fetch = previousFetch;
+  }
+});
+
+// Ожидание ввода принадлежит тому flow, который его поставил. Живой визард /model ждёт
+// API-ключ (secret) в СВОЁМ сообщении; тап по старой кнопке меню не имеет права забрать ни
+// это ожидание, ни общий слот — совпадение имени kind (у экрана поиска тоже есть
+// texts.apikey) владением не является. Иначе ключ уходит обычной доставкой в eve и
+// остаётся в чате.
+test("a stale menu tap cannot take the pending key away from the /model wizard", async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    const raw = init?.body;
+    calls.push({
+      method: url.split("/").at(-1) ?? "",
+      body:
+        typeof raw === "string"
+          ? (JSON.parse(raw) as Record<string, unknown>)
+          : {},
+    });
+    return Response.json({ ok: true, result: { message_id: 100 } });
+  };
+  try {
+    const wizard = flows.start(7, "42", "model", {
+      provider: "custom",
+      pendingBase: "https://api.example.test/v1",
+      step: "awaiting_key",
+      msgId: 100,
+      awaitText: { kind: "apikey", secret: true, data: {} },
+    });
+
+    const tapped = await handleControl(
+      {
+        update_id: 930,
+        callback_query: {
+          id: "cq-wizard-await",
+          from: trustedFrom,
+          message: { message_id: 55, date: 1, chat },
+          data: "iva_menu:srch:o",
+        },
+      },
+      recordingDeps().deps,
+    );
+
+    assert.equal(tapped, true);
+    assert.equal(flows.get(7, "42"), wizard, "слот визарда не вытеснен");
+    assert.equal(wizard.flow, "model");
+    assert.deepEqual(
+      wizard.awaitText,
+      { kind: "apikey", secret: true, data: {} },
+      "ожидание осталось у визарда",
+    );
+    assert.deepEqual(
+      calls.map((call) => call.method),
+      ["answerCallbackQuery"],
+      "тап только гасит кнопку: ни правок сообщений, ни рендера",
+    );
+    assert.equal(
+      typeof calls[0].body.text,
+      "string",
+      "в ack ушёл тост, а не тишина",
+    );
+
+    calls.length = 0;
+    const keyMessage = await handleControl(
+      {
+        update_id: 931,
+        message: {
+          message_id: 931,
+          date: 1,
+          chat,
+          from: trustedFrom,
+          text: "sk-real-secret-value",
+        },
+      },
+      recordingDeps().deps,
+    );
+
+    assert.equal(keyMessage, true, "ключ обработан визардом, а не доставкой");
+    assert.ok(
+      calls.some(
+        (call) =>
+          call.method === "deleteMessage" && call.body.message_id === 931,
+      ),
+      "сообщение с ключом удалено из чата",
+    );
+  } finally {
+    const stale = flows.get(7, "42");
+    if (stale) {
+      stale.createdAt = 0;
+      flows.get(7, "42");
+    }
     globalThis.fetch = previousFetch;
   }
 });

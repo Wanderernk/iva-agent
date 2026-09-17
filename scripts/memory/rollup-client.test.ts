@@ -80,6 +80,8 @@ class FakeEve {
   readonly requests: RecordedRequest[] = [];
   readonly server: Server;
   mode: FakeMode = "own";
+  /** Файловый эффект хода: тест дописывает vault так, как это сделала бы модель. */
+  onTurn?: () => void;
   #nextSession = 1;
   #events = new Map<string, object[]>();
 
@@ -126,6 +128,7 @@ class FakeEve {
       const sessionId = `wrun_fake_${this.#nextSession++}`;
       const message = this.#message(body);
       this.#events.set(sessionId, turn(message));
+      this.onTurn?.();
       sendJson(response, { sessionId });
       return;
     }
@@ -184,6 +187,7 @@ class FakeEve {
             : message,
         ),
       ]);
+      this.onTurn?.();
       if (this.mode === "send-disconnect") {
         request.socket.destroy();
         return;
@@ -221,9 +225,10 @@ function makeRunDirectory(): {
 async function runRollup(
   host: string,
   paths: { readonly data: string; readonly vault: string },
+  period = "monthly",
 ): Promise<RollupRun> {
   return await new Promise<RollupRun>((resolveRun, rejectRun) => {
-    const child = spawn(process.execPath, [ROLLUP, "monthly"], {
+    const child = spawn(process.execPath, [ROLLUP, period], {
       cwd: ROOT,
       env: {
         ...process.env,
@@ -460,4 +465,47 @@ test("a structured 409 session_not_active permits one fresh retry", async (t) =>
       .sessionId,
     "wrun_fake_1",
   );
+});
+
+test("a daily turn that hollows a section leaves the pre-turn CORE.md on disk", async (t) => {
+  const fake = new FakeEve();
+  const host = await fake.start();
+  const paths = makeRunDirectory();
+  t.after(async () => {
+    await fake.stop();
+    rmSync(paths.root, { force: true, recursive: true });
+  });
+  const corePath = join(paths.vault, "CORE.md");
+  const yesterday = new Date(Date.now() - 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+  const beforeTurn = [
+    "# CORE",
+    "",
+    "## Предпочтения",
+    "",
+    "- 2026-07: отвечать коротко, без преамбул",
+    "",
+    "## Указатели",
+    "",
+    `- Последний день: summaries/daily/${yesterday} · Индекс: MOC.md`,
+    "",
+  ].join("\n");
+  writeFileSync(corePath, beforeTurn);
+  const hollowed = beforeTurn.replace(
+    "- 2026-07: отвечать коротко, без преамбул",
+    "",
+  );
+  let written = false;
+  fake.onTurn = () => {
+    if (written) return;
+    written = true;
+    writeFileSync(corePath, hollowed);
+  };
+
+  const run = await runRollup(host, paths, "daily");
+
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(written, true, "the turn must have rewritten CORE.md");
+  assert.equal(readFileSync(corePath, "utf8"), beforeTurn);
 });

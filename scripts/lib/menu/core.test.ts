@@ -4,9 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
 
-type Button = { text: string; callback_data: string };
-type Rows = Button[][];
-
 type InterviewState = {
   i: number;
   qa: Array<{ q: string; a: string }>;
@@ -47,20 +44,15 @@ type MenuContext = {
   };
   getLang: () => "en" | "ru";
   tr: (en: string, ru: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screen: string) => Button[];
   flows: {
-    screen: (state: MenuState, text: string, rows: Rows) => Promise<void>;
+    screen: (state: MenuState, text: string) => Promise<void>;
   };
   show: (state: MenuState, screen: string) => Promise<void>;
 };
 
 type CoreScreen = {
   parent: string;
-  render: (
-    state: MenuState,
-    context: MenuContext,
-  ) => Promise<{ text: string; rows: Rows }>;
+  render: (state: MenuState, context: MenuContext) => Promise<{ text: string }>;
   on: (
     verb: string,
     args: string[],
@@ -125,7 +117,7 @@ function makeState(overrides: Partial<MenuState> = {}): MenuState {
 }
 
 function makeContext(lang: "en" | "ru" = "ru") {
-  const screens: Array<{ text: string; rows: Rows }> = [];
+  const screens: Array<{ text: string }> = [];
   const deliveries: Delivery[] = [];
   const admissions: Delivery[] = [];
   const shown: string[] = [];
@@ -143,13 +135,9 @@ function makeContext(lang: "en" | "ru" = "ru") {
     },
     getLang: () => lang,
     tr: (en, ru) => (lang === "ru" ? ru : en),
-    btn: (text, callbackData) => ({ text, callback_data: callbackData }),
-    backRow: (screen) => [
-      { text: "‹ Назад", callback_data: `iva_menu:${screen}:o` },
-    ],
     flows: {
-      screen: (_state, text, rows) => {
-        screens.push({ text, rows });
+      screen: (_state, text) => {
+        screens.push({ text });
         return Promise.resolve();
       },
     },
@@ -168,11 +156,12 @@ void test("core render handles an empty vault and trims an oversized CORE excerp
 
   const empty = await core.render(state, context);
   assert.equal(core.parent, "r");
+  assert.match(empty.text, /^# 💾 Ядро памяти$/m);
   assert.match(empty.text, /Ядро памяти пусто/);
-  assert.deepEqual(empty.rows[0][0], {
-    text: "Пройти интервью",
-    callback_data: "iva_menu:core:go",
-  });
+  assert.match(
+    empty.text,
+    /<tg-button[^>]*data="iva_menu:core:go"[^>]*>Пройти интервью<\/tg-button>/,
+  );
 
   const excerpt = `${"а".repeat(399)}  ${"б".repeat(20)}`;
   writeFileSync(join(vault, "CORE.md"), `\n${excerpt}\n`, "utf8");

@@ -1,12 +1,13 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { basename, join } from "node:path";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { readEnvFresh } from "../lib/env-file.ts";
 import {
   inspectUpstream,
   markVersionNotified,
-  updateOffer,
+  updateKeepsLine,
+  updateOfferActionLines,
 } from "../lib/update-check.ts";
 import { modelSummary } from "../lib/model-summary.ts";
 import { reporterFor } from "../lib/telegram-status.ts";
@@ -25,10 +26,7 @@ import {
   sleep,
 } from "./config.ts";
 import { edit, reply, tg } from "./transport.ts";
-import {
-  parseUpdateCallbackData,
-  validRecoveryBundleId,
-} from "./update-callback.ts";
+import { parseUpdateCallbackData } from "./update-callback.ts";
 export { parseUpdateCallbackData } from "./update-callback.ts";
 
 type UpdateInfo = Awaited<ReturnType<typeof inspectUpstream>>;
@@ -41,6 +39,8 @@ type UpdateCheckOptions = {
   }) => Promise<UpdateInfo>;
   markNotifiedImpl?: (dataDir: string, version: string) => Promise<void>;
   envImpl?: () => Promise<NodeJS.ProcessEnv>;
+  /** `/update --force`: rebuild the release that runs, with no question to upstream. */
+  force?: boolean;
 };
 type TelegramMessage = { message_id: number };
 type UpdateCallbackQuery = {
@@ -51,10 +51,6 @@ type UpdateCallbackQuery = {
 };
 type LaunchResult = { ok: boolean; msg: string };
 type ErrorLike = { message?: unknown };
-type RecoveryReport = {
-  schema: "iva-update-conflicts/v1";
-  conflicts: { path: string }[];
-};
 
 function messageEditSucceeded(value: unknown): boolean {
   return (
@@ -69,7 +65,13 @@ function messageEditSucceeded(value: unknown): boolean {
 // THIS bridge (restartServices restarts iva-telegram-poll too — a plain child would be
 // killed with us). --collect GC's the unit after exit. The updater reads a 0600 job
 // file and posts each phase directly through Bot API, so no bridge process survives.
-function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
+export function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
+  const updater = [
+    join(ROOT, "bin/iva.mjs"),
+    "update",
+    "--telegram-job",
+    jobId,
+  ];
   const args = [
     "--user",
     "--collect",
@@ -78,15 +80,37 @@ function launchSelfUpdate(jobId: string): Promise<LaunchResult> {
     `--setenv=PATH=${process.env.PATH || ""}`,
     `--setenv=ASSISTANT_DATA_DIR=${DATA_DIR}`,
     NODE,
-    join(ROOT, "bin/iva.mjs"),
-    "update",
-    "--telegram-job",
-    jobId,
+    ...updater,
   ];
   return new Promise<LaunchResult>((resolve) =>
-    execFile("systemd-run", args, (err, out, e) =>
-      resolve({ ok: !err, msg: (e || out || "").toString().trim() }),
-    ),
+    execFile("systemd-run", args, (err, out, e) => {
+      // Без systemd (Docker, чужой супервизор) systemd-run нет вовсе: тогда обновлятор
+      // запускается отсоединённым дочерним процессом. Он переживёт рестарт моста, потому
+      // что ему не родитель, а своя сессия; рестарт сервисов обновлятор сам пропустит
+      // (hasSystemd). Прецедент 13.09.2026: «Не удалось запустить обновление» ×3 в Docker.
+      if (err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+        try {
+          const child = spawn(NODE, updater, {
+            cwd: ROOT,
+            env: { ...process.env, ASSISTANT_DATA_DIR: DATA_DIR },
+            detached: true,
+            stdio: "ignore",
+          });
+          child.unref();
+          log(
+            "systemd-run not found; self-update launched as a detached process",
+          );
+          resolve({ ok: true, msg: "detached" });
+        } catch (spawnError) {
+          resolve({
+            ok: false,
+            msg: String((spawnError as ErrorLike).message ?? spawnError),
+          });
+        }
+        return;
+      }
+      resolve({ ok: !err, msg: (e || out || "").toString().trim() });
+    }),
   );
 }
 
@@ -97,13 +121,19 @@ export async function handleUpdateCheck(
     inspectImpl = inspectUpstream,
     markNotifiedImpl = markVersionNotified,
     envImpl = () => readEnvFresh(ENV_PATH),
+    force = false,
   }: UpdateCheckOptions = {},
 ): Promise<boolean> {
   const status = (await reply(
     chatId,
-    tr("◇ Checking for updates", "◇ Проверяю обновления"),
+    force
+      ? tr("◇ Rebuilding the current version", "◇ Пересобираю текущую версию")
+      : tr("◇ Checking for updates", "◇ Проверяю обновления"),
   )) as TelegramMessage | null;
   if (!status || typeof status.message_id !== "number") return false;
+  // The same rebuild `iva update --force` does on the server, asked from the chat: no
+  // question to upstream, no offer to tap - the word was the confirmation.
+  if (force) return startSelfUpdate(chatId, status.message_id, { force });
   let info;
   try {
     // The same question the daily check asks, and on a converted installation the
@@ -144,14 +174,19 @@ export async function handleUpdateCheck(
           `v${info.localVersion ?? "?"} → newer build`,
           `v${info.localVersion ?? "?"} → новая сборка`,
         );
+  // Кнопки предложения — строки самого сообщения (rich): каждая рядом со своим пояснением.
+  // Тот же помощник собирает их для ежедневного Alert'а — одна формулировка на оба экрана.
+  const target =
+    info.remoteVersion && info.remoteVersion !== info.localVersion
+      ? `v${info.remoteVersion}`
+      : tr("a newer build", "новую сборку");
   const offered = await edit(
     chatId,
     status.message_id,
     tr(
-      `⬆️ Update available\n\n${bump}\nSettings and local changes will be preserved.`,
-      `⬆️ Доступно обновление\n\n${bump}\nНастройки и локальные изменения будут сохранены.`,
-    ),
-    updateOffer(info.localVersion, info.remoteVersion, getLang()).replyMarkup,
+      `⬆️ Update available\n\n${bump}\n${updateKeepsLine("en")}`,
+      `⬆️ Доступно обновление\n\n${bump}\n${updateKeepsLine("ru")}`,
+    ) + `\n\n${updateOfferActionLines(getLang(), target)}`,
   );
   const offerShown = messageEditSucceeded(offered);
   if (offerShown && info.hasVersionUpdate) {
@@ -165,6 +200,12 @@ export async function handleUpdateCheck(
 
 const jobsDir = (): string => join(DATA_DIR, "update-jobs");
 
+/**
+ * Заявка на повтор - часть своего job, а не отдельный файл со своим возрастом: TTL
+ * судит только job, а заявка уходит вместе с ним (или когда его уже нет). Иначе
+ * восстановление файлов или сдвиг времён оставлял свежий job без заявки, и обрыв
+ * повторялся второй раз - инвариант «один повтор» держался бы на двух mtime.
+ */
 async function removeStaleUpdateJobs(): Promise<void> {
   const jobs = jobsDir();
   let names;
@@ -173,106 +214,32 @@ async function removeStaleUpdateJobs(): Promise<void> {
   } catch {
     return;
   }
-  await Promise.all(
-    names
-      .filter((name) => name.endsWith(".json"))
-      .map(async (name) => {
-        const path = join(jobs, name);
-        try {
-          if (Date.now() - (await stat(path)).mtimeMs > UPDATE_JOB_TTL_MS)
-            await rm(path, { force: true });
-        } catch {
-          // Stale-job cleanup tolerates files disappearing or changing concurrently.
-        }
-      }),
+  const marks = names.filter((name) => name.endsWith(RETRY_MARK_SUFFIX));
+  const alive = new Set(
+    names.filter((name) => !name.endsWith(RETRY_MARK_SUFFIX)),
   );
-}
-
-async function showSavedUpdateConflicts(
-  bundleId: string,
-  chatId: string | number,
-  messageId: number,
-): Promise<boolean> {
-  if (!validRecoveryBundleId(bundleId)) {
-    return messageEditSucceeded(
-      await edit(
-        chatId,
-        messageId,
-        tr("⚠️ Invalid recovery bundle", "⚠️ Неверный пакет восстановления"),
-      ),
-    );
-  }
-  let report: RecoveryReport;
-  try {
-    const parsed: unknown = JSON.parse(
-      await readFile(
-        join(DATA_DIR, "update-conflicts", bundleId, "report.json"),
-        "utf8",
-      ),
-    );
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      (parsed as { schema?: unknown }).schema !== "iva-update-conflicts/v1" ||
-      !Array.isArray((parsed as { conflicts?: unknown }).conflicts)
-    )
-      throw new Error("invalid recovery report");
-    const conflicts = (parsed as { conflicts: unknown[] }).conflicts;
-    if (
-      conflicts.some(
-        (item) =>
-          !item ||
-          typeof item !== "object" ||
-          typeof (item as { path?: unknown }).path !== "string",
-      )
-    )
-      throw new Error("invalid conflict list");
-    report = parsed as RecoveryReport;
-  } catch {
-    return messageEditSucceeded(
-      await edit(
-        chatId,
-        messageId,
-        tr(
-          "⚠️ Saved update details are unavailable",
-          "⚠️ Детали обновления недоступны",
-        ),
-      ),
-    );
-  }
-  const visible = report.conflicts.slice(0, 10).map(({ path }) => `- ${path}`);
-  if (report.conflicts.length > visible.length) {
-    const remaining = report.conflicts.length - visible.length;
-    visible.push(
-      tr(`- ${remaining} more conflict(s)`, `- Ещё конфликтов: ${remaining}`),
-    );
-  }
-  const details =
-    visible.length > 0
-      ? tr(
-          `Saved local conflicts:\n${visible.join("\n")}`,
-          `Сохранённые локальные конфликты:\n${visible.join("\n")}`,
-        )
-      : tr(
-          "Your local changes are saved in full.",
-          "Ваши локальные изменения сохранены целиком.",
-        );
-  return messageEditSucceeded(
-    await edit(
-      chatId,
-      messageId,
-      [
-        tr("✅ The new Iva core is active.", "✅ Новое ядро Iva активно."),
-        "",
-        details,
-        "",
-        tr(
-          "Tell Iva: “restore my update changes”.",
-          "Напишите Иве: «восстанови мои изменения после обновления».",
-        ),
-      ].join("\n"),
-      { inline_keyboard: [] },
-    ),
+  await Promise.all(
+    [...alive].map(async (name) => {
+      const path = join(jobs, name);
+      try {
+        if (Date.now() - (await stat(path)).mtimeMs <= UPDATE_JOB_TTL_MS)
+          return;
+        await rm(path, { force: true });
+        alive.delete(name);
+      } catch {
+        // Stale-job cleanup tolerates files disappearing or changing concurrently.
+      }
+    }),
+  );
+  await Promise.all(
+    marks.map(async (name) => {
+      if (alive.has(name.slice(0, -RETRY_MARK_SUFFIX.length))) return;
+      try {
+        await rm(join(jobs, name), { force: true });
+      } catch {
+        // Stale-job cleanup tolerates files disappearing or changing concurrently.
+      }
+    }),
   );
 }
 
@@ -293,23 +260,28 @@ export async function handleUpdateCallback(
   if (from === null) return false;
   if (ALLOWED.size === 0 || !ALLOWED.has(from)) return true; // explicit terminal drop for a known untrusted sender
   if (parsed.action === "skip") {
+    // Правка несёт новый markdown целиком: кнопки предложения жили в тексте, а снимать
+    // прежнюю клавиатуру (пустым рядом) больше не нужно — её просто нет.
     const edited = await edit(
       chatId as string | number,
       messageId as number,
       tr("– Update postponed", "– Обновление отложено"),
-      { inline_keyboard: [] },
     );
     return messageEditSucceeded(edited);
   }
-  if (parsed.action === "conflicts") {
-    const shown = await showSavedUpdateConflicts(
-      parsed.bundleId,
-      chatId as string | number,
-      messageId as number,
-    );
-    return shown;
-  }
+  return startSelfUpdate(chatId as string | number, messageId as number);
+}
 
+/**
+ * One update job, from the file the updater reports to, to the launch. The button
+ * and `/update --force` end here; `force` travels in the job file, not on the command
+ * line, so the retry after an interruption rebuilds exactly what was asked.
+ */
+async function startSelfUpdate(
+  chatId: string | number,
+  messageId: number,
+  { force = false }: { force?: boolean } = {},
+): Promise<boolean> {
   const jobId = randomBytes(8).toString("hex");
   // Asked, never taken: the updater this launches owns the lock from end to end.
   // A lock claimed here on its behalf would outlive the launch - this bridge does
@@ -317,10 +289,9 @@ export async function handleUpdateCallback(
   // one tap would answer "already running" to every update after it.
   if (updateRunning(DATA_DIR)) {
     const edited = await edit(
-      chatId as string | number,
-      messageId as number,
+      chatId,
+      messageId,
       tr("⚠️ An update is already running", "⚠️ Обновление уже идёт"),
-      { inline_keyboard: [] },
     );
     return messageEditSucceeded(edited);
   }
@@ -339,22 +310,26 @@ export async function handleUpdateCallback(
       locale: getLang(),
       startedAt: new Date().toISOString(),
       ...(currentAtStart ? { currentAtStart } : {}),
+      ...(force ? { force: true } : {}),
     }),
     { mode: 0o600 },
   );
   await edit(
-    chatId as string | number,
-    messageId as number,
-    tr("◇ Saving your changes", "◇ Сохраняю ваши изменения"),
-    { inline_keyboard: [] },
+    chatId,
+    messageId,
+    tr("◇ Starting the update", "◇ Запускаю обновление"),
   );
   const r = await launchSelfUpdate(jobId);
   if (!r.ok) {
     await rm(join(jobsDir(), `${jobId}.json`), { force: true });
+    // systemd-run's own words go to the journal, and the first line reaches the chat:
+    // without them «couldn't start» is undebuggable (13.09.2026, three users at once).
+    const reason = r.msg.split("\n")[0].slice(0, 200);
+    log("self-update launch failed:", r.msg || "(no output)");
     const failureNotice = await edit(
-      chatId as string | number,
-      messageId as number,
-      tr("⚠️ Couldn't start the update", "⚠️ Не удалось запустить обновление"),
+      chatId,
+      messageId,
+      `${tr("⚠️ Couldn't start the update", "⚠️ Не удалось запустить обновление")}${reason ? `\n\n${reason}` : ""}\n\n${tr("Run on the server: iva update", "Запустите на сервере: iva update")}`,
     );
     return messageEditSucceeded(failureNotice);
   }
@@ -386,6 +361,12 @@ type ReconcileOptions = {
   root?: string;
   tickMs?: number;
   graceMs?: number;
+  /**
+   * Как запускается повтор прерванного обновления. Без значения по умолчанию: молчаливый
+   * боевой запуск делал бы любой тест, забывший подставить своё, настоящим самообновлением
+   * того дерева, в котором он бежит.
+   */
+  launchImpl: (jobId: string) => Promise<LaunchResult>;
 };
 type VersionStore = ReturnType<typeof createVersionStore>;
 
@@ -492,6 +473,7 @@ function rolledBack(store: VersionStore, running: string): boolean {
 async function dropDeliveredJob(path: string): Promise<void> {
   try {
     await rm(path, { force: true });
+    await rm(retryMark(path), { force: true });
   } catch (error) {
     log(
       "update job file left on disk after its final:",
@@ -601,7 +583,11 @@ async function concludeUpdateJob(
 async function watchUpdateJob(
   path: string,
   snapshot: UpdateJob,
-  { root, tickMs, graceMs }: Required<ReconcileOptions>,
+  {
+    root,
+    tickMs,
+    graceMs,
+  }: Required<Pick<ReconcileOptions, "root" | "tickMs" | "graceMs">>,
 ): Promise<void> {
   const store = createVersionStore(classifyRoot(root).home);
   const deadline = Date.now() + UPDATE_JOB_TTL_MS;
@@ -627,7 +613,10 @@ async function watchUpdateJob(
       const moved = flippedTo(store, snapshot);
       // The file went with an updater that answered the chat itself: nothing was
       // installed, so nothing restarted, so the report went out the ordinary way.
-      if (!job && !moved) return;
+      if (!job && !moved) {
+        await rm(retryMark(path), { force: true }); // Заявка живёт не дольше своего job.
+        return;
+      }
       quietSince ??= Date.now();
       if (Date.now() - quietSince < graceMs) continue;
       await concludeUpdateJob(path, job ?? snapshot, store, moved);
@@ -637,6 +626,49 @@ async function watchUpdateJob(
     }
   }
   log("update job watch gave up on:", basename(path));
+}
+
+/** The claim that an interrupted update was already restarted, beside its job file. */
+const RETRY_MARK_SUFFIX = ".retried";
+const retryMark = (path: string): string => `${path}${RETRY_MARK_SUFFIX}`;
+
+/**
+ * An update that was interrupted before it wrote anything down - the box lost power,
+ * the process was killed - is started again, once. `runVersionUpdate` finishes whatever
+ * the dead run left half-done, so the retry is the whole repair; the claim beside the
+ * job file is what keeps it from becoming a loop, and a second break is left to the TTL
+ * path below with the message it already has.
+ *
+ * Заявка создаётся с `wx` (O_EXCL) до запуска: два моста, читающие один job
+ * одновременно, получают ровно одно обновление, второй - EEXIST. Обратный порядок
+ * (запуск, потом заявка) стоил бы перезапуска обновления на каждом старте моста.
+ */
+async function retryInterruptedUpdate(
+  path: string,
+  job: UpdateJob,
+  launch: (jobId: string) => Promise<LaunchResult>,
+): Promise<boolean> {
+  if (updateRunning(DATA_DIR)) return false; // Живой владелец лока: обновление идёт.
+  try {
+    await writeFile(retryMark(path), "", { flag: "wx", mode: 0o600 });
+  } catch {
+    return false; // Заявка уже стоит: обновление этого job повторяли.
+  }
+  const launched = await launch(basename(path, ".json"));
+  if (!launched.ok) {
+    log("interrupted update not restarted:", launched.msg || "(no output)");
+    return false;
+  }
+  if (job.chatId !== undefined && job.messageId !== undefined)
+    await edit(
+      job.chatId,
+      Number(job.messageId),
+      tr(
+        "◇ The update was interrupted, retrying",
+        "◇ Обновление прервалось, повторяю",
+      ),
+    );
+  return true;
 }
 
 /**
@@ -650,7 +682,8 @@ export async function reconcileUpdateJobs({
   root = ROOT,
   tickMs = WATCH_TICK_MS,
   graceMs = WATCH_GRACE_MS,
-}: ReconcileOptions = {}): Promise<Promise<void>[]> {
+  launchImpl,
+}: ReconcileOptions): Promise<Promise<void>[]> {
   let names: string[];
   try {
     names = await readdir(jobsDir());
@@ -669,11 +702,14 @@ export async function reconcileUpdateJobs({
       if (!job) continue;
       const outcome = outcomeOf(job);
       if (!outcome) {
+        await retryInterruptedUpdate(path, job, launchImpl);
         watchers.push(watchUpdateJob(path, job, { root, tickMs, graceMs }));
         continue;
       }
-      if (await deliverFinal(job, outcome)) await rm(path, { force: true });
-      else log("update final undelivered; the job waits for the next start");
+      if (await deliverFinal(job, outcome)) {
+        await rm(path, { force: true });
+        await rm(retryMark(path), { force: true });
+      } else log("update final undelivered; the job waits for the next start");
     } catch (error) {
       log("update job reconcile failed:", name, (error as ErrorLike).message);
     }

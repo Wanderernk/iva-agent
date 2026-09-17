@@ -175,16 +175,16 @@ await test("лимит подписи режет мельче стандартн
   for (const message of sent) assert.ok(message.text.length <= 1024);
 });
 
-await test("пустое сообщение и один пробел не порождают отправку", async (t) => {
+await test("пустой рендер — провал шва, а не успех с нулём доставок", async (t) => {
   captureErrors(t);
   for (const message of ["", "   ", "\n\t \n"]) {
     const { sent, transport } = stub();
     const result = await sendThroughOutbox(message, transport);
     assert.deepEqual(result, {
-      ok: true,
+      ok: false,
       delivered: 0,
       fellBack: false,
-      error: "",
+      error: "nothing delivered: empty rendering",
     });
     assert.deepEqual(sent, []);
   }

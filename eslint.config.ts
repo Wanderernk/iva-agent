@@ -14,6 +14,8 @@ export default defineConfig([
     ".eve/",
     "services/telegram-userbot/",
     "data/",
+    ".scratch/",
+    ".worktrees/",
     "**/wt/",
     "**/.workflow-data/",
     "**/.iva-update/",

@@ -8,14 +8,23 @@
 // order they are declared here). A cadence change is one edit here.
 //
 // Crons fire in the PROCESS's local time — agent/instrumentation.ts sets TZ from
-// ASSISTANT_TIMEZONE at startup — so "0 4 * * *" means 04:00 local.
+// ASSISTANT_TIMEZONE at startup — so "0 4 * * *" means 04:00 local. The reminders dispatcher
+// ticks every minute on top of them; its own entry sits below.
 export const SCHEDULE_CRON = {
   "memory-daily": "0 4 * * *",
   "memory-weekly": "15 4 * * 1",
   "memory-monthly": "20 4 1 * *",
   "memory-yearly": "25 4 1 1 *",
   digest: "0 8 * * *",
+  // Дневной сторож расписаний (T20 п.4): после ночных rollup, до рабочего дня.
+  "jobs-watchdog": "17 7 * * *",
 } as const;
+
+// The reminders dispatcher ticks every minute. It stays out of SCHEDULE_CRON on purpose:
+// that table is for schedules with a status entry and a catch-up point (parseCron demands
+// a fixed minute and hour), and the dispatcher has neither - the reminder table itself is
+// its state. Still the single place a cron string lives (schedule-table.test.ts).
+export const REMINDER_TICK_CRON = "* * * * *";
 
 export type ScheduleName = keyof typeof SCHEDULE_CRON;
 

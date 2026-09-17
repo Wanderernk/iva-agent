@@ -15,7 +15,7 @@
 // скиллов сразу (eve ловит его и пропускает резолвер целиком). Битая запись пропускается
 // одной строкой в лог, остальные скиллы отдаются.
 import type { Dirent } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { dataDir } from "./data-dir.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
@@ -40,7 +40,7 @@ export function customSkillsDir(): string {
 
 // Описание попадает в системный промпт на каждом ходу. Файл без frontmatter, у которого
 // первая строка длиной в абзац, иначе раздувал бы промпт — режем.
-const DESCRIPTION_CAP = 300;
+const DESCRIPTION_CAP = 120;
 
 type Kind = "package" | "flat";
 
@@ -97,7 +97,13 @@ function firstMeaningfulLine(body: string): string | null {
   return null;
 }
 
-function describe(name: string, markdown: string): string {
+type Described = {
+  readonly description: string;
+  /** Длина описания до усечения; null — описание уложилось в DESCRIPTION_CAP. */
+  readonly truncatedFrom: number | null;
+};
+
+function describe(name: string, markdown: string): Described {
   let description: string | null;
   try {
     const { fields, body } = parseFrontmatter(markdown);
@@ -111,11 +117,33 @@ function describe(name: string, markdown: string): string {
     description = firstMeaningfulLine(markdown);
   }
   // Тот же слабый фолбэк, что у eve: скилл остаётся загружаемым по имени.
-  if (!description) return `Instructions for the ${name} skill.`;
-  return description.length > DESCRIPTION_CAP
-    ? `${description.slice(0, DESCRIPTION_CAP - 1).trimEnd()}…`
-    : description;
+  if (!description)
+    return {
+      description: `Instructions for the ${name} skill.`,
+      truncatedFrom: null,
+    };
+  if (description.length > DESCRIPTION_CAP) {
+    // Не оставлять одинокий старший суррогат: эмодзи на границе усечения превращался
+    // в «�» в индексе скиллов - тем же приёмом режет CORE (agent/lib/core-clamp.ts).
+    let end = DESCRIPTION_CAP - 1;
+    if (
+      end > 0 &&
+      /[\uD800-\uDBFF]/.test(description[end - 1]) &&
+      /[\uDC00-\uDFFF]/.test(description[end])
+    )
+      end -= 1;
+    return {
+      description: `${description.slice(0, end).trimEnd()}…`,
+      truncatedFrom: description.length,
+    };
+  }
+  return { description, truncatedFrom: null };
 }
+
+// Потолок одного файла скилла: тело и соседи читаются на каждом ходу, поэтому
+// без потолка один гигант тормозит ход и раздувает контекст. Настоящие скиллы —
+// десятки килобайт (самый большой встроенный — 56 КБ), запас четырёхкратный.
+const MAX_SKILL_FILE_BYTES = 256 * 1024;
 
 /** Соседние файлы пакета. Пути, которые eve не примет, и нечитаемые файлы отбрасываются. */
 async function packageFiles(
@@ -141,6 +169,23 @@ async function packageFiles(
     // SKILL.md eve генерирует сам из markdown и бросает, если он пришёл файлом.
     if (path === "SKILL.md") continue;
     if (path.includes("\\")) continue; // eve примет только POSIX-путь
+    let size: number;
+    try {
+      const fileStat = await lstat(absolute);
+      if (!fileStat.isFile()) continue;
+      size = fileStat.size;
+    } catch (error) {
+      log(
+        `[skills] custom skill ${name} file ${path} skipped: ${reason(error)}`,
+      );
+      continue;
+    }
+    if (size > MAX_SKILL_FILE_BYTES) {
+      log(
+        `[skills] custom skill ${name} file ${path} skipped: ${size} bytes, cap ${MAX_SKILL_FILE_BYTES}`,
+      );
+      continue;
+    }
     try {
       files[path] = await readFile(absolute);
     } catch (error) {
@@ -164,6 +209,32 @@ async function readOne(
     kind === "package"
       ? join(dir, entryName, "SKILL.md")
       : join(dir, entryName);
+  const source = kind === "package" ? join(entryName, "SKILL.md") : entryName;
+  // Читать только обычный файл: блочное/символьное устройство и FIFO без писателя
+  // отдают бесконечный поток — readFile ждёт EOF, которого нет, и виснет весь ход
+  // (eve ждёт резолвер без дедлайна). stat идёт за симлинком, как и чтение.
+  try {
+    const target = await stat(markdownPath);
+    if (!target.isFile()) {
+      log(`[skills] ${label} ${name} skipped: ${source} is not a regular file`);
+      return null;
+    }
+    if (target.size > MAX_SKILL_FILE_BYTES) {
+      log(
+        `[skills] ${label} ${name} skipped: ${source} is ${target.size} bytes, cap ${MAX_SKILL_FILE_BYTES}`,
+      );
+      return null;
+    }
+  } catch (error) {
+    log(
+      `[skills] ${label} ${name} skipped: ${
+        code(error) === "ENOENT" && kind === "package"
+          ? "no SKILL.md"
+          : reason(error)
+      }`,
+    );
+    return null;
+  }
   let markdown: string;
   try {
     markdown = await readFile(markdownPath, "utf8");
@@ -177,7 +248,16 @@ async function readOne(
     );
     return null;
   }
-  const description = describe(name, markdown);
+  const { description, truncatedFrom } = describe(name, markdown);
+  if (truncatedFrom !== null) {
+    const key = `description-cap\u0000${label}\u0000${name}\u0000${source}\u0000${truncatedFrom}`;
+    if (!reportedDiagnostics.has(key)) {
+      reportedDiagnostics.add(key);
+      log(
+        `[skills] ${label} ${name} (${source}) description is ${truncatedFrom} characters, cap ${DESCRIPTION_CAP}; truncated in the prompt index`,
+      );
+    }
+  }
   if (kind === "flat") return { description, markdown };
   const files = await packageFiles(join(dir, entryName), name, log);
   return Object.keys(files).length > 0
@@ -238,8 +318,9 @@ export async function readCustomSkills(
 }
 
 // Одна и та же жалоба не должна повторяться на каждом ходу: и про битый
-// plugins.json, и про кривой скилл плагина достаточно сказать один раз за жизнь
-// процесса. Набор маленький и ограничен числом скиллов на диске.
+// plugins.json, и про кривой скилл плагина, и про усечённое описание кастомного
+// скилла достаточно сказать один раз за жизнь процесса. Набор маленький и ограничен
+// числом скиллов на диске.
 let damagedStateReported = false;
 const reportedDiagnostics = new Set<string>();
 

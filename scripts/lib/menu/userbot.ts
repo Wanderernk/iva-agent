@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { readEnvValues, upsertEnv } from "../env-file.ts";
 import { resolveDataDir } from "../data-dir.ts";
 import { probeUserbotHealth } from "../userbot-health.ts";
+import { button } from "./buttons.ts";
 
 type ErrorLike = { code?: unknown; message?: unknown };
 type Health = { state: string };
@@ -23,7 +24,7 @@ type MenuState = {
   data: { ub?: { apiId?: string } | null };
   awaitText?: { kind: string; secret: boolean; data: { step?: string } } | null;
 };
-type View = { text: string; rows: Array<Array<unknown>> };
+type View = { text: string };
 type MenuContext = {
   deps: {
     root: string;
@@ -38,15 +39,9 @@ type MenuContext = {
   };
   flows: {
     get: (chatId: number | string, userId: string) => MenuState | null;
-    screen: (
-      state: MenuState,
-      text: string,
-      rows: Array<Array<unknown>>,
-    ) => Promise<unknown>;
+    screen: (state: MenuState, text: string) => Promise<unknown>;
   };
   tr: (en: string, ru: string) => string;
-  btn: (text: string, callbackData: string) => unknown;
-  backRow: (screen: string) => Array<unknown>;
   show: (state: MenuState, screen: string) => Promise<unknown>;
 };
 type Exec = (
@@ -67,6 +62,27 @@ const PARENT = "r";
 const SVC = "iva-telegram-userbot.service";
 
 const isPrivate = (st: MenuState) => Number(st.chatId) > 0;
+
+const backLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("‹ Menu", "‹ Меню"), `iva_menu:${PARENT}:o`)} — ${ctx.tr(
+    "back to the settings.",
+    "вернуться в настройки.",
+  )}`;
+const cancelLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`, "danger")} — ${ctx.tr(
+    "leave the prompt without entering anything.",
+    "выйти из ввода, ничего не меняя.",
+  )}`;
+const refreshLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("🔄 Refresh", "🔄 Обновить"), `iva_menu:${SID}:rf`, "success")} — ${ctx.tr(
+    "check the state again.",
+    "проверить состояние снова.",
+  )}`;
+const turnOffLine = (ctx: MenuContext) =>
+  `${button(ctx.tr("Turn off", "Выключить"), `iva_menu:${SID}:do:off`, "danger")} — ${ctx.tr(
+    "stop the userbot proxy.",
+    "остановить userbot-прокси.",
+  )}`;
 
 function run(cmd: string, args: string[], timeout = 1500) {
   return new Promise<{ failed: boolean; code: number; stdout: string }>(
@@ -156,100 +172,71 @@ async function buildScreen(st: MenuState, ctx: MenuContext): Promise<View> {
 
   if (!hasCreds) {
     const text = [
-      head,
-      "",
+      `# ${head}`,
       beta,
-      "",
       statusLine,
-      "",
       T(
         "No API credentials yet. Create an app at https://my.telegram.org (API development tools) — you'll get api_id and api_hash.",
         "Ключей ещё нет. Создай приложение на https://my.telegram.org (API development tools) — получишь api_id и api_hash.",
       ),
-    ].join("\n");
-    return {
-      text,
-      rows: [
-        [
-          ctx.btn(
-            T("Enter credentials", "Ввести ключи"),
-            `iva_menu:${SID}:do:creds`,
-          ),
-        ],
-        ctx.backRow(PARENT),
-      ],
-    };
+      `${button(T("Enter credentials", "Ввести ключи"), `iva_menu:${SID}:do:creds`)} — ${T(
+        "enter api_id and api_hash in a private chat.",
+        "ввести api_id и api_hash в личном чате.",
+      )}`,
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   }
 
   if (status.state === "off") {
     const text = [
-      head,
-      "",
+      `# ${head}`,
       beta,
-      "",
       statusLine,
-      "",
       T(
         "Credentials are set. Turn the proxy on — it builds a venv (up to ~3 min).",
         "Ключи заданы. Включи прокси — соберётся venv (до ~3 мин).",
       ),
-    ].join("\n");
-    return {
-      text,
-      rows: [
-        [ctx.btn(T("Turn on", "Включить"), `iva_menu:${SID}:do:setup`)],
-        [ctx.btn(T("🔄 Refresh", "🔄 Обновить"), `iva_menu:${SID}:rf`)],
-        ctx.backRow(PARENT),
-      ],
-    };
+      `${button(T("Turn on", "Включить"), `iva_menu:${SID}:do:setup`, "success")} — ${T(
+        "start the proxy (builds a venv, up to ~3 min).",
+        "запустить прокси (сборка venv, до ~3 мин).",
+      )}`,
+      refreshLine(ctx),
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   }
 
   if (status.state === "starting") {
-    return {
-      text: [
-        head,
-        "",
-        beta,
-        "",
-        statusLine,
-        "",
-        T(
-          "The proxy service is still starting. Refresh in a moment.",
-          "Прокси ещё запускается. Обнови через несколько секунд.",
-        ),
-      ].join("\n"),
-      rows: [
-        [
-          ctx.btn(T("Turn off", "Выключить"), `iva_menu:${SID}:do:off`),
-          ctx.btn(T("🔄 Refresh", "🔄 Обновить"), `iva_menu:${SID}:rf`),
-        ],
-        ctx.backRow(PARENT),
-      ],
-    };
+    const text = [
+      `# ${head}`,
+      beta,
+      statusLine,
+      T(
+        "The proxy service is still starting. Refresh in a moment.",
+        "Прокси ещё запускается. Обнови через несколько секунд.",
+      ),
+      turnOffLine(ctx),
+      refreshLine(ctx),
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   }
 
   if (status.state === "unreachable") {
-    return {
-      text: [
-        head,
-        "",
-        beta,
-        "",
-        statusLine,
-        "",
-        T(
-          "The service is active, but its health endpoint did not answer. Run `iva userbot diagnose --json` for the fixed diagnostic.",
-          "Сервис активен, но health endpoint не ответил. Запусти `iva userbot diagnose --json` для точной диагностики.",
-        ),
-      ].join("\n"),
-      rows: [
-        [
-          ctx.btn(T("Turn off", "Выключить"), `iva_menu:${SID}:do:off`),
-          ctx.btn(T("🔄 Refresh", "🔄 Обновить"), `iva_menu:${SID}:rf`),
-        ],
-        ctx.backRow(PARENT),
-      ],
-    };
+    const text = [
+      `# ${head}`,
+      beta,
+      statusLine,
+      T(
+        "The service is active, but its health endpoint did not answer. Run `iva userbot diagnose --json` for the fixed diagnostic.",
+        "Сервис активен, но health endpoint не ответил. Запусти `iva userbot diagnose --json` для точной диагностики.",
+      ),
+      turnOffLine(ctx),
+      refreshLine(ctx),
+      backLine(ctx),
+    ].join("\n\n");
+    return { text };
   }
 
   const accountHint =
@@ -262,23 +249,23 @@ async function buildScreen(st: MenuState, ctx: MenuContext): Promise<View> {
           "Proxy and Telegram account are ready.",
           "Прокси и аккаунт Telegram готовы.",
         );
-  const text = [head, "", beta, "", statusLine, "", accountHint].join("\n");
-  return {
-    text,
-    rows: [
-      [
-        ctx.btn(T("Turn off", "Выключить"), `iva_menu:${SID}:do:off`),
-        ctx.btn(T("🔄 Refresh", "🔄 Обновить"), `iva_menu:${SID}:rf`),
-      ],
-      ctx.backRow(PARENT),
-    ],
-  };
+  const text = [
+    `# ${head}`,
+    beta,
+    statusLine,
+    accountHint,
+    turnOffLine(ctx),
+    refreshLine(ctx),
+    backLine(ctx),
+  ].join("\n\n");
+  return { text };
 }
 
 // Приглашение ввести api_id или api_hash (двухшаговый секретный приём).
 function promptCred(st: MenuState, ctx: MenuContext, step: string) {
   st.awaitText = { kind: "ubcred", secret: true, data: { step } };
-  const text =
+  const head = `# 🔑 ${step === "api_id" ? "api_id" : "api_hash"}`;
+  const ask =
     step === "api_id"
       ? ctx.tr(
           "Send your api_id (a number). I'll delete the message right away.",
@@ -288,9 +275,7 @@ function promptCred(st: MenuState, ctx: MenuContext, step: string) {
           "Now send your api_hash. I'll delete the message right away.",
           "Теперь пришли api_hash. Сообщение сразу удалю.",
         );
-  return ctx.flows.screen(st, text, [
-    [ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)],
-  ]);
+  return ctx.flows.screen(st, [head, ask, cancelLine(ctx)].join("\n\n"));
 }
 
 export default {
@@ -309,11 +294,10 @@ export default {
         st.awaitText = null;
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             "Credentials are secrets — open a private chat and enter them there.",
             "Ключи — это секрет. Открой личный чат и введи их там.",
-          ),
-          [ctx.backRow(PARENT)],
+          )}\n\n${backLine(ctx)}`,
         );
       }
       st.data.ub = {};
@@ -336,7 +320,7 @@ export default {
         .then(async () => {
           if (ctx.flows.get(st.chatId, st.userId) === st && st.screen === SID) {
             const v = await buildScreen(st, ctx);
-            await ctx.flows.screen(st, v.text, v.rows);
+            await ctx.flows.screen(st, v.text);
           }
         })
         .catch(async () => {
@@ -344,29 +328,31 @@ export default {
           if (ctx.flows.get(st.chatId, st.userId) === st && st.screen === SID) {
             await ctx.flows.screen(
               st,
-              ctx.tr(
-                "🧪 Beta\n\nSetup failed. Check the service logs, then try again.",
-                "🧪 Бета\n\nНастройка завершилась с ошибкой. Проверь логи сервиса и повтори.",
-              ),
               [
-                [
-                  ctx.btn(
-                    ctx.tr("Try again", "Повторить"),
-                    `iva_menu:${SID}:do:setup`,
-                  ),
-                ],
-                ctx.backRow(PARENT),
-              ],
+                `# ${ctx.tr("🧪 Beta", "🧪 Бета")}`,
+                ctx.tr(
+                  "Setup failed. Check the service logs, then try again.",
+                  "Настройка завершилась с ошибкой. Проверь логи сервиса и повтори.",
+                ),
+                `${button(ctx.tr("Try again", "Повторить"), `iva_menu:${SID}:do:setup`)} — ${ctx.tr(
+                  "run the proxy setup again.",
+                  "запустить настройку прокси заново.",
+                )}`,
+                backLine(ctx),
+              ].join("\n\n"),
             );
           }
         });
       return ctx.flows.screen(
         st,
-        ctx.tr(
-          "🧪 Beta\n\n◇ Setting up the userbot proxy…",
-          "🧪 Бета\n\n◇ Собираю userbot-прокси…",
-        ),
-        [ctx.backRow(PARENT)],
+        [
+          `# ${ctx.tr("🧪 Beta", "🧪 Бета")}`,
+          ctx.tr(
+            "◇ Setting up the userbot proxy…",
+            "◇ Собираю userbot-прокси…",
+          ),
+          backLine(ctx),
+        ].join("\n\n"),
       );
     }
 
@@ -391,11 +377,10 @@ export default {
         if (!/^\d+$/.test(value)) {
           return ctx.flows.screen(
             st,
-            ctx.tr(
+            `${ctx.tr(
               "api_id must be a number. Send it again or cancel.",
               "api_id должен быть числом. Пришли ещё раз или отмени.",
-            ),
-            [[ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)]],
+            )}\n\n${cancelLine(ctx)}`,
           );
         }
         st.data.ub = { apiId: value };
@@ -405,11 +390,10 @@ export default {
       if (!/^\S{8,}$/.test(value)) {
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             "That doesn't look like an api_hash. Send it again or cancel.",
             "Это не похоже на api_hash. Пришли ещё раз или отмени.",
-          ),
-          [[ctx.btn(ctx.tr("Cancel", "Отмена"), `iva_menu:${SID}:o`)]],
+          )}\n\n${cancelLine(ctx)}`,
         );
       }
       const apiId = st.data.ub?.apiId;
@@ -423,11 +407,10 @@ export default {
       } catch (error) {
         return ctx.flows.screen(
           st,
-          ctx.tr(
+          `${ctx.tr(
             `Couldn't write .env: ${String(errorMessage(error))}`,
             `Не удалось записать .env: ${String(errorMessage(error))}`,
-          ),
-          [ctx.backRow(PARENT)],
+          )}\n\n${backLine(ctx)}`,
         );
       }
       // Ключи есть — экран покажет [Включить].

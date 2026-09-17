@@ -4,18 +4,13 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const PER_PAGE = 8;
+import { button, buttonRow, escapeRichText } from "./buttons.ts";
 
-interface MenuButton {
-  text: string;
-  callback_data: string;
-}
+const PER_PAGE = 8;
 
 interface SkillsContext {
   deps: { root: string };
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => MenuButton;
-  backRow: (screenId: string) => MenuButton[];
 }
 
 interface SkillsState {
@@ -49,6 +44,13 @@ function displayText(value: unknown, fallback: string): string {
   return String(value);
 }
 
+function backLine(T: (en: string, ru: string) => string) {
+  return `${button(T("‹ Menu", "‹ Меню"), "iva_menu:r:o")} — ${T(
+    "back to the settings.",
+    "вернуться в настройки.",
+  )}`;
+}
+
 export default {
   parent: "r",
   render(st: SkillsState, ctx: SkillsContext) {
@@ -65,20 +67,23 @@ export default {
     }
     if (skills === null) {
       return {
-        text: T(
-          "🧩 Skills\n\nSkill list is unavailable — .eve/agent-summary.json not found (it appears after a build).",
-          "🧩 Скиллы\n\nСписок недоступен — .eve/agent-summary.json не найден (появляется после сборки).",
-        ),
-        rows: [ctx.backRow("r")],
+        text: [
+          `# ${T("🧩 Skills", "🧩 Скиллы")}`,
+          T(
+            "Skill list is unavailable — .eve/agent-summary.json not found (it appears after a build).",
+            "Список недоступен — .eve/agent-summary.json не найден (появляется после сборки).",
+          ),
+          backLine(T),
+        ].join("\n\n"),
       };
     }
     if (skills.length === 0) {
       return {
-        text: T(
-          "🧩 Skills\n\nNo skills registered.",
-          "🧩 Скиллы\n\nСкиллов не зарегистрировано.",
-        ),
-        rows: [ctx.backRow("r")],
+        text: [
+          `# ${T("🧩 Skills", "🧩 Скиллы")}`,
+          T("No skills registered.", "Скиллов не зарегистрировано."),
+          backLine(T),
+        ].join("\n\n"),
       };
     }
     const pages = Math.ceil(skills.length / PER_PAGE);
@@ -88,30 +93,34 @@ export default {
       .slice(page * PER_PAGE, page * PER_PAGE + PER_PAGE)
       .map((value) => {
         const skill = skillFrom(value);
-        const name = displayText(skill.name, "?");
-        const desc = displayText(skill.description, "")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 60);
+        const name = escapeRichText(displayText(skill.name, "?"));
+        const desc = escapeRichText(
+          displayText(skill.description, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 60),
+        );
         return `• ${name}${desc ? ` — ${desc}` : ""}`;
       })
       .join("\n");
-    const rows: MenuButton[][] = [];
+    const lines = [
+      `# ${T(`🧩 Skills (${skills.length})`, `🧩 Скиллы (${skills.length})`)}`,
+      body,
+    ];
     if (pages > 1) {
-      rows.push([
-        ctx.btn("‹", `iva_menu:sk:pg:${page > 0 ? page - 1 : 0}`),
-        ctx.btn(`${page + 1}/${pages}`, `iva_menu:sk:pg:${page}`),
-        ctx.btn(
-          "›",
-          `iva_menu:sk:pg:${page < pages - 1 ? page + 1 : pages - 1}`,
-        ),
-      ]);
+      lines.push(
+        buttonRow([
+          button("‹", `iva_menu:sk:pg:${page > 0 ? page - 1 : 0}`),
+          button(`${page + 1}/${pages}`, `iva_menu:sk:pg:${page}`),
+          button(
+            "›",
+            `iva_menu:sk:pg:${page < pages - 1 ? page + 1 : pages - 1}`,
+          ),
+        ]),
+      );
     }
-    rows.push(ctx.backRow("r"));
-    return {
-      text: `${T(`🧩 Skills (${skills.length})`, `🧩 Скиллы (${skills.length})`)}\n\n${body}`,
-      rows,
-    };
+    lines.push(backLine(T));
+    return { text: lines.join("\n\n") };
   },
   on(...args: unknown[]) {
     void args;

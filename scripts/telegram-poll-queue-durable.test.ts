@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { parseOffsetFile } from "./lib/offset-store.ts";
 import {
   normalizeQueueDocument,
@@ -130,14 +130,52 @@ function ownedUpdates(result: Pick<HarnessResult, "inbox" | "queue">) {
   ];
 }
 
-async function waitForFile(file: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+async function waitForFile(
+  file: string,
+  child: ChildProcess,
+  stderr: () => string,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (existsSync(file)) return;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      assert.fail(
+        `child exited before ${file} (code ${String(child.exitCode)}, signal ${String(child.signalCode)})\nstderr:\n${stderr()}`,
+      );
+    }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
   }
-  assert.fail(`timed out waiting for ${file}`);
+  assert.fail(
+    `timed out after ${timeoutMs} ms waiting for ${file}\nstderr:\n${stderr()}`,
+  );
 }
+
+test("waitForFile reports a child that died before its ready file", async (t: TestContext) => {
+  const dataDir = makeDataDir(t, "wait-dead-child");
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      "process.stderr.write('harness died before ready\\n'); process.exit(3)",
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  await assert.rejects(
+    waitForFile(join(dataDir, "never-ready"), child, () => stderr),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /exited before/u);
+      assert.match(error.message, /harness died before ready/u);
+      return true;
+    },
+  );
+});
 
 test("direct queue runtime forwards an immutable session target", async () => {
   const requests: ResetRequest[] = [];
@@ -362,7 +400,7 @@ test("SIGKILL after offset ownership preserves every burst part for restart", as
       child.kill("SIGKILL");
   });
 
-  await waitForFile(join(dataDir, "ownership-ready"));
+  await waitForFile(join(dataDir, "ownership-ready"), child, () => stderr);
   const childExit = new Promise<{
     code: number | null;
     signal: NodeJS.Signals | null;
@@ -684,8 +722,10 @@ test("an allowed callback without a stable ingress key fails closed", (t: TestCo
   const dataDir = makeDataDir(t, "unownable-callback");
   const result = runHarness("unownable-callback", dataDir);
 
-  assert.deepEqual(result.requestedOffsets, [100, 100]);
-  assert.deepEqual(result.offset, { offset: 100 });
+  // Неопознаваемый апдейт подтверждается и не блокирует offset навсегда (H2, main
+  // cefd33f): «fails closed» здесь про доставку — она пустая, а не про замерший вход.
+  assert.deepEqual(result.requestedOffsets, [100, 102]);
+  assert.deepEqual(result.offset, { offset: 102 });
   assert.deepEqual(result.deliveries, []);
   assert.deepEqual(ownedUpdates(result), []);
 });
@@ -718,7 +758,11 @@ test("SIGKILL after callback rejection preserves it for restart delivery", async
     }
   });
 
-  await waitForFile(join(dataDir, "callback-rejected-ready"));
+  await waitForFile(
+    join(dataDir, "callback-rejected-ready"),
+    child,
+    () => stderr,
+  );
   const childExit = new Promise<{
     code: number | null;
     signal: NodeJS.Signals | null;
@@ -794,7 +838,11 @@ test("SIGKILL after core synthetic ownership replays distillation text", async (
     }
   });
 
-  await waitForFile(join(dataDir, "core-distill-ownership-ready"));
+  await waitForFile(
+    join(dataDir, "core-distill-ownership-ready"),
+    child,
+    () => stderr,
+  );
   child.kill("SIGKILL");
   assert.deepEqual(await childExit, { code: null, signal: "SIGKILL" }, stderr);
 
@@ -894,7 +942,11 @@ test("SIGKILL after first core synthetic EIO reconstructs distillation from the 
     }
   });
 
-  await waitForFile(join(dataDir, "core-distill-eio-ready"));
+  await waitForFile(
+    join(dataDir, "core-distill-eio-ready"),
+    child,
+    () => stderr,
+  );
   child.kill("SIGKILL");
   assert.deepEqual(await childExit, { code: null, signal: "SIGKILL" }, stderr);
   assert.deepEqual(

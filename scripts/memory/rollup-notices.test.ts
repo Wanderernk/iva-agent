@@ -70,7 +70,7 @@ test("the run reads the traces of past runs before it leaves its own", () => {
   // прогон оставит свой собственный. Прочитанный после, он был бы true у всех.
   assert.match(
     source,
-    /const RAN_BEFORE = rollupRanBefore\(DATA_DIR, VAULT\);/u,
+    /const RAN_BEFORE = rollupRanBefore\(DATA_DIR, VAULT\(\)\);/u,
   );
   assert.ok(
     source.indexOf("const RAN_BEFORE") < source.indexOf("saveSession("),
@@ -88,30 +88,31 @@ test("the delivery half of the prompt is the one that carries the language", () 
   assert.match(source, /no H1\/H2 headings/u);
 });
 
-test("the red line in the instructions exempts both scheduled senders", () => {
-  // Красный блок системных инструкций говорит, что отчёт — обычный ответ хода: отправку
-  // делает код Outbox. В плановых ходах отправку тоже делает код, но другой, и без явного
-  // исключения модель считает своим ответом уже отправленный текст — владелец получает
+test("the delivery rule names every scheduled sender", () => {
+  // Блок доставки системных инструкций говорит, что отчёт — обычный ответ хода: отправку
+  // делает код Outbox. В плановых ходах финальный текст тоже доставляет код, и они названы
+  // прямо: без этого модель считает отправленным уже готовый текст, и владелец получает
   // второе сообщение мимо кода доставки.
   const instructions = readFileSync(
     join(ROOT, "agent/instructions.md"),
     "utf8",
   );
-  const red = instructions.slice(0, instructions.indexOf("\nYou are **Iva**"));
-  assert.match(red, /ordinary turn reply/u);
-  // Транспорт мимо Outbox из обязательного пути убран: он же обход outbound-гейта.
-  assert.doesNotMatch(red, /only rich message/iu);
-  assert.match(red, /Never send a reply to the current chat yourself/u);
-  const at = red.indexOf("Exception");
-  assert.notEqual(at, -1, "the red line must carry an exception at all");
-  const exception = red.slice(at);
-  assert.match(exception, /final text of the turn/u);
-  assert.match(exception, /forbidden/u);
-  // Оба хода названы В САМОМ исключении, одним предложением: упоминание дайджеста рядом —
-  // например во фразе «дайджест из чата — обычный ход» — этому не удовлетворяет.
+  const start = instructions.indexOf("## Delivery");
+  assert.notEqual(start, -1, "the delivery block must stay in the persona");
+  const end = instructions.indexOf("\n## ", start + 1);
+  const delivery = instructions.slice(start, end === -1 ? undefined : end);
+  assert.match(delivery, /ordinary turn reply/u);
+  // Транспорт мимо Outbox убран: он же обход outbound-гейта.
+  assert.doesNotMatch(delivery, /only rich message/iu);
+  assert.match(delivery, /Never send to the current chat yourself/u);
+  // Все три плановых хода названы одним предложением: это и есть исключение из
+  // «никогда не слать самой».
   assert.match(
-    exception,
-    /There are two:[^.]*rollup[^.]*morning\s+digest/u,
-    "the exception itself must name the nightly rollup and the scheduled digest",
+    delivery,
+    /Scheduled turns \([^)]*nightly memory[^)]*morning digest[^)]*remind/u,
+    "the delivery rule must name the nightly memory pass, the morning digest and the reminder turn",
   );
+  assert.match(delivery, /deliver the final text/u);
+  // Режимов доставки в персоне нет: путь один — код шлёт текст в срок и будит агента.
+  assert.doesNotMatch(instructions, /verbatim|mode:/iu);
 });

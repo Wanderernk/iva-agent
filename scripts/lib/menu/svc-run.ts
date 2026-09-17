@@ -1,12 +1,11 @@
-// Раннер экрана «Обслуживание» (svc): один долгий процесс на мост + живой прогресс
-// анимированным custom emoji в сообщении меню. Спека: notes/specs/2026-07-25-menu-service-design.md (вне публичного дерева, см. историю git).
+// Раннер экрана «Обслуживание» (svc): один долгий процесс на мост + живой прогресс в том же
+// сообщении меню. Спека: notes/specs/2026-07-25-menu-service-design.md (вне публичного дерева, см. историю git).
 //
 // - spawn-команды (доктор, чистка) живут в cgroup моста — рестарт моста честно убивает их;
 // - ночной цикл — штатный oneshot-юнит: старт --no-block, статус поллингом is-active
 //   (activating → inactive|failed), переживает рестарт моста, отмена = systemctl stop;
-// - custom emoji анимируется клиентом сам: редактируем не чаще tickMs и только при смене
-//   payload; 400 от Telegram (владелец без Premium) — одноразовый даунгрейд на fallback
-//   (паттерн editActive из scripts/lib/telegram-status.ts).
+// - тикер только собирает markdown и отдаёт его движку через opts.edit (flows.screen):
+//   своей дороги в Telegram у экрана нет, кнопка отмены живёт строкой в тексте.
 import {
   spawn,
   execFile,
@@ -14,14 +13,12 @@ import {
   type ExecFileOptions,
 } from "node:child_process";
 
-// Лоадеры из t.me/addemoji/iconemoji1 — набор /update (🔺) и working-status
-// (💬). Не переводы.
+// Лоадер: своим цветом помечает, какая команда бежит. Не перевод.
 export const LOADERS = {
-  doc: { alt: "🔄", id: "5888544366342967214", fallback: "◇" },
-  cln: { alt: "🟢", id: "5818812952362356039", fallback: "◇" },
-  mem: { alt: "🟡", id: "5947553854030614234", fallback: "◇" },
+  doc: { alt: "🔄" },
+  cln: { alt: "🟢" },
+  mem: { alt: "🟡" },
 };
-
 export const TIMEOUT_MS = { doc: 600_000, cln: 1_800_000, mem: 3_600_000 };
 const TICK_MS = 3_000;
 const POLL_MS = 3_000;
@@ -30,38 +27,16 @@ const TAIL_LINES = 40;
 type ServiceCommand = keyof typeof TIMEOUT_MS;
 type RunStatus = "running" | "failed" | "cancelled" | "timeout" | "done";
 
-interface Loader {
-  alt: string;
-  id: string;
-  fallback: string;
-}
-
-interface MenuButton {
-  text: string;
-  callback_data: string;
-}
-
 interface ProgressView {
   text: string;
-  rows?: MenuButton[][];
 }
-
-interface TelegramResponse {
-  ok?: boolean;
-  error_code?: number;
-  description?: string;
-}
-
-type TelegramClient = (
-  method: string,
-  body: Record<string, unknown>,
-) => Promise<TelegramResponse>;
 
 export interface RunOptions {
-  tg: TelegramClient;
+  // Единственная дорога к сообщению — движок: он правит rich-текст в st.msgId
+  // (flows.screen) и сам разбирается с «message is not modified» и протухшим сообщением.
+  edit: (markdown: string) => Promise<unknown>;
   chatId: number | string;
   messageId: number;
-  loader: Loader;
   attached?: () => boolean;
   progressView: (run: ServiceRun) => ProgressView;
   onFinish?: (run: ServiceRun) => void | Promise<void>;
@@ -97,7 +72,6 @@ export interface ServiceRun {
   _timer: NodeJS.Timeout | null;
   _kill: (() => void) | null;
 }
-
 type ExecFileCallback = (
   error: (Error & { code?: string | number | null }) | null,
   stdout: string | Buffer,
@@ -117,12 +91,10 @@ function errorMessage(error: unknown): string {
 }
 
 let RUN: ServiceRun | null = null; // единственный запуск на мост
-let customEmojiOk = true; // глобальный даунгрейд после первого 400
 
 export const currentRun = () => RUN;
 export function resetForTests() {
   RUN = null;
-  customEmojiOk = true;
 }
 
 export function stripAnsi(s: unknown): string {
@@ -186,41 +158,16 @@ function pushLines(
   }
 }
 
-// Эдит с custom_emoji entity; «not modified» = успех; 400 — даунгрейд и повтор с fallback.
-async function editRich(
+// Эдит прогресса: markdown уже собран экраном (кнопка отмены — строкой в тексте),
+// тикер только отсеивает повторы и отдаёт его движку.
+async function editProgress(
   opts: RunOptions,
   run: ServiceRun,
-  text: string,
-  rows: MenuButton[][] | undefined,
+  markdown: string,
 ): Promise<void> {
-  const reply_markup = rows ? { inline_keyboard: rows } : undefined;
-  const payload = JSON.stringify([text, rows, customEmojiOk]);
-  if (run._edit.lastPayload === payload) return;
-  run._edit.lastPayload = payload;
-  const base = { chat_id: run.chatId, message_id: run.messageId, reply_markup };
-  if (customEmojiOk) {
-    const L = opts.loader;
-    const r = await opts
-      .tg("editMessageText", {
-        ...base,
-        text: `${L.alt} ${text}`,
-        entities: [
-          {
-            type: "custom_emoji",
-            offset: 0,
-            length: L.alt.length,
-            custom_emoji_id: L.id,
-          },
-        ],
-      })
-      .catch((): TelegramResponse => ({ ok: false }));
-    if (r.ok || /not modified/i.test(r.description || "")) return;
-    if (r.error_code !== 400) return;
-    customEmojiOk = false;
-  }
-  await opts
-    .tg("editMessageText", { ...base, text: `${opts.loader.fallback} ${text}` })
-    .catch(() => {});
+  if (run._edit.lastPayload === markdown) return;
+  run._edit.lastPayload = markdown;
+  await opts.edit(markdown).catch(() => {});
 }
 
 function startTicker(run: ServiceRun, opts: RunOptions): void {
@@ -231,7 +178,7 @@ function startTicker(run: ServiceRun, opts: RunOptions): void {
     }
     if (opts.attached && !opts.attached()) return; // юзер ушёл с экрана — не дерёмся за сообщение
     const v = opts.progressView(run);
-    await editRich(opts, run, v.text, v.rows);
+    await editProgress(opts, run, v.text);
   };
   run._timer = setInterval(() => {
     void tick();

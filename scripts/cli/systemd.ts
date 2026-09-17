@@ -26,6 +26,7 @@ import {
 } from "../lib/systemd-control.ts";
 import { resolveTimeZone, validateTimeZone } from "../lib/timezone.ts";
 import type { createCliRuntime } from "./runtime.ts";
+import { resolveVaultDir } from "../../packages/vault-dir/index.ts";
 
 type CliRuntime = ReturnType<typeof createCliRuntime>;
 
@@ -200,8 +201,7 @@ export function createCliSystemd(runtime: CliRuntime) {
     }
     // Стор воркфлоу несёт транскрипты диалогов, vault — саму память; оба старше UMask-фикса
     // могли быть созданы world-readable. chmod только верхнего уровня (закрывает traversal).
-    const vaultRel = readEnv().ASSISTANT_VAULT_DIR || "vault";
-    const vaultDir = vaultRel.startsWith("/") ? vaultRel : join(ROOT, vaultRel);
+    const vaultDir = resolveVaultDir(ROOT, readEnv().ASSISTANT_VAULT_DIR);
     for (const path of [
       join(ROOT, ".eve"),
       join(ROOT, ".workflow-data"),

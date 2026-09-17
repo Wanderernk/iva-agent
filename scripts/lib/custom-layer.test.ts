@@ -10,6 +10,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -21,7 +23,6 @@ import { fileURLToPath } from "node:url";
 import {
   captureCustomLayer,
   commitCustomLayer,
-  ensureCustomRecoveryBundle,
   isAuthoredPath,
   materializeCustomLayer,
   readCustomManifest,
@@ -63,6 +64,7 @@ function fixture(t: TestContext): {
     "agent/instructions.md",
     "tone: stock\nkeep-a\nkeep-b\ncore: stock\n",
   );
+  write(root, "agent/instructions/10-map.md", "map: stock\n");
   write(root, "agent/skills/stock/SKILL.md", "stock skill\n");
   write(root, "agent/tools/stock.ts", "export default 'stock';\n");
   write(
@@ -117,6 +119,8 @@ function fixture(t: TestContext): {
 test("authored path policy is narrow and traversal-safe", () => {
   for (const path of [
     "agent/instructions.md",
+    "agent/instructions/20-core.ts",
+    "agent/instructions/rules.md",
     "agent/skills/my-skill/SKILL.md",
     "agent/connections/calendar.ts",
     "agent/tools/my-tool.ts",
@@ -125,7 +129,7 @@ test("authored path policy is narrow and traversal-safe", () => {
     assert.equal(isAuthoredPath(path), true, path);
 
   for (const path of [
-    "agent/instructions/20-core.ts",
+    "agent/instructions/../agent.ts",
     "agent/schedules/digest.ts",
     "agent/agent.ts",
     "package.json",
@@ -409,48 +413,6 @@ test("an upstream conflict resolution replaces the canonical local copy", (t) =>
   );
 });
 
-test("a failed custom build keeps the canonical local side intact", (t) => {
-  const { root, dataDir, base, stash } = fixture(t);
-  captureCustomLayer({
-    root,
-    dataDir,
-    baseRevision: base,
-    stashRevision: stash,
-  });
-  write(
-    root,
-    "agent/instructions.md",
-    "tone: stock\nkeep-a\nkeep-b\ncore: upstream\n",
-  );
-  const result = materializeCustomLayer({
-    root,
-    dataDir,
-    targetRevision: "5".repeat(40),
-  });
-
-  ensureCustomRecoveryBundle({
-    result,
-    root,
-    targetRevision: "5".repeat(40),
-    reason: "custom-build-failed",
-  });
-  commitCustomLayer(result);
-
-  assert.equal(
-    readFileSync(join(dataDir, "custom/agent/instructions.md"), "utf8"),
-    "tone: mine\nkeep-a\nkeep-b\ncore: stock\n",
-  );
-  assert.throws(
-    () =>
-      resolveCustomConflict({
-        dataDir,
-        path: "agent/instructions.md",
-        side: "edited",
-      }),
-    /edit the canonical customization/u,
-  );
-});
-
 test("a tombstone conflicts safely when upstream changes the deleted file", (t) => {
   const { root, dataDir, base, stash } = fixture(t);
   captureCustomLayer({
@@ -545,11 +507,10 @@ test("the public build falls back to core when Git metadata is unavailable", (t)
   cpSync(join(PROJECT_ROOT, "scripts/lib"), join(root, "scripts/lib"), {
     recursive: true,
   });
-  cpSync(
-    join(PROJECT_ROOT, "packages/data-dir"),
-    join(root, "packages/data-dir"),
-    { recursive: true },
-  );
+  for (const name of ["data-dir", "vault-dir"])
+    cpSync(join(PROJECT_ROOT, "packages", name), join(root, "packages", name), {
+      recursive: true,
+    });
   symlinkSync(
     join(PROJECT_ROOT, "node_modules"),
     join(root, "node_modules"),
@@ -608,4 +569,173 @@ test("the recovery CLI reports resolve failures as JSON", (t) => {
     error: "not an authored path: ../outside",
   });
   assert.equal(result.stderr, "");
+});
+
+test("a markdown rule file in the slot is live, not built", (t) => {
+  const { root, dataDir, base } = fixture(t);
+  mkdirSync(join(dataDir, "custom/agent/instructions"), { recursive: true });
+  captureCustomLayer({ root, dataDir, baseRevision: base });
+  assert.deepEqual(readCustomManifest(dataDir).entries, {});
+
+  write(dataDir, "custom/agent/instructions/rules.md", "rules: mine\n");
+  write(dataDir, "custom/agent/instructions/30-mine.ts", "export default 1;\n");
+  captureCustomLayer({ root, dataDir, baseRevision: base });
+  const entry =
+    readCustomManifest(dataDir).entries["agent/instructions/rules.md"];
+  assert.equal(entry?.originSha256, null);
+  assert.equal(entry?.tombstone, false);
+  assert.equal(entry?.localSha256?.length, 64);
+
+  const result = materializeCustomLayer({
+    root,
+    dataDir,
+    targetRevision: "6".repeat(40),
+    now: new Date("2026-09-12T06:07:08.000Z"),
+  });
+
+  assert.deepEqual(result.conflicts, []);
+  // Markdown-правила читает с диска agent/instructions/30-owner-rules.ts: в дереве сборки
+  // и в runtime их нет, иначе текст правила попал бы в промпт дважды.
+  assert.equal(existsSync(join(root, "agent/instructions/rules.md")), false);
+  assert.equal(
+    existsSync(join(result.runtimeRoot, "agent/instructions/rules.md")),
+    false,
+  );
+  // Файл слота с кодом по-прежнему идёт через сборку.
+  assert.equal(
+    readFileSync(join(root, "agent/instructions/30-mine.ts"), "utf8"),
+    "export default 1;\n",
+  );
+  assert.equal(
+    readFileSync(
+      join(result.runtimeRoot, "agent/instructions/30-mine.ts"),
+      "utf8",
+    ),
+    "export default 1;\n",
+  );
+  assert.equal(
+    readFileSync(join(root, "agent/instructions/10-map.md"), "utf8"),
+    "map: stock\n",
+  );
+  assert.equal(
+    readFileSync(join(root, "agent/instructions.md"), "utf8"),
+    "tone: stock\nkeep-a\nkeep-b\ncore: stock\n",
+  );
+
+  commitCustomLayer(result);
+  assert.equal(
+    readFileSync(join(dataDir, "custom/agent/instructions/rules.md"), "utf8"),
+    "rules: mine\n",
+  );
+});
+
+test("a slot file that takes a bundled name is refused, not merged", (t) => {
+  const { root, dataDir, base } = fixture(t);
+  write(dataDir, "custom/agent/instructions/10-map.md", "map: mine\n");
+
+  assert.throws(
+    () => captureCustomLayer({ root, dataDir, baseRevision: base }),
+    /collides with a bundled file: agent\/instructions\/10-map\.md/u,
+  );
+  assert.equal(existsSync(join(dataDir, "custom/manifest.json")), false);
+  assert.equal(
+    readFileSync(join(root, "agent/instructions/10-map.md"), "utf8"),
+    "map: stock\n",
+  );
+
+  rmSync(join(dataDir, "custom/agent/instructions/10-map.md"));
+  write(dataDir, "custom/agent/instructions/rules.md", "rules: mine\n");
+  captureCustomLayer({ root, dataDir, baseRevision: base });
+  write(root, "agent/instructions/rules.md", "rules: upstream\n");
+
+  assert.throws(
+    () =>
+      materializeCustomLayer({
+        root,
+        dataDir,
+        targetRevision: "7".repeat(40),
+      }),
+    /agent\/instructions\/rules\.md/u,
+  );
+  assert.equal(
+    readFileSync(join(dataDir, "custom/agent/instructions/rules.md"), "utf8"),
+    "rules: mine\n",
+  );
+  assert.deepEqual(
+    readdirSync(join(dataDir, "custom")).filter((name) =>
+      name.startsWith(".pending-"),
+    ),
+    [],
+  );
+});
+
+test("a slot file renamed out of a collision leaves nothing under the taken name", (t) => {
+  const { root, dataDir, base } = fixture(t);
+  write(
+    dataDir,
+    "custom/agent/instructions/rules.ts",
+    "export const rules = 1;\n",
+  );
+  captureCustomLayer({ root, dataDir, baseRevision: base });
+  write(root, "agent/instructions/rules.ts", "export const rules = 2;\n");
+  assert.throws(
+    () =>
+      materializeCustomLayer({
+        root,
+        dataDir,
+        targetRevision: "8".repeat(40),
+      }),
+    /agent\/instructions\/rules\.ts/u,
+  );
+
+  // Владелец делает ровно то, что просит текст отказа: переименовывает свой файл.
+  renameSync(
+    join(dataDir, "custom/agent/instructions/rules.ts"),
+    join(dataDir, "custom/agent/instructions/my-rules.ts"),
+  );
+  captureCustomLayer({ root, dataDir, baseRevision: base });
+  commitCustomLayer(
+    materializeCustomLayer({
+      root,
+      dataDir,
+      targetRevision: "8".repeat(40),
+    }),
+  );
+
+  assert.equal(
+    existsSync(join(dataDir, "custom/agent/instructions/rules.ts")),
+    false,
+  );
+  assert.equal(
+    readFileSync(
+      join(dataDir, "custom/agent/instructions/my-rules.ts"),
+      "utf8",
+    ),
+    "export const rules = 1;\n",
+  );
+  assert.equal(
+    readCustomManifest(dataDir).entries["agent/instructions/rules.ts"],
+    undefined,
+  );
+  assert.equal(
+    readFileSync(join(root, "agent/instructions/rules.ts"), "utf8"),
+    "export const rules = 2;\n",
+  );
+
+  // Живая сборка начинает с чистой копии ревизии (scripts/build.ts), поэтому файл,
+  // который слой положил в дерево, к следующему проходу там не лежит.
+  rmSync(join(root, "agent/instructions/my-rules.ts"));
+  // Следующая сборка без единой правки владельца обязана пройти.
+  captureCustomLayer({ root, dataDir, baseRevision: base });
+  commitCustomLayer(
+    materializeCustomLayer({
+      root,
+      dataDir,
+      targetRevision: "8".repeat(40),
+    }),
+  );
+  assert.equal(
+    existsSync(join(dataDir, "custom/agent/instructions/rules.ts")),
+    false,
+  );
 });

@@ -199,7 +199,7 @@ void test("telegram-send fails an empty report without calling Telegram", async 
     assert.deepEqual(result, {
       ok: false,
       fellBack: false,
-      error: "empty report",
+      error: "nothing delivered: empty rendering",
     });
   }
   assert.deepEqual(requests, []);

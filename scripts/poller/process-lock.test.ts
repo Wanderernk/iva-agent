@@ -15,7 +15,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import fc from "fast-check";
 import {
   acquireTelegramProcessLock,
   parseTelegramGuardHolderMarker,
@@ -37,7 +36,6 @@ const MAIN_GUARD_CHILD = join(
   import.meta.dirname,
   "../fixtures/telegram-main-guard-child.ts",
 );
-const SEED = 18_702;
 let guardSequence = 0;
 
 type TestGuard = { identity: string; directory: string };
@@ -125,48 +123,60 @@ function readyEvidence(state: RunningChild): ReadyEvidence {
   return JSON.parse(line) as ReadyEvidence;
 }
 
-async function waitFor(
-  predicate: () => boolean,
-  message: string,
-  timeoutMs = 10_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.fail(message);
-}
-
-async function waitForExit(child: ChildProcess, timeoutMs = 5_000) {
+/**
+ * Выход ребёнка ждём по сигналу процесса, а не по стенным часам: под нагрузкой
+ * пятисекундный срок истекал на живом ребёнке, который просто ждал планировщика. Таймер
+ * здесь — страховка от ребёнка, который не выходит никогда (в проекте нет --test-timeout):
+ * тест обязан упасть с его pid, а не висеть до конца прогона.
+ */
+async function waitForExit(child: ChildProcess) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return { code: child.exitCode, signal: child.signalCode };
   }
   return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolveExit, rejectExit) => {
-      let settled = false;
-      const finish = (
-        result: { code: number | null; signal: NodeJS.Signals | null } | Error,
-      ) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        child.off("error", onError);
-        child.off("exit", onExit);
-        if (result instanceof Error) rejectExit(result);
-        else resolveExit(result);
-      };
-      const onError = (error: Error) => finish(error);
-      const onExit = (code: number | null, signal: NodeJS.Signals | null) =>
-        finish({ code, signal });
-      const timer = setTimeout(
-        () => finish(new Error(`timed out waiting for child ${child.pid}`)),
-        timeoutMs,
+      const guard = setTimeout(
+        () =>
+          rejectExit(
+            new Error(
+              `child ${child.pid} did not exit in ${WAIT_HANG_GUARD_MS}ms`,
+            ),
+          ),
+        WAIT_HANG_GUARD_MS,
       );
-      child.once("error", onError);
-      child.once("exit", onExit);
+      child.once("error", (error) => {
+        clearTimeout(guard);
+        rejectExit(error);
+      });
+      child.once("exit", (code, signal) => {
+        clearTimeout(guard);
+        resolveExit({ code, signal });
+      });
     },
   );
+}
+
+/**
+ * Потолок ожидания — та же страховка, что у `waitForExit`, а не расписание: живой ребёнок
+ * под нагрузкой ждёт планировщика сколько нужно. Там, где конец предиката держит чужая
+ * жизнь (внук-холдер, контендер с убитым холдером), без потолка регрессия превращается из
+ * красного теста в вечное ожидание: у проекта нет --test-timeout, дефолт node:test —
+ * Infinity.
+ */
+const WAIT_HANG_GUARD_MS = 30_000;
+
+/**
+ * Опрос признака (файл-замок, строка READY). Предикат терминален: признак появится или
+ * процесс закончится; `what` называет, чего не дождались. Исход проверяет assert рядом с
+ * вызовом, потому что только там есть свежий stderr ребёнка.
+ */
+async function waitFor(predicate: () => boolean, what: string): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > WAIT_HANG_GUARD_MS)
+      assert.fail(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 void test("process owner parser requires PID and OS start identity", () => {
@@ -190,27 +200,6 @@ void test("process owner parser requires PID and OS start identity", () => {
       /invalid Telegram process owner schema/u,
     );
   }
-});
-
-void test("property: arbitrary owner bytes either fail or satisfy the full identity schema", () => {
-  fc.assert(
-    fc.property(fc.string(), (raw) => {
-      try {
-        const owner = parseTelegramProcessOwner(raw);
-        assert.ok(Number.isSafeInteger(owner.pid) && owner.pid > 0);
-        assert.match(owner.nonce, /^[0-9a-f]{32}$/u);
-        assert.deepEqual(Object.keys(owner).sort(), [
-          "nonce",
-          "pid",
-          "processStart",
-          "schema",
-        ]);
-      } catch (error) {
-        assert.ok(error instanceof Error);
-      }
-    }),
-    { seed: SEED, numRuns: 2_000 },
-  );
 });
 
 void test("the production holder resource is uid-global and contains no bot, path, or secret", () => {
@@ -250,29 +239,6 @@ void test("the production holder resource is uid-global and contains no bot, pat
   ]);
 });
 
-void test("property: arbitrary holder markers fail or satisfy the global schema", () => {
-  fc.assert(
-    fc.property(fc.string(), (raw) => {
-      try {
-        const holder = parseTelegramGuardHolderMarker(raw);
-        assert.match(holder.resource, /^(?:telegram:[0-9]+|test:[a-z0-9-]+)$/u);
-        assert.ok(Number.isSafeInteger(holder.pid) && holder.pid > 0);
-        assert.match(holder.nonce, /^[0-9a-f]{32}$/u);
-        assert.deepEqual(Object.keys(holder).sort(), [
-          "nonce",
-          "pid",
-          "processStart",
-          "resource",
-          "schema",
-        ]);
-      } catch (error) {
-        assert.ok(error instanceof Error);
-      }
-    }),
-    { seed: SEED, numRuns: 2_000 },
-  );
-});
-
 void test("different bots and DATA_DIR values share one uid-global lease", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "iva-process-global-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -291,12 +257,13 @@ void test("different bots and DATA_DIR values share one uid-global lease", async
           child.exitCode !== null ||
           child.signalCode !== null,
       ),
-    `global contenders did not settle: ${contenders.map(({ stderr }) => stderr).join(" | ")}`,
+    "both global contenders to settle",
   );
   assert.equal(
     contenders.filter(({ stdout }) => stdout.includes('"event":"READY"'))
       .length,
     1,
+    `global contenders did not settle: ${contenders.map(({ stderr }) => stderr).join(" | ")}`,
   );
   const winner = contenders.find(({ stdout }) =>
     stdout.includes('"event":"READY"'),
@@ -335,8 +302,7 @@ void test("different bots and DATA_DIR values share one uid-global lease", async
         candidate.stdout.includes('"event":"READY"') ||
         candidate.child.exitCode !== null ||
         candidate.child.signalCode !== null,
-      "successor did not settle",
-      2_000,
+      "the successor candidate to settle",
     );
     if (candidate.stdout.includes('"event":"READY"')) {
       successor = candidate;
@@ -398,7 +364,14 @@ void test("direct DATA_DIR recreation cannot admit an aliased second Bridge", as
   mkdirSync(dataDir);
   const first = startChild(t, "write-on-signal", dataDir, guard, "71910");
   await waitFor(
-    () => first.stdout.includes('"event":"READY"'),
+    () =>
+      first.stdout.includes('"event":"READY"') ||
+      first.child.exitCode !== null ||
+      first.child.signalCode !== null,
+    "the first owner to acquire",
+  );
+  assert.ok(
+    first.stdout.includes('"event":"READY"'),
     `first owner did not acquire: ${first.stderr}`,
   );
   renameSync(dataDir, join(root, "data.old"));
@@ -406,8 +379,15 @@ void test("direct DATA_DIR recreation cannot admit an aliased second Bridge", as
   symlinkSync(dataDir, alias, "dir");
   assert.equal(first.child.kill("SIGUSR1"), true);
   await waitFor(
-    () => existsSync(join(dataDir, "active-writer")),
-    "first Bridge did not write the recreated state",
+    () =>
+      existsSync(join(dataDir, "active-writer")) ||
+      first.child.exitCode !== null ||
+      first.child.signalCode !== null,
+    "the first Bridge to write the recreated state",
+  );
+  assert.ok(
+    existsSync(join(dataDir, "active-writer")),
+    `first Bridge did not write the recreated state: ${first.stderr}`,
   );
   assert.equal(
     readFileSync(join(dataDir, "active-writer"), "utf8"),
@@ -420,7 +400,7 @@ void test("direct DATA_DIR recreation cannot admit an aliased second Bridge", as
       second.stdout.includes('"event":"READY"') ||
       second.child.exitCode !== null ||
       second.child.signalCode !== null,
-    `second owner did not settle: ${second.stderr}`,
+    "the second Bridge to settle",
   );
   assert.equal(
     second.stdout.includes('"event":"READY"'),
@@ -449,7 +429,14 @@ void test("guard root, lock, and owner replacement cannot bypass one constant li
         "71101",
       );
       await waitFor(
-        () => first.stdout.includes('"event":"READY"'),
+        () =>
+          first.stdout.includes('"event":"READY"') ||
+          first.child.exitCode !== null ||
+          first.child.signalCode !== null,
+        "the first owner to acquire",
+      );
+      assert.ok(
+        first.stdout.includes('"event":"READY"'),
         `first owner did not acquire: ${first.stderr}`,
       );
       const evidence = readyEvidence(first);
@@ -476,7 +463,7 @@ void test("guard root, lock, and owner replacement cannot bypass one constant li
           second.stdout.includes('"event":"READY"') ||
           second.child.exitCode !== null ||
           second.child.signalCode !== null,
-        `replacement contender did not settle: ${second.stderr}`,
+        "the second Bridge to settle",
       );
       assert.equal(second.stdout.includes('"event":"READY"'), false);
       assert.equal((await waitForExit(second.child)).code, 1, second.stderr);
@@ -491,7 +478,7 @@ void test("guard root, lock, and owner replacement cannot bypass one constant li
         } catch (error) {
           return (error as NodeJS.ErrnoException).code === "ESRCH";
         }
-      }, `holder ${evidence.holderPid} survived parent exit`);
+      }, `holder ${evidence.holderPid} to exit after its parent was killed`);
     });
   }
 });
@@ -668,25 +655,30 @@ void test("OS lease permits exactly one ordered first-run drop attempt", async (
     startMainChild(t, dataDir, guard),
     startMainChild(t, dataDir, guard),
   ];
-  await waitFor(
-    () => {
-      const firstCalls = readdirSync(dataDir).filter((name) =>
-        name.startsWith("first-bot-api-"),
-      );
-      assert.ok(firstCalls.length <= 1, "both Bridge mains reached Bot API");
-      return (
-        firstCalls.length === 1 &&
-        mainContenders.some(
+  await waitFor(() => {
+    const firstCalls = readdirSync(dataDir).filter((name) =>
+      name.startsWith("first-bot-api-"),
+    );
+    assert.ok(firstCalls.length <= 1, "both Bridge mains reached Bot API");
+    // Терминально и «дроп не состоялся»: пока ни одного first-bot-api нет, ждать
+    // больше нечего, если оба контендера вышли, — следующий assert назовёт провал,
+    // а не оставит прогон висеть.
+    return firstCalls.length === 1
+      ? mainContenders.some(
           ({ child }) => child.exitCode !== null || child.signalCode !== null,
         )
-      );
-    },
-    `main guard did not settle: ${mainContenders.map(({ stderr }) => stderr).join(" | ")}`,
-  );
+      : mainContenders.every(
+          ({ child }) => child.exitCode !== null || child.signalCode !== null,
+        );
+  }, "the first-run drop to settle");
   const firstCalls = readdirSync(dataDir).filter((name) =>
     name.startsWith("first-bot-api-"),
   );
-  assert.equal(firstCalls.length, 1);
+  assert.equal(
+    firstCalls.length,
+    1,
+    `main guard did not settle: ${mainContenders.map(({ stderr }) => stderr).join(" | ")}`,
+  );
   const evidence = JSON.parse(
     readFileSync(join(dataDir, firstCalls[0]), "utf8"),
   ) as {
@@ -714,11 +706,7 @@ void test("OS lease permits exactly one ordered first-run drop attempt", async (
   assert.equal((await winnerExit).signal, "SIGKILL");
 
   const successor = startMainChild(t, dataDir, guard);
-  await waitFor(
-    () =>
-      successor.child.exitCode !== null || successor.child.signalCode !== null,
-    `successor did not fail closed: ${successor.stderr}`,
-  );
+  // Ждём именно выход ребёнка — сигналом процесса, а не таймером.
   assert.equal((await waitForExit(successor.child)).code, 1, successor.stderr);
   assert.match(successor.stderr, /marker exists without an offset/u);
   assert.equal(

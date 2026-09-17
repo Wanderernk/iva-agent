@@ -46,6 +46,7 @@ import {
   sentNotBeforeIso,
 } from "../lib/rollup-stale-cursor.ts";
 import { sendTelegramHtml } from "../lib/telegram-send.ts";
+import { vaultDirOrExit } from "../lib/vault-boundary.ts";
 
 type Period = "daily" | "weekly" | "monthly" | "yearly";
 
@@ -66,7 +67,10 @@ const CHAT = notificationChat();
 // Absolute, like the instructions above: the prompt hands these paths to the model as
 // read_file/write_file targets, and read_file resolves a RELATIVE path against the vault
 // root — a "vault/daily/…" string would come back as vault/vault/daily/… and ENOENT.
-const VAULT = resolve(process.env.ASSISTANT_VAULT_DIR ?? "vault");
+let vaultCache: string | null = null;
+// Лениво: неверная настройка вольта всплывает на первом использовании, где её ловит
+// граница процесса — одна строка причины и код 1, а не стек на импорте модуля.
+const VAULT = (): string => (vaultCache ??= vaultDirOrExit());
 const TZ = resolveTimeZone(process.env.ASSISTANT_TIMEZONE);
 // Format rules and the memory-processor prompts live in the repo, not in the vault: they
 // are product, and must update with it instead of rotting inside every user's vault.
@@ -115,7 +119,7 @@ function buildPrompt(p: Period, now: string): string {
   const prevYear = String(y - 1);
 
   const intro =
-    `You are processing long-term memory (vault: ${VAULT}). It is now ${now} (${TZ}). ` +
+    `You are processing long-term memory (vault: ${VAULT()}). It is now ${now} (${TZ}). ` +
     `Work strictly by the format rules in ${INSTRUCTIONS}/rules/ and the memory-processor ` +
     `instructions in ${INSTRUCTIONS}/memory-processor/. ` +
     `Do not invent facts — take them from the source files. `;
@@ -128,7 +132,7 @@ function buildPrompt(p: Period, now: string): string {
     case "daily":
       return (
         intro +
-        `Process the raw transcript of the completed day (${VAULT}/daily/${yesterday}.md): ` +
+        `Process the raw transcript of the completed day (${VAULT()}/daily/${yesterday}.md): ` +
         `extract entities and create/update autograph cards. Prefer the write_card tool over write_file ` +
         `for cards — it enforces the schema. For each fact choose one operation: ADD (new), ` +
         `UPDATE (existing subject, compatible new fact), SUPERSEDE (contradicts the Compiled Truth), ` +
@@ -147,11 +151,11 @@ function buildPrompt(p: Period, now: string): string {
         `frustration) are NEVER identity-level facts: never put them into CORE or entity cards. ` +
         `At most mention them as a dated mood line in the daily-summary, or — only if clearly worth ` +
         `keeping — a note card with status: archived. ` +
-        `First read ${VAULT}/.graph/supersede-candidates.json (the deterministic conflict scan) and ` +
+        `First read ${VAULT()}/.graph/supersede-candidates.json (the deterministic conflict scan) and ` +
         `resolve every listed same-entity conflict by superseding the stale card. ` +
         `Then assemble a daily-summary for ${yesterday} with the day's topics and MOC links down to the cards ` +
         `and to the raw transcript daily/${yesterday}.md. ` +
-        `Then ${VAULT}/CORE.md, per the ${INSTRUCTIONS}/rules/core-format.md rule. If the day produced ` +
+        `Then ${VAULT()}/CORE.md, per the ${INSTRUCTIONS}/rules/core-format.md rule. If the day produced ` +
         `no new durable fact, preference, goal or behavioral lesson, do not open or write CORE.md. ` +
         `Otherwise edit only the affected lines; never rewrite the file; keep every existing section, ` +
         `including ones not in the template. The pointer to the last day is set by code — leave it alone. ` +
@@ -219,7 +223,7 @@ const SESSION_TTL_MS = 14 * 24 * 3600 * 1000;
 // status file, daily summaries in the vault) — one session file is not enough; dropHungSession
 // deletes it. It separates an installation that used to get the morning report from a fresh
 // one, which has nothing to miss and must hear nothing. Best-effort by design: ADR-0007.
-const RAN_BEFORE = rollupRanBefore(DATA_DIR, VAULT);
+const RAN_BEFORE = rollupRanBefore(DATA_DIR, VAULT());
 
 async function loadSession(): Promise<{
   readonly sessionId: string;
@@ -237,7 +241,10 @@ async function loadSession(): Promise<{
       return null;
     }
     return saved;
-  } catch {
+  } catch (error) {
+    console.error(
+      `rollup ${period}: сохранённая сессия не прочиталась, начинаю заново: ${String(error)}`,
+    );
     return null;
   }
 }
@@ -355,7 +362,7 @@ async function dropHungSession(
   }
 }
 
-const CORE_PATH = join(VAULT, "CORE.md");
+const CORE_PATH = join(VAULT(), "CORE.md");
 
 // CORE как есть. Отсутствующий файл — пустое состояние первой ночи (ровно то, что видит
 // динамическая инструкция CORE); любой другой отказ чтения остаётся громким.
@@ -543,14 +550,18 @@ if (period === "daily") {
   if (damage.damaged) {
     writeFileAtomicSync(CORE_PATH, coreBeforeTurn);
     core = coreBeforeTurn;
-    const lost = damage.lostHeadings.map((h) => `## ${h}`).join(", ");
+    const damagedHeadings = [
+      ...damage.lostHeadings,
+      ...damage.hollowedHeadings,
+    ];
+    const lost = damagedHeadings.map((h) => `## ${h}`).join(", ");
     console.error(
       `rollup daily: CORE.md lost ${lost || "all of its content"} during the turn — restored the pre-turn file`,
     );
     await alertOwner(
       CORE_DAMAGE_ALERT_KEY,
-      damage.lostHeadings.join(",") || "emptied",
-      coreDamageAlert(tr, damage.lostHeadings),
+      damagedHeadings.join(",") || "emptied",
+      coreDamageAlert(tr, damagedHeadings),
     );
   } else {
     alertResolved(DATA_DIR, CORE_DAMAGE_ALERT_KEY);

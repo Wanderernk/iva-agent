@@ -1,10 +1,13 @@
 /* eslint-disable @typescript-eslint/no-floating-promises -- Node's test runner owns registrations. */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readdirSync,
+  rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -16,11 +19,16 @@ import {
   MODEL_PROVIDER_NAMES,
   invalidModelProviderMessage,
 } from "#lib/model-provider.ts";
+import { jobFactsFile, recordFact } from "#lib/job-facts.ts";
 import { PLUGIN_SCHEMA_URL } from "#lib/plugin-reader.ts";
-import { pluginRoot, writePluginsState } from "#lib/plugin-store.ts";
+import {
+  pluginConfigFile,
+  pluginRoot,
+  writePluginsState,
+} from "#lib/plugin-store.ts";
 import { createSystemdControl } from "../lib/systemd-control.ts";
 import { acquireUpdateLock, createVersionStore } from "../lib/version-store.ts";
-import { createDoctorCommand } from "./doctor.ts";
+import { authoredTreeMissing, createDoctorCommand } from "./doctor.ts";
 import { createCliRuntime } from "./runtime.ts";
 import { createCliSystemd } from "./systemd.ts";
 
@@ -100,17 +108,49 @@ async function doctorOutput(root: string): Promise<{
   return { events, summaryLogs };
 }
 
-async function bridgeBacklogEvents(
+/** Доктор с подменённым каталогом данных: правила владельца читаются из своего sandbox. */
+async function ownerRulesEvents(
+  root: string,
+  data: string,
+): Promise<Array<[string, string]>> {
+  const events: Array<[string, string]> = [];
+  const runtime: CliRuntime = {
+    ...createCliRuntime(root),
+    C: NO_COLOR,
+    ok: (message) => events.push(["ok", message]),
+    warn: (message) => events.push(["warn", message]),
+    bad: (message) => events.push(["bad", message]),
+    readEnv: completeEnv,
+    dataDirAbs: () => data,
+    hasSystemd: () => false,
+  };
+  await createDoctorCommand(runtime, lifecycle(), {
+    nodeVersion: "24.19.0",
+    log: () => undefined,
+    exit: () => undefined,
+  })();
+  return events;
+}
+
+/**
+ * Доктор с живым systemd (стаб) и своим каталогом данных. Возвращает события команды,
+ * отобранные по примете начала строки; пустая примета — все.
+ */
+async function systemdDoctorEvents(
   root: string,
   {
     now,
     queue,
     queueRaw,
     statuses = [],
+    envText,
+    messagePrefix = "bridge backlog:",
   }: {
     now: number;
     queue?: unknown;
     queueRaw?: string;
+    envText?: string;
+    messagePrefix?: string;
     statuses?: Array<{
       chatKey: string;
       status: { status?: string; updatedAt?: number };
@@ -119,6 +159,7 @@ async function bridgeBacklogEvents(
 ): Promise<Array<[string, string]>> {
   const data = join(root, "data");
   const units = join(root, "units");
+  if (envText !== undefined) writeFileSync(join(root, ".env"), envText);
   mkdirSync(data, { recursive: true });
   mkdirSync(units, { recursive: true });
   writeFileSync(join(units, "iva.service"), "[Service]\n");
@@ -166,8 +207,275 @@ async function bridgeBacklogEvents(
     log: () => undefined,
     exit: () => undefined,
   })();
-  return events.filter(([, message]) => message.startsWith("bridge backlog:"));
+  return events.filter(([, message]) => message.startsWith(messagePrefix));
 }
+
+/** Доктор на каталоге с напоминаниями: возвращает события, начинающиеся с "reminders". */
+async function remindersEvents(
+  root: string,
+  {
+    now,
+    pulseAgoMs,
+    rows = [],
+    brokenTable,
+    logs,
+  }: {
+    now: number;
+    pulseAgoMs: number | null;
+    rows?: Array<{
+      id: string;
+      firedAt: number | null;
+      error: string | null;
+      delivered?: boolean | null;
+    }>;
+    brokenTable?: string;
+    // Сводка и разделители идут через log, а не ok/warn/bad — их ловит эта тетрадь.
+    logs?: string[];
+  },
+): Promise<Array<[string, string]>> {
+  const data = join(root, "data");
+  mkdirSync(data, { recursive: true });
+  // Стор и тик считают путь от cwd + ASSISTANT_DATA_DIR (agent/lib/data-dir.ts), а доктор
+  // спрашивает каталог данных у runtime — в тесте их надо свести.
+  const previousDataDir = process.env.ASSISTANT_DATA_DIR;
+  process.env.ASSISTANT_DATA_DIR = data;
+  writeFileSync(
+    join(data, "reminders.json"),
+    brokenTable ??
+      JSON.stringify({
+        schemaVersion: 2,
+        rows: rows.map((row) => ({
+          id: row.id,
+          text: `напоминание ${row.id}`,
+          schedule: { kind: "at", atMs: now - 60_000 },
+          nextRunAtMs: now - 60_000,
+          createdAt: now - 120_000,
+          status: "fired",
+          firedAt: row.firedAt,
+          delivered:
+            row.delivered === undefined ? row.error === null : row.delivered,
+          error: row.error,
+        })),
+      }),
+  );
+  const pulseFile = join(data, "reminders.tick");
+  if (pulseAgoMs === null) {
+    rmSync(pulseFile, { force: true });
+  } else {
+    writeFileSync(pulseFile, `${now - pulseAgoMs}\n`);
+    const at = new Date(now - pulseAgoMs);
+    utimesSync(pulseFile, at, at);
+  }
+  const units = join(root, "units");
+  mkdirSync(units, { recursive: true });
+  writeFileSync(join(units, "iva.service"), "[Service]\n");
+  const events: Array<[string, string]> = [];
+  const systemd = createSystemdControl({
+    run: (args) => {
+      if (args[0] === "is-enabled") return { code: 0, out: "enabled" };
+      if (args[0] === "is-active") return { code: 0, out: "active" };
+      return { code: 1, out: "" };
+    },
+  });
+  const runtime: CliRuntime = {
+    ...createCliRuntime(root),
+    UNIT_DIR: units,
+    SERVICES: [],
+    TIMERS: [],
+    C: NO_COLOR,
+    ok: (message) => events.push(["ok", message]),
+    warn: (message) => events.push(["warn", message]),
+    bad: (message) => events.push(["bad", message]),
+    readEnv: completeEnv,
+    dataDirAbs: () => data,
+    hasSystemd: () => true,
+    systemd,
+    cap: (command) =>
+      command === "ss"
+        ? { code: 0, out: "LISTEN 0 511 127.0.0.1:8723 0.0.0.0:*", err: "" }
+        : { code: 1, out: "", err: "" },
+  };
+  try {
+    await createDoctorCommand(runtime, lifecycle(), {
+      nodeVersion: "24.19.0",
+      now: () => now,
+      log: (...args: unknown[]) => void logs?.push(args.map(String).join(" ")),
+      exit: () => undefined,
+    })();
+  } finally {
+    if (previousDataDir === undefined) delete process.env.ASSISTANT_DATA_DIR;
+    else process.env.ASSISTANT_DATA_DIR = previousDataDir;
+  }
+  return events.filter(([, message]) => message.startsWith("reminders"));
+}
+
+test("doctor показывает провалы напоминаний за сутки и пульс тика", async (t) => {
+  const root = await sandbox(t);
+  const now = Date.now();
+  // id задаёт владелец, а текст ошибки несёт тело ответа Telegram: строке доктора — а она
+  // же уезжает в пакет diagnose — остаются только хеш id и код ошибки.
+  const slug = "напомни-про-подарок";
+  const phrase = "private phrase for Anya";
+  const hash8 = (value: string) =>
+    createHash("sha256").update(value).digest("hex").slice(0, 8);
+
+  // Свежий пульс и один провал за сутки.
+  const fresh = await remindersEvents(root, {
+    now,
+    pulseAgoMs: 30_000,
+    rows: [
+      {
+        id: slug,
+        firedAt: now - 3_600_000,
+        error: `sendMessage 400: ${phrase}`,
+      },
+      {
+        id: "r2",
+        firedAt: now - 30 * 3_600_000,
+        error: "старое, не показываем",
+      },
+      { id: "r3", firedAt: now - 60_000, error: null },
+      {
+        id: "r4",
+        firedAt: now - 120_000,
+        error: "delivery fact not recorded",
+        delivered: null,
+      },
+      {
+        id: "r5",
+        firedAt: now - 180_000,
+        error: "agent wake failed: boom",
+        delivered: true,
+      },
+    ],
+  });
+  assert.ok(
+    fresh.some(
+      ([kind, message]) => kind === "ok" && /dispatcher ticked/u.test(message),
+    ),
+    JSON.stringify(fresh),
+  );
+  assert.ok(
+    fresh.some(
+      ([kind, message]) =>
+        kind === "warn" &&
+        message.includes(`#${hash8(slug)}`) &&
+        /sendMessage 400/u.test(message),
+    ),
+    JSON.stringify(fresh),
+  );
+  for (const leak of [slug, phrase, "напомни"])
+    assert.equal(
+      fresh.some(([, message]) => message.includes(leak)),
+      false,
+      `в строке доктора остался текст владельца: ${leak}`,
+    );
+  assert.equal(
+    fresh.some(([, message]) => message.includes(hash8("r2"))),
+    false,
+    "провал старше суток не показываем",
+  );
+  assert.equal(
+    fresh.some(([, message]) => message.includes(hash8("r3"))),
+    false,
+    "успешную строку не показываем",
+  );
+  // Незаписанный факт — не провал доставки: строка доктора называет его иначе.
+  const marker = fresh.find(([, message]) => message.includes(hash8("r4")));
+  assert.ok(marker, JSON.stringify(fresh));
+  assert.match(marker[1], /the delivery fact was not recorded/u);
+  assert.equal(
+    /did not go out/u.test(marker[1]),
+    false,
+    "невидимый факт назван провалом доставки",
+  );
+  // А записанный факт с ошибкой позднего шага — не «не дошло».
+  const later = fresh.find(([, message]) => message.includes(hash8("r5")));
+  assert.ok(later, JSON.stringify(fresh));
+  assert.match(later[1], /went out, a later step failed/u);
+  assert.equal(/did not go out/u.test(later[1]), false);
+
+  // Тик молчит десять минут.
+  const stale = await remindersEvents(root, {
+    now,
+    pulseAgoMs: 10 * 60_000,
+    rows: [],
+  });
+  assert.ok(
+    stale.some(
+      ([kind, message]) =>
+        kind === "warn" && /has not ticked for 10m/u.test(message),
+    ),
+    JSON.stringify(stale),
+  );
+
+  // Пульса нет вовсе.
+  const none = await remindersEvents(root, { now, pulseAgoMs: null, rows: [] });
+  assert.ok(
+    none.some(
+      ([kind, message]) =>
+        kind === "warn" && /has not ticked yet/u.test(message),
+    ),
+    JSON.stringify(none),
+  );
+});
+
+// Сводка считает раздел, а не число строк: список провалов — одно предупреждение, как у
+// расписаний (doctor.ts:644-647). Двойной счёт в цикле давал Summary с лишними warn.
+test("список провалов напоминаний добавляет сводке одно предупреждение", async (t) => {
+  const now = Date.now();
+  const failures = [
+    { id: "r1", firedAt: now - 60_000, error: "sendMessage 400: first" },
+    { id: "r2", firedAt: now - 120_000, error: "sendMessage 400: second" },
+  ];
+  const summaryOf = async (rows: typeof failures) => {
+    const root = await sandbox(t);
+    const logs: string[] = [];
+    await remindersEvents(root, { now, pulseAgoMs: 30_000, rows, logs });
+    const summary = logs.find((line) => line.startsWith("Summary:"));
+    assert.ok(summary, `сводка не напечатана: ${JSON.stringify(logs)}`);
+    return summary;
+  };
+  const warns = (line: string): number => {
+    const match = /· (\d+) warn ·/u.exec(line);
+    assert.ok(match, `в сводке нет счётчика warn: ${line}`);
+    return Number(match[1]);
+  };
+  const withFailures = warns(await summaryOf(failures));
+  const withoutFailures = warns(await summaryOf([]));
+  assert.equal(
+    withFailures - withoutFailures,
+    1,
+    "два провала напоминаний дали сводке не одно предупреждение, как на базе",
+  );
+});
+
+test("doctor читает битую таблицу, не унося файл владельца в карантин", async (t) => {
+  const root = await sandbox(t);
+  const now = Date.now();
+  const events = await remindersEvents(root, {
+    now,
+    pulseAgoMs: 30_000,
+    brokenTable: "{not json",
+  });
+  assert.ok(
+    events.some(
+      ([kind, message]) =>
+        kind === "warn" && message.startsWith("reminders: table unreadable"),
+    ),
+    JSON.stringify(events),
+  );
+  const data = join(root, "data");
+  assert.ok(
+    existsSync(join(data, "reminders.json")),
+    "доктор перенёс файл владельца",
+  );
+  assert.deepEqual(
+    readdirSync(data).filter((name) => name.includes(".corrupt-")),
+    [],
+    "карантин создан",
+  );
+});
 
 test("non-systemd doctor preserves exact counter and exit semantics", async (t) => {
   const root = await sandbox(t);
@@ -214,7 +522,7 @@ test("doctor warns about an old Telegram bridge backlog item", async (t) => {
   writeFileSync(join(root, ".env"), "present=true\n");
 
   assert.deepEqual(
-    await bridgeBacklogEvents(root, {
+    await systemdDoctorEvents(root, {
       now: 1_000_000,
       queue: {
         version: 1,
@@ -239,11 +547,59 @@ test("doctor warns about an old Telegram bridge backlog item", async (t) => {
   );
 });
 
+// Предупреждение о строках .env, которые сервис и команда прочитают по-разному.
+// Разбор идёт по СЫРОЙ строке файла: по разобранному значению `ab#cd` выглядит как
+// безобидное `ab`, и главный случай был бы не виден.
+test("doctor names the .env lines the service and the CLI read differently", async (t) => {
+  const root = await sandbox(t);
+
+  assert.deepEqual(
+    await systemdDoctorEvents(root, {
+      now: 1_000_000,
+      messagePrefix: ".env lines",
+      envText: [
+        "CUSTOM_API_KEY=ab#cd",
+        "ASSISTANT_VAULT_DIR=вольт",
+        // Закавычено целиком: оба парсера отдают `tg ` — доктору сказать нечего.
+        'TELEGRAM_BOT_TOKEN="tg "',
+        "my.key=1",
+        "IVA_PORT=8723",
+        "# комментарий",
+        "",
+      ].join("\n"),
+    }),
+    [
+      [
+        "warn",
+        ".env lines the service and the CLI may read differently: " +
+          "CUSTOM_API_KEY (one of # \" ' ` \\), " +
+          "ASSISTANT_VAULT_DIR (a character outside ASCII), " +
+          "my.key (a name the service cannot use)" +
+          " — re-enter them: iva config",
+      ],
+    ],
+  );
+});
+
+// Контроль: на здоровом .env предупреждения нет вовсе, иначе тест выше держал бы ноль.
+test("doctor stays silent when every .env line is unambiguous", async (t) => {
+  const root = await sandbox(t);
+
+  assert.deepEqual(
+    await systemdDoctorEvents(root, {
+      now: 1_000_000,
+      messagePrefix: ".env lines",
+      envText: "CUSTOM_API_KEY=sk-live_ABC-123\nIVA_PORT=8723\n",
+    }),
+    [],
+  );
+});
+
 test("doctor reports a clear bridge backlog when queue files are missing", async (t) => {
   const root = await sandbox(t);
   writeFileSync(join(root, ".env"), "present=true\n");
 
-  assert.deepEqual(await bridgeBacklogEvents(root, { now: 1_000_000 }), [
+  assert.deepEqual(await systemdDoctorEvents(root, { now: 1_000_000 }), [
     ["ok", "bridge backlog: clear"],
   ]);
 });
@@ -252,7 +608,7 @@ test("doctor warns when a Telegram bridge queue file is corrupt", async (t) => {
   const root = await sandbox(t);
   writeFileSync(join(root, ".env"), "present=true\n");
   const queueFile = join(root, "data", "telegram-queue.json");
-  const events = await bridgeBacklogEvents(root, {
+  const events = await systemdDoctorEvents(root, {
     now: 1_000_000,
     queueRaw: "{not json",
   });
@@ -272,7 +628,7 @@ test("doctor treats a running chat without updatedAt as stuck", async (t) => {
   writeFileSync(join(root, ".env"), "present=true\n");
 
   assert.deepEqual(
-    await bridgeBacklogEvents(root, {
+    await systemdDoctorEvents(root, {
       now: 1_000_000,
       statuses: [{ chatKey: "1:", status: { status: "running" } }],
     }),
@@ -330,6 +686,50 @@ test("doctor keeps workflow counts when one run file is unreadable", async (t) =
       ],
     ],
   );
+});
+
+test("doctor names iva reset when stale running workflows pile up", async (t) => {
+  const root = await sandbox(t);
+  writeFileSync(join(root, ".env"), "present=true\n");
+  const store = join(root, ".eve", ".workflow-data");
+  mkdirSync(join(store, "runs"), { recursive: true });
+  for (let index = 0; index < 7; index++)
+    writeFileSync(
+      join(store, `runs/run-${index}.json`),
+      '{"status":"running"}',
+    );
+  const events: Array<[string, string]> = [];
+  const systemd = createSystemdControl({
+    run: () => ({ code: 1, out: "" }),
+  });
+  const runtime: CliRuntime = {
+    ...createCliRuntime(root),
+    UNIT_DIR: join(root, "units"),
+    SERVICES: [],
+    TIMERS: [],
+    C: NO_COLOR,
+    ok: (message) => events.push(["ok", message]),
+    warn: (message) => events.push(["warn", message]),
+    bad: (message) => events.push(["bad", message]),
+    readEnv: completeEnv,
+    dataDirAbs: () => join(root, "data"),
+    hasSystemd: () => true,
+    systemd,
+    cap: () => ({ code: 1, out: "", err: "" }),
+  };
+
+  await createDoctorCommand(runtime, lifecycle(), {
+    nodeVersion: "24.19.0",
+    log: () => undefined,
+    exit: () => undefined,
+  })();
+
+  const [line] = events.filter(([, message]) =>
+    message.startsWith("workflow store"),
+  );
+  assert.equal(line?.[0], "warn");
+  assert.match(line?.[1] ?? "", /running count 7 exceeds 5/u);
+  assert.match(line?.[1] ?? "", /iva reset/u);
 });
 
 test("doctor accepts a custom embedding endpoint for hybrid memory search", async (t) => {
@@ -550,7 +950,7 @@ test("opencode diagnostics preserve required-key order", async (t) => {
 
   assert.equal(
     failures[0],
-    ".env incomplete, missing: OPENCODE_API_KEY, OPENCODE_MODEL, DEEPGRAM_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, ASSISTANT_BEARER — run: iva config",
+    ".env incomplete, missing: OPENCODE_API_KEY, OPENCODE_MODEL, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, ASSISTANT_BEARER — run: iva config",
   );
 });
 
@@ -1301,4 +1701,312 @@ test("doctor checks the plugin units and the health of every MCP proxy", async (
   assert.doesNotMatch(everything, /dropped/u);
   assert.doesNotMatch(everything, /iva-mcp-trace-remote/u);
   assert.doesNotMatch(everything, /iva-plugin-trace-gone/u);
+});
+
+// Конфиг плагина правит владелец руками, и до сих пор его ошибку не называла ни одна
+// поверхность: рантайм молча брал пустой конфиг, сборка — тоже. Доктор существует ровно
+// для таких находок.
+test("doctor names a plugin config the owner cannot have meant", async (t) => {
+  const root = await sandbox(t);
+  writeFileSync(join(root, ".env"), "present=true\n");
+  const data = join(root, "data");
+  plantStorePlugin(data, "trace");
+  writeFileSync(pluginConfigFile(data, "trace"), '{"level": "debug",');
+  await writePluginsState(data, {
+    marketplaces: [],
+    plugins: [
+      {
+        name: "trace",
+        source: "./trace",
+        ref: "",
+        sha: "",
+        digest: "",
+        enabled: true,
+        trusted: false,
+        installedAt: "2026-08-17T12:00:00.000Z",
+      },
+    ],
+  });
+
+  const events = await pluginEvents(root);
+  const damaged = events.filter(([, message]) =>
+    message.includes("trace.config.json"),
+  );
+  assert.equal(damaged.length, 1, "ровно одна строка про испорченный конфиг");
+  assert.equal(damaged[0][0], "bad");
+  assert.match(damaged[0][1], /trace\.config\.json is unusable: .*JSON/iu);
+});
+
+test("doctor says nothing about a plugin whose config is valid or absent", async (t) => {
+  const root = await sandbox(t);
+  writeFileSync(join(root, ".env"), "present=true\n");
+  const data = join(root, "data");
+  plantStorePlugin(data, "trace");
+  plantStorePlugin(data, "quiet");
+  writeFileSync(pluginConfigFile(data, "trace"), '{"level": "debug"}');
+  await writePluginsState(data, {
+    marketplaces: [],
+    plugins: ["trace", "quiet"].map((name) => ({
+      name,
+      source: `./${name}`,
+      ref: "",
+      sha: "",
+      digest: "",
+      enabled: true,
+      trusted: false,
+      installedAt: "2026-08-17T12:00:00.000Z",
+    })),
+  });
+
+  const events = await pluginEvents(root);
+  assert.deepEqual(
+    events.filter(([, message]) => message.includes("unusable")),
+    [],
+    "исправный и отсутствующий конфиг доктор не комментирует",
+  );
+});
+
+test("doctor counts the owner rules", async (t) => {
+  const root = await sandbox(t);
+  const data = join(root, "data");
+  const rules = "- no emoji\n- one paragraph per reply\n";
+  mkdirSync(join(data, "custom/agent/instructions"), { recursive: true });
+  writeFileSync(join(data, "custom/agent/instructions/rules.md"), rules);
+
+  const events = await ownerRulesEvents(root, data);
+
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "ok" &&
+        message === `owner rules: 1 file, ${rules.length} chars`,
+    ),
+  );
+  assert.ok(!events.some(([, message]) => message.includes("deprecated")));
+});
+
+test("doctor names the deprecated replacement and an oversized rules file", async (t) => {
+  const root = await sandbox(t);
+  const data = join(root, "data");
+  mkdirSync(join(data, "custom/agent/instructions"), { recursive: true });
+  writeFileSync(join(data, "custom/agent/instructions.md"), "replacement\n");
+  writeFileSync(
+    join(data, "custom/agent/instructions/rules.md"),
+    "x".repeat(4100),
+  );
+
+  const events = await ownerRulesEvents(root, data);
+
+  assert.ok(
+    events.some(
+      ([level, message]) => level === "warn" && /deprecated/u.test(message),
+    ),
+  );
+  assert.ok(
+    events.some(
+      ([level, message]) => level === "warn" && /4000/u.test(message),
+    ),
+  );
+});
+
+// T20 п.5: раздел «расписания» доктора собран из таблицы фактов — проводка до вывода
+// команды, а не только сам отчёт (его формат держит scripts/cli/doctor-schedule.test.ts).
+test("doctor names a failed schedule run and its open failure", async (t) => {
+  const root = await sandbox(t);
+  const data = join(root, "data");
+  mkdirSync(data, { recursive: true });
+  const finishedAt = Date.now() - 1000;
+  await recordFact(
+    jobFactsFile(data),
+    {
+      name: "memory-daily",
+      startedAt: finishedAt - 1000,
+      finishedAt,
+      ok: false,
+      error: "exited 1",
+      exitCode: 1,
+      tail: "rollup daily: agent returned no report",
+      acked: false,
+      wake: null,
+    },
+    finishedAt,
+  );
+
+  // Пустая примета = все события команды: раздел расписаний говорит по-русски и с двух
+  // разных начал («расписание …», «незакрытый провал: …»).
+  const events = await systemdDoctorEvents(root, {
+    now: finishedAt + 1000,
+    messagePrefix: "",
+  });
+
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "warn" &&
+        /расписание memory-daily: провал \(exited 1\)/u.test(message),
+    ),
+    "последний запуск имени виден как провал",
+  );
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "warn" &&
+        /незакрытый провал: memory-daily .*iva jobs ack memory-daily/u.test(
+          message,
+        ),
+    ),
+    "незакрытый провал назван с командой закрытия",
+  );
+});
+
+// T30 §2: раздел расписаний виден и без systemd (jobs.json есть на любой установке).
+test("doctor без systemd печатает раздел расписаний по таблице фактов", async (t) => {
+  const root = await sandbox(t);
+  const data = join(root, "data");
+  mkdirSync(data, { recursive: true });
+  const { jobFactsFile, recordFact } = await import("#lib/job-facts.ts");
+  const finishedAt = Date.now() - 1000;
+  await recordFact(
+    jobFactsFile(data),
+    {
+      name: "memory-daily",
+      startedAt: finishedAt - 1000,
+      finishedAt,
+      ok: false,
+      error: "exited 1",
+      exitCode: 1,
+      tail: "rollup daily: no report",
+      acked: false,
+      wake: null,
+    },
+    finishedAt,
+  );
+  const { events } = await doctorOutput(root);
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "warn" &&
+        /расписание memory-daily: провал \(exited 1\)/u.test(message),
+    ),
+    `раздела расписаний без systemd нет: ${JSON.stringify(events)}`,
+  );
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "warn" &&
+        /незакрытый провал: memory-daily .*iva jobs ack memory-daily/u.test(
+          message,
+        ),
+    ),
+    "незакрытый провал не назван",
+  );
+});
+
+// T30 №9: чужая ERR_MODULE_NOT_FOUND (пропал packages/*) — не «нет agent/».
+test("T30 №9: authoredTreeMissing различает дерево и пакет", () => {
+  const foreign = Object.assign(
+    new Error(
+      'Cannot find module "/tmp/x/packages/secret-redaction/index.ts" imported from /tmp/x/scripts/cli/doctor.ts',
+    ),
+    { code: "ERR_MODULE_NOT_FOUND" },
+  );
+  assert.equal(
+    authoredTreeMissing(foreign),
+    false,
+    "пропажа пакета выдана за отсутствие authored tree",
+  );
+  const authored = Object.assign(
+    new Error('Cannot find module "#lib/job-facts.ts"'),
+    { code: "ERR_PACKAGE_IMPORT_NOT_DEFINED" },
+  );
+  assert.equal(authoredTreeMissing(authored), true);
+});
+
+async function doctorOutputPastSystemdGate(
+  root: string,
+): Promise<Array<[string, string]>> {
+  // Секция rollup-status.json стоит ниже раннего выхода systemd, поэтому
+  // штатный doctorOutput (hasSystemd: false) до неё не доходит и на Linux, и
+  // на macOS. Здесь та же обвязка, но systemd есть: двойник отвечает, что всё
+  // выключено/не найдено, и секции идут дальше своим ходом.
+  const events: Array<[string, string]> = [];
+  const runtime: CliRuntime = {
+    ...createCliRuntime(root),
+    C: NO_COLOR,
+    ok: (message) => events.push(["ok", message]),
+    warn: (message) => events.push(["warn", message]),
+    bad: (message) => events.push(["bad", message]),
+    readEnv: completeEnv,
+    hasSystemd: () => true,
+    systemd: {
+      query: () => ({ code: 1, out: "", err: "" }),
+      isEnabled: () => false,
+      isActive: () => false,
+      activate: () => undefined,
+      resetFailed: () => undefined,
+      restart: () => undefined,
+      daemonReload: () => undefined,
+    } as never,
+  };
+  await createDoctorCommand(runtime, lifecycle(), {
+    nodeVersion: "24.19.0",
+    log: () => {},
+    exit: () => undefined,
+  })();
+  return events;
+}
+
+test("rollup-status свежий и здоровый — строка ok", async (t) => {
+  const root = await sandbox(t);
+  mkdirSync(join(root, "data"), { recursive: true });
+  writeFileSync(
+    join(root, "data/rollup-status.json"),
+    JSON.stringify({
+      "memory-daily": { lastSuccessAt: Date.now(), lastExitCode: 0 },
+    }),
+  );
+
+  const events = await doctorOutputPastSystemdGate(root);
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "ok" &&
+        /memory-daily schedule last succeeded 0h ago/u.test(message),
+    ),
+    `нет ok-строки свежего расписания: ${JSON.stringify(events)}`,
+  );
+});
+
+test("rollup-status старый и с провалом — строки предупреждения", async (t) => {
+  const root = await sandbox(t);
+  mkdirSync(join(root, "data"), { recursive: true });
+  writeFileSync(
+    join(root, "data/rollup-status.json"),
+    JSON.stringify({
+      "memory-daily": {
+        lastSuccessAt: Date.now() - 30 * 60 * 60 * 1000,
+        lastExitCode: 1,
+      },
+    }),
+  );
+
+  const events = await doctorOutputPastSystemdGate(root);
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "warn" &&
+        /memory-daily schedule hasn't succeeded in 30h \(> 26h\)/u.test(
+          message,
+        ),
+    ),
+    `нет warn-строки протухшего расписания: ${JSON.stringify(events)}`,
+  );
+  assert.ok(
+    events.some(
+      ([level, message]) =>
+        level === "warn" &&
+        /memory-daily schedule's last run exited 1/u.test(message),
+    ),
+    `нет warn-строки кода провала: ${JSON.stringify(events)}`,
+  );
 });

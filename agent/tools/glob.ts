@@ -64,19 +64,14 @@ async function walk(root: string, dir: string, out: string[]): Promise<void> {
 
 export default defineTool({
   description:
-    "Найти файлы по glob-паттерну НАПРЯМУЮ на файловой системе хоста VPS. " +
-    "Поддерживает ** (любые поддиректории), * и ?. Поиск относительно cwd " +
-    "(по умолчанию текущая рабочая директория процесса). Возвращает массив путей " +
-    "(относительно cwd). Директории .git/node_modules/dist и т.п. пропускаются.",
+    "Glob-поиск файлов: **, * и ?. От cwd (по умолчанию рабочая директория) — " +
+    "пути относительно cwd; .git/node_modules/dist пропускаются.",
   inputSchema: z.object({
     pattern: z
       .string()
       .min(1)
       .describe("Glob-паттерн, напр. **/*.ts или vault/daily/*.md"),
-    cwd: z
-      .string()
-      .optional()
-      .describe("Базовая директория поиска (абсолютный путь)"),
+    cwd: z.string().optional().describe("Абсолютный путь"),
   }),
   async execute({ pattern, cwd }) {
     const root = cwd ?? process.cwd();

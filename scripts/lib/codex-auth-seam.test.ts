@@ -266,6 +266,13 @@ const AUTH_FIXTURES: AuthCase[] = [
     prev: STORED,
   },
   {
+    // The endpoint may answer without a token at all. The stored one has to survive on both
+    // sides: the login half writes the file of the very same shape the refresh writes back.
+    name: "an answer without access_token keeps the stored one",
+    tokens: { access_token: "" },
+    prev: { ...STORED, access_token: "at-stored" },
+  },
+  {
     name: "refresh: the response rotates id_token and refresh_token",
     tokens: {
       id_token: claimToken({
@@ -278,21 +285,23 @@ const AUTH_FIXTURES: AuthCase[] = [
     prev: STORED,
   },
   {
-    // A new id_token without the claim wins over the stored account — the subscription
-    // really did change, and keeping the old account id would sign every call as somebody else.
-    name: "refresh: a claimless id_token clears the stored account",
+    // A new id_token without the claim keeps the stored account: ChatGPT-Account-ID is how
+    // the subscription backend knows the account, and one silent claim-less answer must not
+    // strip it until the next login (blind QA v3). A token that names an account still wins.
+    name: "refresh: a claimless id_token keeps the stored account",
     tokens: { id_token: jwt({ exp: 9_999_999_999 }), access_token: "at-4" },
     prev: STORED,
   },
   {
-    name: "refresh: an unparsable id_token clears the stored account",
+    name: "refresh: an unparsable id_token keeps the stored account",
     tokens: { id_token: "garbage", access_token: "at-5" },
     prev: STORED,
   },
   {
     // Non-string claims are the shape a provider change would arrive in; both copies must
-    // read them as "no account" rather than stringifying a number into a header.
-    name: "claims of the wrong type read as no account",
+    // read them as "no account" rather than stringifying a number into a header, and the
+    // account already on disk stays.
+    name: "claims of the wrong type keep the stored account",
     tokens: {
       id_token: claimToken({ chatgpt_account_id: 42, chatgpt_plan_type: "" }),
       access_token: "at-6",

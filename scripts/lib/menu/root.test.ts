@@ -4,104 +4,84 @@ import assert from "node:assert/strict";
 
 import root from "./root.ts";
 
+// Rich-кнопка живёт строкой в markdown: подпись и callback_data достаём из тега, порядок
+// пар «кнопка — пояснение» и есть прежний порядок рядов.
+const buttonsOf = (text: string): Array<[string, string]> =>
+  [
+    ...text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
+
 function makeCtx(lang: string) {
   return {
     tr: (en: string, ru: string) => (lang === "ru" ? ru : en),
-    btn: (text: string, callback_data: string) => ({ text, callback_data }),
   };
 }
 
-const englishRows = [
-  [
-    ["🧠 Model", "iva_menu:mdl"],
-    ["🤔 Thinking", "iva_menu:thk"],
-  ],
-  [
-    ["🔍 Search", "iva_menu:srch:o"],
-    ["🌐 Language", "iva_menu:lang:o"],
-  ],
-  [
-    ["🎭 Character", "iva_menu:chr:o"],
-    ["💾 Memory", "iva_menu:core:o"],
-  ],
-  [
-    ["📡 Userbot", "iva_menu:ub:o"],
-    ["🔗 Google", "iva_menu:gws:o"],
-  ],
-  [
-    ["⏰ Timers", "iva_menu:cron:o"],
-    ["🔔 Notices", "iva_menu:ntc:o"],
-  ],
-  [
-    ["🧩 Skills", "iva_menu:sk:o"],
-    ["📊 Status", "iva_menu:st:o"],
-  ],
-  [
-    ["🔀 New messages", "iva_menu:turn:o"],
-    ["🛠 Maintenance", "iva_menu:svc:o"],
-  ],
-  [["✖ Close", "iva_menu:r:x"]],
+const englishButtons = [
+  ["🧠 Model", "iva_menu:mdl"],
+  ["🤔 Thinking", "iva_menu:thk"],
+  ["🔍 Search", "iva_menu:srch:o"],
+  ["💬 Rich replies", "iva_menu:rich:o"],
+  ["🎤 Voice", "iva_menu:voice:o"],
+  ["🌐 Language", "iva_menu:lang:o"],
+  ["🎭 Character", "iva_menu:chr:o"],
+  ["💾 Memory", "iva_menu:core:o"],
+  ["📡 Userbot", "iva_menu:ub:o"],
+  ["🔗 Google", "iva_menu:gws:o"],
+  ["⏰ Timers", "iva_menu:cron:o"],
+  ["🔔 Notices", "iva_menu:ntc:o"],
+  ["🧩 Skills", "iva_menu:sk:o"],
+  ["📊 Status", "iva_menu:st:o"],
+  ["🔀 New messages", "iva_menu:turn:o"],
+  ["🛠 Maintenance", "iva_menu:svc:o"],
+  ["✖ Close", "iva_menu:r:x"],
 ];
 
-const russianRows = [
-  [
-    ["🧠 Модель", "iva_menu:mdl"],
-    ["🤔 Размышления", "iva_menu:thk"],
-  ],
-  [
-    ["🔍 Поиск", "iva_menu:srch:o"],
-    ["🌐 Язык", "iva_menu:lang:o"],
-  ],
-  [
-    ["🎭 Характер", "iva_menu:chr:o"],
-    ["💾 Память", "iva_menu:core:o"],
-  ],
-  [
-    ["📡 Userbot", "iva_menu:ub:o"],
-    ["🔗 Google", "iva_menu:gws:o"],
-  ],
-  [
-    ["⏰ Кроны", "iva_menu:cron:o"],
-    ["🔔 Уведомления", "iva_menu:ntc:o"],
-  ],
-  [
-    ["🧩 Скиллы", "iva_menu:sk:o"],
-    ["📊 Статус", "iva_menu:st:o"],
-  ],
-  [
-    ["🔀 Новые сообщения", "iva_menu:turn:o"],
-    ["🛠 Обслуживание", "iva_menu:svc:o"],
-  ],
-  [["✖ Закрыть", "iva_menu:r:x"]],
+const russianButtons = [
+  ["🧠 Модель", "iva_menu:mdl"],
+  ["🤔 Размышления", "iva_menu:thk"],
+  ["🔍 Поиск", "iva_menu:srch:o"],
+  ["💬 Богатые ответы", "iva_menu:rich:o"],
+  ["🎤 Голос", "iva_menu:voice:o"],
+  ["🌐 Язык", "iva_menu:lang:o"],
+  ["🎭 Характер", "iva_menu:chr:o"],
+  ["💾 Память", "iva_menu:core:o"],
+  ["📡 Userbot", "iva_menu:ub:o"],
+  ["🔗 Google", "iva_menu:gws:o"],
+  ["⏰ Кроны", "iva_menu:cron:o"],
+  ["🔔 Уведомления", "iva_menu:ntc:o"],
+  ["🧩 Скиллы", "iva_menu:sk:o"],
+  ["📊 Статус", "iva_menu:st:o"],
+  ["🔀 Новые сообщения", "iva_menu:turn:o"],
+  ["🛠 Обслуживание", "iva_menu:svc:o"],
+  ["✖ Закрыть", "iva_menu:r:x"],
 ];
 
-function compact(
-  rows: Array<Array<{ text: string; callback_data: string }>>,
-): Array<Array<[string, string]>> {
-  return rows.map((row) =>
-    row.map(({ text, callback_data }) => [text, callback_data]),
-  );
-}
-
-test("root preserves English row order, callbacks, and close action", () => {
+test("root preserves English button order, callbacks, and close action", () => {
   const state = { page: 3 };
   const view = root.render(state, makeCtx("en"));
 
-  assert.equal(view.text, "⚙️ Settings\n\nPick a section.");
-  assert.deepEqual(compact(view.rows), englishRows);
+  assert.match(view.text, /^# ⚙️ Settings$/m);
+  assert.deepEqual(buttonsOf(view.text), englishButtons);
+  // Каждая кнопка — своя строка-абзац с пояснением «кнопка — что она делает».
+  assert.equal(view.text.match(/<tg-button /g)?.length, englishButtons.length);
+  assert.equal(
+    view.text.match(/\n\n<tg-button /g)?.length,
+    englishButtons.length,
+  );
   assert.deepEqual(state, { page: 3 });
 });
 
 test("root translates labels without changing callback routing", () => {
   const view = root.render({}, makeCtx("ru"));
 
-  assert.equal(view.text, "⚙️ Настройки\n\nВыбери раздел.");
-  assert.deepEqual(compact(view.rows), russianRows);
+  assert.match(view.text, /^# ⚙️ Настройки$/m);
+  assert.deepEqual(buttonsOf(view.text), russianButtons);
   assert.deepEqual(
-    compact(view.rows)
-      .flat()
-      .map(([, callback]) => callback),
-    englishRows.flat().map(([, callback]) => callback),
+    buttonsOf(view.text).map(([, callback]) => callback),
+    englishButtons.map(([, callback]) => callback),
   );
 });
 

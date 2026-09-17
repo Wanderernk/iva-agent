@@ -61,11 +61,11 @@ Iva is a personal agent that lives on your own server and works in your Telegram
 
 ## For everyday life
 
-Voice notes and shopping lists. People and dates she actually remembers. Search and purchases researched with sources. Reminders and schedules: say "remind me on Friday to congratulate Sergey" or "send my day plan every morning at 9" — Iva sets up a cron on her server and the message arrives right on time. Bedtime stories that continue tonight's plot tomorrow. The interface speaks Russian or English, switched with one button in `/menu`; voice notes are understood in Russian, English and Uzbek.
+Voice notes and shopping lists. People and dates she actually remembers. Search and purchases researched with sources. Reminders and schedules: say "remind me on Friday to congratulate Sergey" or "send my day plan every morning at 9" — Iva puts it on her reminder list or her schedule, and the message arrives right on time. Bedtime stories that continue tonight's plot tomorrow. The interface speaks Russian or English, switched with one button in `/menu`; voice notes are understood in Russian, English and Uzbek.
 
 ## Iva grows around you
 
-Out of the box Iva ships with eight skills: web research, a browser, Google Workspace, a morning digest, local document processing, rich Telegram posts, a personal-account userbot (beta) and injection defense. The rest is yours to add — and adding is cheap:
+Out of the box Iva ships with ten skills: web research, a browser, Google Workspace, a morning digest, local document processing, rich Telegram posts, problem reports, update recovery, a personal-account userbot (beta) and injection defense. The rest is yours to add — and adding is cheap:
 
 - a **skill** is one markdown file with a procedure;
 - an **MCP connector** to your CRM, database or internal service is one config file;
@@ -75,7 +75,7 @@ The author's own install has grown past 80 skills: Iva runs a Telegram channel, 
 
 ## Honest limits
 
-Everything that arrives on its own runs on a schedule: digests and reminders are crons and timers on your server, which Iva sets up when you ask. Without a schedule and without a message from you she won't text first — spontaneous initiative is not a thing she has. The model and voice transcription are cloud APIs you choose and pay for directly, with no markup. The userbot mode (acting from your personal account) is a beta, at your own risk.
+Everything that arrives on its own runs on a schedule: digests are schedules inside Iva, and reminders live in her own table on your server, which she fills when you ask (see [Reminders](reminders.md)). Without a schedule and without a message from you she won't text first — spontaneous initiative is not a thing she has. The model and voice transcription are cloud APIs you choose and pay for directly, with no markup. The userbot mode (acting from your personal account) is a beta, at your own risk.
 
 ## Try it
 

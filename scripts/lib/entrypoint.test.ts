@@ -39,7 +39,7 @@ test("isEntrypoint recognises the started module behind a symlinked directory", 
 
 test("isEntrypoint rejects a module that is not the started one", () => {
   assert.equal(
-    isEntrypoint(new URL("./update-safety.ts", import.meta.url).href),
+    isEntrypoint(new URL("./version-store.ts", import.meta.url).href),
     false,
   );
   assert.equal(isEntrypoint("file:///nonexistent/module.ts"), false);

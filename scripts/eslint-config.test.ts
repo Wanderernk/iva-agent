@@ -16,6 +16,8 @@ const EXPECTED_IGNORES = [
   ".eve/",
   "services/telegram-userbot/",
   "data/",
+  ".scratch/",
+  ".worktrees/",
   "**/wt/",
   "**/.workflow-data/",
   "**/.iva-update/",

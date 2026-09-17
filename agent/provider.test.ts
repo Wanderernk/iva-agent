@@ -1,15 +1,16 @@
 // Ядро middleware, который прикладывает картинку Vault к сообщению модели. Файлы сюда
 // приходят инъекцией (readImage), поэтому тест идёт без файловой системы и без сети.
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import fc from "fast-check";
-import { wrapLanguageModel } from "ai";
+import { generateText, wrapLanguageModel } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import type {
+  LanguageModelV4FunctionTool,
   LanguageModelV4StreamPart,
   LanguageModelV4StreamResult,
 } from "@ai-sdk/provider";
@@ -57,6 +58,18 @@ function userText(...texts: string[]): Message {
     content: texts.map((text) => ({ type: "text" as const, text })),
   };
 }
+
+// Промпт в форме параметров middleware: остальные поля не нужны, важны только роли и текст.
+type MiddlewareParams = Parameters<
+  NonNullable<ReturnType<typeof attachImagesMiddleware>["transformParams"]>
+>[0]["params"];
+
+const middlewareParams = (text: string): MiddlewareParams => ({
+  prompt: [userText(text)],
+});
+
+// Предикат для моделей, собранных в тестах заголовков: картинки в этих прогонах не едут.
+const blindToImages = (): Promise<boolean> => Promise.resolve(false);
 
 function filesOf(message: Message): FilePart[] {
   const content = (message as { content: { type: string }[] }).content;
@@ -382,19 +395,45 @@ await test("промпт без ссылок уходит нетронутым �
     globalThis.fetch = original;
   });
 
-  const params = {
-    prompt: [userText("привет, что там по задачам?")],
-  } as unknown as Parameters<
-    NonNullable<typeof attachImagesMiddleware.transformParams>
-  >[0]["params"];
+  const params = middlewareParams("привет, что там по задачам?");
+  const middleware = attachImagesMiddleware(() => {
+    throw new Error("предикат не должен спрашиваться без ссылок");
+  });
 
-  const result = await attachImagesMiddleware.transformParams?.({
+  const result = await middleware.transformParams?.({
     type: "generate",
     params,
     model: {} as never,
   });
 
   assert.equal(result, params);
+});
+
+// Шов provider ↔ vision: предикат приходит параметром, а не импортом, и его ответ решает,
+// дойдёт ли промпт до чтения Vault. Файл тут заведомо нечитаем, поэтому виден ровно шаг
+// решения: слепой предикат до чтения не доводит, зрячий — доводит.
+await test("предикат решает, дойдёт ли ссылка до чтения картинки", async (t) => {
+  const logs = muteErrors(t);
+  const ref = `vault/${REF}`;
+  const run = (sees: boolean) =>
+    attachImagesMiddleware(() => Promise.resolve(sees)).transformParams?.({
+      type: "generate",
+      params: middlewareParams(`посмотри ${ref}`),
+      model: {} as never,
+    });
+  const readVault = () =>
+    logs.some(
+      (line) => line.includes(REF) && line.includes("из Vault не прочитал"),
+    );
+
+  await run(false);
+  assert.equal(
+    readVault(),
+    false,
+    "слепой предикат не доводит до чтения Vault",
+  );
+  await run(true);
+  assert.ok(readVault(), "зрячий предикат доводит промпт до чтения Vault");
 });
 
 await test("метаданные без контента обрываются по deadline и не отравляют сессию", async (t) => {
@@ -692,6 +731,21 @@ await test("codexFetch refreshes and retries auth failures once", async (t) => {
     assert.equal(backendAuthorizations.length, 1);
   });
 
+  await t.test(
+    "a refresh without access_token does not retry with the old token",
+    async () => {
+      resetAuth();
+      backendResponses = [
+        Response.json({ error: { code: "token_expired" } }, { status: 401 }),
+      ];
+      refreshResponses = [Response.json({})];
+      // Пустой ответ токен-эндпоинта — отказ, а не новый вход: бэкенд не должен получить
+      // повторный запрос с прежним, уже отвергнутым Bearer.
+      await assert.rejects(request(), assertCodexAuthExpired);
+      assert.equal(backendAuthorizations.length, 1);
+    },
+  );
+
   await t.test("a non-reusable body is not retried", async () => {
     resetAuth();
     const upstream = Response.json(
@@ -703,4 +757,355 @@ await test("codexFetch refreshes and retries auth failures once", async (t) => {
     assert.equal(await request(null), upstream);
     assert.equal(backendAuthorizations.length, 1);
   });
+});
+
+// --- OpenCode Go: заголовки клиента ----------------------------------------------------------
+// Go принимает запрос только со стабильным ID диалога (x-opencode-session) и своим User-Agent;
+// без них — 4xx MissingSessionID на каждый ход. Остальные провайдеры заголовков не получают.
+// Провайдер выбирается на загрузке модуля, поэтому Go — отдельный экземпляр модуля (query в
+// specifier), с чистым окружением и без сети.
+const SESSION_HEADER_SEED = 20260910;
+
+type ChatModel = ReturnType<typeof makeTextModelOllama>;
+const { makeTextModel: makeTextModelOllama } = await import("./provider.ts");
+
+type ProviderModule = typeof import("./provider.ts");
+
+async function loadOpencodeProvider(): Promise<ProviderModule> {
+  const previous = {
+    MODEL_PROVIDER: process.env.MODEL_PROVIDER,
+    OPENCODE_API_KEY: process.env.OPENCODE_API_KEY,
+  };
+  process.env.MODEL_PROVIDER = "opencode";
+  process.env.OPENCODE_API_KEY = "sk-test";
+  try {
+    // Query в specifier даёт отдельный экземпляр модуля; TS такой путь не резолвит,
+    // поэтому specifier — переменная, а форма модуля закреплена типом ниже.
+    const specifier = "./provider.ts?provider=opencode";
+    const loaded: unknown = await import(specifier);
+    return loaded as ProviderModule;
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function chatCompletion(): Response {
+  return Response.json({
+    id: "chatcmpl-test",
+    object: "chat.completion",
+    created: 0,
+    model: "test",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "ok" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+}
+
+/** Гонит один запрос через модель и возвращает заголовки, которые ушли бы провайдеру. */
+async function requestHeadersOf(
+  t: TestContext,
+  model: ChatModel,
+): Promise<Headers> {
+  const originalFetch = globalThis.fetch;
+  let captured: Headers | undefined;
+  globalThis.fetch = (input, init) => {
+    captured = new Headers(
+      init?.headers ?? (input instanceof Request ? input.headers : undefined),
+    );
+    return Promise.resolve(chatCompletion());
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  await generateText({ model, prompt: "ping", maxRetries: 0 });
+  assert.ok(captured, "запрос к провайдеру не ушёл");
+  return captured;
+}
+
+await test("Go: запрос несёт ID диалога сессии и User-Agent Ивы", async (t) => {
+  const go = await loadOpencodeProvider();
+  assert.equal(go.providerName, "opencode");
+  const headers = await requestHeadersOf(
+    t,
+    go.makeTextModel({
+      sessionId: "sess_01ABC",
+      chatModelSeesImages: blindToImages,
+    }),
+  );
+  assert.equal(headers.get("x-opencode-session"), "sess_01ABC");
+  assert.equal(headers.get("user-agent"), go.IVA_USER_AGENT);
+  assert.match(go.IVA_USER_AGENT, /^iva\/\d+\.\d+\.\d+/u);
+  assert.equal(headers.get("authorization"), "Bearer sk-test");
+});
+
+await test("Go без сессии: ID процесса, непустой и один на все вызовы", async (t) => {
+  const go = await loadOpencodeProvider();
+  const first = await requestHeadersOf(
+    t,
+    go.makeTextModel({ chatModelSeesImages: blindToImages }),
+  );
+  const second = await requestHeadersOf(
+    t,
+    go.makeTextModel({
+      sessionId: "  ",
+      chatModelSeesImages: blindToImages,
+    }),
+  );
+  const id = first.get("x-opencode-session");
+  assert.ok(id && id.length > 0);
+  assert.equal(second.get("x-opencode-session"), id);
+  assert.equal(id, go.opencodeSessionId(undefined));
+});
+
+await test("не-Go провайдер заголовков Go не шлёт", async (t) => {
+  const ollama = await import("./provider.ts");
+  assert.equal(ollama.providerName, "ollama");
+  assert.equal(ollama.providerRequestHeaders("sess_01ABC"), undefined);
+  const headers = await requestHeadersOf(
+    t,
+    makeTextModelOllama({
+      sessionId: "sess_01ABC",
+      chatModelSeesImages: blindToImages,
+    }),
+  );
+  assert.equal(headers.get("x-opencode-session"), null);
+  assert.notEqual(headers.get("user-agent"), ollama.IVA_USER_AGENT);
+});
+
+await test(`ID сессии уходит как есть, пустой заменяется ID процесса (seed ${SESSION_HEADER_SEED})`, async () => {
+  const go = await loadOpencodeProvider();
+  const processId = go.opencodeSessionId(undefined);
+  fc.assert(
+    fc.property(fc.stringMatching(/^[A-Za-z0-9_:.-]{1,64}$/u), (id) => {
+      assert.equal(go.opencodeSessionId(id), id);
+      assert.equal(go.providerRequestHeaders(id)?.["x-opencode-session"], id);
+    }),
+    { seed: SESSION_HEADER_SEED, numRuns: 200 },
+  );
+  fc.assert(
+    fc.property(fc.stringMatching(/^[ \t\r\n\u00a0]{0,8}$/u), (blank) => {
+      assert.equal(go.opencodeSessionId(blank), processId);
+    }),
+    { seed: SESSION_HEADER_SEED, numRuns: 50 },
+  );
+  assert.match(processId, /^iva-[0-9a-f-]{36}$/u);
+});
+
+// --- Провайдер отверг схему инструмента: повтор без lookaround-паттернов -----------------------
+const { toolSchemaRetryMiddleware, withoutLookaroundPatterns } =
+  await import("./provider.ts");
+const { APICallError } = await import("ai");
+
+const SCHEMA_REJECTION = new APICallError({
+  message:
+    "Invalid JSON schema: regex lookaround is not supported. Found at $.properties.attendees.items.pattern.",
+  url: "https://chatgpt.com/backend-api/codex/responses",
+  requestBodyValues: {},
+  statusCode: 400,
+  responseBody: '{"error":{"code":"invalid_json_schema","param":"tools"}}',
+});
+
+function calendarTools(): LanguageModelV4FunctionTool[] {
+  return [
+    {
+      type: "function" as const,
+      name: "create_event",
+      inputSchema: {
+        type: "object",
+        properties: {
+          attendees: {
+            type: "array",
+            items: {
+              type: "string",
+              pattern: "^(?=.*@).+$",
+              description: "email",
+            },
+          },
+          title: { type: "string", pattern: "^[^\\n]+$" },
+        },
+      },
+    },
+  ];
+}
+
+function modelRejectingSchemaOnce(rejections: Error[]) {
+  const calls: unknown[][] = [];
+  const model = wrapLanguageModel({
+    model: new MockLanguageModelV4({
+      doStream: (options) => {
+        calls.push(options.tools ?? []);
+        const next = rejections.shift();
+        if (next) return Promise.reject(next);
+        return Promise.resolve({
+          stream: new ReadableStream<LanguageModelV4StreamPart>({
+            start(controller) {
+              controller.enqueue(streamPart("text-start"));
+              controller.enqueue(streamPart("text-delta"));
+              controller.close();
+            },
+          }),
+        } satisfies LanguageModelV4StreamResult);
+      },
+    }),
+    middleware: toolSchemaRetryMiddleware,
+  });
+  return { model, calls };
+}
+
+void test("a 400 for a tool schema is retried once with the lookaround patterns gone, everything else kept", async () => {
+  const { model, calls } = modelRejectingSchemaOnce([SCHEMA_REJECTION]);
+  const { stream } = await model.doStream({
+    prompt: [],
+    tools: calendarTools(),
+  });
+  await stream.pipeTo(new WritableStream());
+  assert.equal(calls.length, 2);
+  const retried = calls[1][0] as {
+    inputSchema: {
+      properties: Record<
+        string,
+        { items?: Record<string, unknown>; pattern?: string }
+      >;
+    };
+  };
+  assert.deepEqual(retried.inputSchema.properties.attendees.items, {
+    type: "string",
+    description: "email",
+  });
+  assert.equal(retried.inputSchema.properties.title.pattern, "^[^\\n]+$");
+  // Исходные инструменты первого вызова не тронуты: копия, не мутация.
+  const first = calls[0][0] as typeof retried;
+  assert.equal(
+    first.inputSchema.properties.attendees.items?.pattern,
+    "^(?=.*@).+$",
+  );
+});
+
+void test("any other 400, or a schema with nothing to drop, fails fast without a retry", async () => {
+  const other = new APICallError({
+    message: "Invalid 'input[0].role': expected one of user, assistant",
+    url: "https://x",
+    requestBodyValues: {},
+    statusCode: 400,
+  });
+  const a = modelRejectingSchemaOnce([other]);
+  await assert.rejects(
+    () =>
+      Promise.resolve(a.model.doStream({ prompt: [], tools: calendarTools() })),
+    other,
+  );
+  assert.equal(a.calls.length, 1);
+
+  const b = modelRejectingSchemaOnce([SCHEMA_REJECTION]);
+  const plain: LanguageModelV4FunctionTool[] = [
+    {
+      ...calendarTools()[0],
+      inputSchema: {
+        type: "object",
+        properties: { title: { type: "string" } },
+      },
+    },
+  ];
+  await assert.rejects(
+    () => Promise.resolve(b.model.doStream({ prompt: [], tools: plain })),
+    SCHEMA_REJECTION,
+  );
+  assert.equal(b.calls.length, 1);
+});
+
+// Инвариант вырезания: lookaround-паттернов нет, всё остальное на месте, мусор не роняет.
+// Seed печатает fast-check при провале.
+void test("property: withoutLookaroundPatterns drops exactly the lookaround patterns and never throws", () => {
+  const lookaround = /\(\?<?[=!]/u;
+  const pattern = fc.oneof(
+    fc.constant("^(?=.*@).+$"),
+    fc.constant("(?!x)y"),
+    fc.constant("(?<=a)b"),
+    fc.constant("(?<!a)b"),
+    fc.constant("^[a-z]+$"),
+    fc.string({ maxLength: 12 }),
+  );
+  const schema = fc.letrec((tie) => ({
+    node: fc.record(
+      {
+        type: fc.constantFrom("string", "object", "array"),
+        pattern,
+        description: fc.string({ maxLength: 8 }),
+        items: tie("node"),
+        properties: fc.dictionary(fc.string({ maxLength: 5 }), tie("node"), {
+          maxKeys: 3,
+        }),
+      },
+      { requiredKeys: [] },
+    ),
+  })).node;
+  const scrub = (value: unknown) =>
+    JSON.parse(
+      JSON.stringify(value, (key, v: unknown) =>
+        key === "pattern" && typeof v === "string" && lookaround.test(v)
+          ? undefined
+          : v,
+      ),
+    ) as unknown;
+  fc.assert(
+    fc.property(schema, (input) => {
+      const dropped = { count: 0 };
+      const out = withoutLookaroundPatterns(input, dropped);
+      assert.deepEqual(JSON.parse(JSON.stringify(out)), scrub(input));
+      assert.equal(
+        dropped.count > 0,
+        JSON.stringify(input) !== JSON.stringify(scrub(input)),
+      );
+    }),
+    { numRuns: 300 },
+  );
+  fc.assert(
+    fc.property(fc.jsonValue({ maxDepth: 4 }), (garbage) => {
+      withoutLookaroundPatterns(garbage);
+    }),
+    { numRuns: 300 },
+  );
+});
+
+// --- Codex: инструменты уходят с strict:false, иначе Responses включает строгий режим сам --
+const { codexProviderOptions } = await import("./provider.ts");
+
+void test("codex sends every function tool with strict:false and leaves provider tools alone", async () => {
+  const out = await codexProviderOptions.transformParams?.({
+    type: "stream",
+    model: new MockLanguageModelV4(),
+    params: {
+      prompt: [],
+      tools: [
+        ...calendarTools(),
+        {
+          type: "provider",
+          id: "openai.web_search",
+          name: "web_search",
+          args: {},
+        },
+      ],
+    },
+  });
+  const tools = out?.tools ?? [];
+  assert.equal(tools.length, 2);
+  assert.equal((tools[0] as { strict?: boolean }).strict, false);
+  assert.equal("strict" in tools[1], false);
+});
+
+void test("codex without tools still passes: nothing to mark", async () => {
+  const out = await codexProviderOptions.transformParams?.({
+    type: "stream",
+    model: new MockLanguageModelV4(),
+    params: { prompt: [] },
+  });
+  assert.equal(out?.tools, undefined);
 });

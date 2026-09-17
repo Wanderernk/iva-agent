@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/require-await -- async test double preserves the transport contract. */
+import "../fixtures/rich-menu-style.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFlows, type TelegramFlowResponse } from "./tg-flow.ts";
@@ -64,16 +65,19 @@ void test("start(...extra) подмешивает поля (msgId меню) в �
   assert.equal(st.flow, "menu");
 });
 
-void test("screen без msgId шлёт новое сообщение и запоминает message_id", async () => {
+void test("screen без msgId шлёт новое rich-сообщение и запоминает message_id", async () => {
   const { tg, calls } = makeTg([{ ok: true, result: { message_id: 777 } }]);
   const flows = createFlows({ tg });
   const st = flows.start(5, 6, "think");
   await flows.screen(st, "привет", [[{ text: "A", callback_data: "x" }]]);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].method, "sendMessage");
-  assert.deepEqual(calls[0].params.reply_markup, {
-    inline_keyboard: [[{ text: "A", callback_data: "x" }]],
+  assert.equal(calls[0].method, "sendRichMessage");
+  // Старый ряд доезжает до текста rich-кнопкой; reply_markup в Bot API не уходит вовсе.
+  assert.deepEqual(calls[0].params.rich_message, {
+    markdown:
+      'привет\n\n<tg-button-row><tg-button type="callback_data" data="x">A</tg-button></tg-button-row>',
   });
+  assert.equal(calls[0].params.reply_markup, undefined);
   assert.equal(st.msgId, 777);
 });
 
@@ -86,7 +90,8 @@ void test("screen с msgId правит на месте, без фолбэка �
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "editMessageText");
   assert.equal(calls[0].params.message_id, 42);
-  assert.equal(calls[0].params.reply_markup, undefined); // rows отсутствуют -> reply_markup не задаётся
+  // rows отсутствуют -> markdown уходит как есть, никакого text/reply_markup
+  assert.deepEqual(calls[0].params.rich_message, { markdown: "экран" });
   assert.equal(st.msgId, 42);
 });
 
@@ -103,7 +108,7 @@ void test("«not modified» на правке считается успехом 
   assert.equal(st.msgId, 42);
 });
 
-void test("правка не удалась (сообщение удалено) — фолбэк на новое сообщение с новым msgId", async () => {
+void test("правка не удалась (сообщение удалено) — фолбэк на новое rich-сообщение с новым msgId", async () => {
   const { tg, calls } = makeTg([
     { ok: false, description: "Bad Request: message to edit not found" },
     { ok: true, result: { message_id: 900 } },
@@ -114,7 +119,7 @@ void test("правка не удалась (сообщение удалено) 
   await flows.screen(st, "новый экран");
   assert.equal(calls.length, 2);
   assert.equal(calls[0].method, "editMessageText");
-  assert.equal(calls[1].method, "sendMessage");
+  assert.equal(calls[1].method, "sendRichMessage");
   assert.equal(st.msgId, 900);
 });
 
@@ -144,7 +149,7 @@ void test("get чистит протухший по TTL стейт и отдаё
   assert.equal(flows.get(3, 4), st2);
 });
 
-void test("end снимает стейт и рисует финальный экран с опциональными rows", async () => {
+void test("end снимает стейт и рисует финальный rich-экран с опциональными rows", async () => {
   const { tg, calls } = makeTg([{ ok: true }]);
   const flows = createFlows({ tg });
   const st = flows.start(7, 8, "menu");
@@ -154,15 +159,18 @@ void test("end снимает стейт и рисует финальный эк
   assert.equal(flows.get(7, 8), null); // стейт удалён
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "editMessageText");
-  assert.deepEqual(calls[0].params.reply_markup, { inline_keyboard: menuRow });
+  assert.deepEqual(calls[0].params.rich_message, {
+    markdown:
+      'готово\n\n<tg-button-row><tg-button type="callback_data" data="iva_menu:r:o">‹ Меню</tg-button></tg-button-row>',
+  });
 });
 
-void test("end без rows — терминальный экран без клавиатуры", async () => {
+void test("end без rows — терминальный экран без кнопок", async () => {
   const { tg, calls } = makeTg([{ ok: true, result: { message_id: 5 } }]);
   const flows = createFlows({ tg });
-  const st = flows.start(7, 8, "model"); // msgId=null -> уйдёт как sendMessage
+  const st = flows.start(7, 8, "model"); // msgId=null -> уйдёт как sendRichMessage
   await flows.end(st, "сохранил");
   assert.equal(flows.get(7, 8), null);
-  assert.equal(calls[0].method, "sendMessage");
-  assert.equal(calls[0].params.reply_markup, undefined);
+  assert.equal(calls[0].method, "sendRichMessage");
+  assert.deepEqual(calls[0].params.rich_message, { markdown: "сохранил" });
 });

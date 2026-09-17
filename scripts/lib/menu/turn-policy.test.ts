@@ -17,13 +17,10 @@ const screen = loaded.default as Screen;
 
 after(() => rmSync(dataDir, { recursive: true, force: true }));
 
-type Button = { text: string; callback_data: string };
-type View = { text: string; rows: Button[][] };
+type View = { text: string };
 type MenuState = { page: number };
 type MenuContext = {
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screenId: string) => Button[];
   show: (state: MenuState, screenId: string) => Promise<void>;
 };
 type Screen = {
@@ -42,10 +39,6 @@ const settingsPath = join(dataDir, "settings.json");
 function makeContext(lang: string, redrawn: string[] = []): MenuContext {
   return {
     tr: (english, russian) => (lang === "ru" ? russian : english),
-    btn: (text, callbackData) => ({ text, callback_data: callbackData }),
-    backRow: (screenId) => [
-      { text: "Back", callback_data: `iva_menu:${screenId}:o` },
-    ],
     show: (_state, screenId) => {
       redrawn.push(screenId);
       return Promise.resolve();
@@ -53,10 +46,13 @@ function makeContext(lang: string, redrawn: string[] = []): MenuContext {
   };
 }
 
+// Кнопка — тег в markdown: подпись и data достаём из строки экрана.
 function labels(view: View): Array<[string, string]> {
-  return view.rows
-    .flat()
-    .map(({ text, callback_data }) => [text, callback_data]);
+  return [
+    ...view.text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
 }
 
 test("queue is the default and callbacks stay stable in both languages", () => {
@@ -67,7 +63,7 @@ test("queue is the default and callbacks stay stable in both languages", () => {
   assert.deepEqual(labels(english), [
     ["✓ Queue", "iva_menu:turn:set:queue"],
     ["○ Interrupt", "iva_menu:turn:set:steer"],
-    ["Back", "iva_menu:r:o"],
+    ["‹ Menu", "iva_menu:r:o"],
   ]);
 
   const russian = screen.render({ page: 0 }, makeContext("ru"));
@@ -75,7 +71,7 @@ test("queue is the default and callbacks stay stable in both languages", () => {
   assert.deepEqual(labels(russian), [
     ["✓ Очередь", "iva_menu:turn:set:queue"],
     ["○ Перебивать", "iva_menu:turn:set:steer"],
-    ["Back", "iva_menu:r:o"],
+    ["‹ Меню", "iva_menu:r:o"],
   ]);
   assert.equal(screen.parent, "r");
 });
@@ -88,7 +84,7 @@ test("steer renders selected and a selection preserves other settings", async ()
   assert.deepEqual(labels(screen.render({ page: 0 }, makeContext("en"))), [
     ["○ Queue", "iva_menu:turn:set:queue"],
     ["✓ Interrupt", "iva_menu:turn:set:steer"],
-    ["Back", "iva_menu:r:o"],
+    ["‹ Menu", "iva_menu:r:o"],
   ]);
 
   const redrawn: string[] = [];

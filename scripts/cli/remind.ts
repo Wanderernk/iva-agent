@@ -2,38 +2,25 @@
 // authored-tree import lazy so repair and doctor still load on a partial installation.
 import { readEnvFresh } from "../lib/env-file.ts";
 import { notificationChat } from "../lib/notification-chat.ts";
-import { writtenInLanguage } from "../lib/notice-policy.ts";
+import {
+  reminderClientOptions,
+  reminderPrompt,
+  runReminderTurn,
+} from "../lib/reminder-turn.ts";
+import type { CreateClient, ReminderTurn } from "../lib/reminder-turn.ts";
 import type { createCliRuntime } from "./runtime.ts";
+
+export type {
+  ReminderClientOptions,
+  ReminderTurn,
+} from "../lib/reminder-turn.ts";
 
 type CliRuntime = ReturnType<typeof createCliRuntime>;
 type SendTelegramHtml =
   typeof import("../lib/telegram-send.ts").sendTelegramHtml;
 
-export type ReminderTurn = {
-  readonly status: string;
-  readonly message?: string;
-  readonly feedback?: (message: string) => Promise<unknown>;
-};
-
 type RunAgentTurn = (prompt: string) => Promise<ReminderTurn>;
 type Timeout = <T>(work: Promise<T>, timeoutMs: number) => Promise<T>;
-type ReminderClient = {
-  readonly sessions: {
-    create(input: { readonly message: string }): Promise<{
-      readonly response: {
-        result(): Promise<{
-          readonly status: string;
-          readonly message?: string;
-        }>;
-      };
-      readonly session: {
-        send(message: string): Promise<unknown>;
-        reset(options: { readonly reason: string }): Promise<unknown>;
-      };
-    }>;
-  };
-};
-type CreateClient = () => Promise<ReminderClient>;
 
 export type RemindDependencies = {
   readonly createClient?: CreateClient;
@@ -64,46 +51,6 @@ const deadline: Timeout = (work, timeoutMs) =>
     );
   });
 
-async function defaultCreateClient(): Promise<ReminderClient> {
-  const { Client } = await import("eve/client");
-  const port = process.env.IVA_PORT ?? "8723";
-  const host = process.env.ASSISTANT_HOST ?? `http://127.0.0.1:${port}`;
-  const bearer = process.env.ASSISTANT_BEARER;
-  return new Client({
-    host,
-    ...(bearer ? { auth: { bearer: () => Promise.resolve(bearer) } } : {}),
-  });
-}
-
-async function runAgentTurn(
-  prompt: string,
-  createClient: CreateClient = defaultCreateClient,
-): Promise<ReminderTurn> {
-  const client = await createClient();
-  let session:
-    Awaited<ReturnType<typeof client.sessions.create>>["session"] | undefined;
-  try {
-    const created = await client.sessions.create({ message: prompt });
-    session = created.session;
-    const result = await created.response.result();
-    return {
-      status: result.status,
-      ...(typeof result.message === "string"
-        ? { message: result.message }
-        : {}),
-      feedback: async (message) => session?.send(message),
-    };
-  } finally {
-    if (session) {
-      try {
-        await session.reset({ reason: "Reminder finished" });
-      } catch (error) {
-        console.error("remind: session reset failed:", error);
-      }
-    }
-  }
-}
-
 /** Create the remind command without reading .env or touching eve at import time. */
 export function createRemindCommand(
   runtime: CliRuntime,
@@ -124,31 +71,39 @@ export function createRemindCommand(
       throw new Error(
         "No target chat — set TELEGRAM_DIGEST_CHAT_ID or TELEGRAM_ALLOWED_USER_IDS in .env",
       );
+    const client = reminderClientOptions(env);
 
     let turn: ReminderTurn | undefined;
+    let failure: string | undefined;
     try {
       const { tr } = await import("#lib/i18n.ts");
-      const prompt =
-        `A one-time reminder fired: ${JSON.stringify(text)}. ` +
-        "Check whether it is still relevant; the task may already be closed, so inspect tasks. " +
-        "Formulate a short reminder message for the user and return it as the final text of this turn. " +
-        `Return the text ${writtenInLanguage(tr)}. ` +
-        "Do not send anything yourself: no rich messages and no Telegram tools. " +
-        "Only the finished reminder text, no preamble.";
+      const prompt = reminderPrompt(text, tr);
       const timeoutMs = dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS;
       const runner =
         dependencies.runAgentTurn ??
-        ((prompt) => runAgentTurn(prompt, dependencies.createClient));
+        ((prompt) =>
+          runReminderTurn(prompt, client, {
+            createClient: dependencies.createClient,
+          }));
       turn = await (dependencies.timeout ?? deadline)(
         runner(prompt),
         timeoutMs,
       );
-    } catch {
+    } catch (error) {
       turn = undefined;
+      failure = error instanceof Error ? error.message : String(error);
     }
 
     const agentMessage =
       turn?.status !== "failed" && turn?.message ? turn.message : undefined;
+    if (!agentMessage) {
+      const cause =
+        failure ??
+        (turn?.status === "failed"
+          ? `status "failed"${turn.message ? `: ${turn.message}` : ""}`
+          : `no text (status "${turn?.status}")`);
+      console.error(`remind: agent turn failed: ${cause}`);
+    }
     const message = agentMessage ?? `⏰ ${text}`;
     const send =
       dependencies.send ??

@@ -1,10 +1,6 @@
 ---
 name: security-defense
-description: >
-  Procedures for handling untrusted content, suspected prompt injection, secret exposure,
-  data exfiltration, and manual security inspection. Use for emails, web pages, forwarded
-  messages, webhooks, group content, or a suspected leak. Do not use as a general claim that
-  every command or model call is automatically governed at runtime.
+description: "Untrusted content, prompt injection, secret leak: emails, pages, forwards, webhooks, group content."
 ---
 
 # Security Defense

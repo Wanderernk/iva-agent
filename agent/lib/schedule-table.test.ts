@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import "../../scripts/lib/ts-esm-hooks.ts";
 import { runScheduleMigration } from "./schedule-migration.ts";
 import {
+  REMINDER_TICK_CRON,
   SCHEDULE_CRON,
   type ScheduleCron,
   type ScheduleName,
@@ -58,8 +59,12 @@ void test("the table pins the cron expressions Iva ships with", () => {
       "memory-monthly": "20 4 1 * *",
       "memory-yearly": "25 4 1 1 *",
       digest: "0 8 * * *",
+      "jobs-watchdog": "17 7 * * *",
     },
   );
+  // Диспетчер напоминаний стоит вне SCHEDULE_CRON: у него нет ни записи статуса, ни
+  // точки догона, а его состояние - сама таблица напоминаний.
+  assert.equal(REMINDER_TICK_CRON, "* * * * *");
 });
 
 void test("parseCron reads every entry off its cron string", () => {
@@ -71,6 +76,7 @@ void test("parseCron reads every entry off its cron string", () => {
       { minute: 20, hour: 4, dayOfMonth: 1, month: null, dayOfWeek: null },
       { minute: 25, hour: 4, dayOfMonth: 1, month: 1, dayOfWeek: null },
       { minute: 0, hour: 8, dayOfMonth: null, month: null, dayOfWeek: null },
+      { minute: 17, hour: 7, dayOfMonth: null, month: null, dayOfWeek: null },
     ],
   );
 });
@@ -132,7 +138,7 @@ void test("every schedule file takes its cron from the table", async () => {
     .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"))
     .map((entry) => entry.replace(/\.ts$/, ""))
     .sort();
-  assert.deepEqual(files, [...NAMES].sort());
+  assert.deepEqual(files, [...NAMES, "reminders"].sort());
 
   for (const name of NAMES) {
     const module = (await import(`../schedules/${name}.ts`)) as {
@@ -140,6 +146,11 @@ void test("every schedule file takes its cron from the table", async () => {
     };
     assert.equal(module.default.cron, SCHEDULE_CRON[name]);
   }
+
+  const reminders = (await import("../schedules/reminders.ts")) as {
+    readonly default: { readonly cron: string };
+  };
+  assert.equal(reminders.default.cron, REMINDER_TICK_CRON);
 });
 
 // The catch-up consumer never exposes the due point it computes; it only decides whether a
@@ -279,7 +290,7 @@ void test("no cron expression survives outside the table", () => {
   for (const file of [...sourceFiles("agent"), ...sourceFiles("scripts")]) {
     if (file === TABLE_FILE) continue;
     const source = readFileSync(join(REPO_ROOT, file), "utf8");
-    for (const cron of Object.values(SCHEDULE_CRON)) {
+    for (const cron of [...Object.values(SCHEDULE_CRON), REMINDER_TICK_CRON]) {
       if (source.includes(cron)) offenders.push(`${file}: ${cron}`);
     }
   }

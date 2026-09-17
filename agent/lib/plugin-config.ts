@@ -14,26 +14,60 @@ import { dataDir } from "./data-dir.ts";
 import { pluginConfigFile, pluginEnvFile } from "./plugin-store.ts";
 
 /**
+ * Состояние файла конфига: три исхода, а не два (agent/lib/settings.ts решает так же).
+ * «Файла нет» — нормальная жизнь плагина без настроек; «испорчен» — ошибка владельца,
+ * о которой обязан сказать и журнал, и `iva doctor`. Одна формула на обе поверхности:
+ * разойтись им нельзя, иначе доктор начнёт ругаться на то, что рантайм принимает.
+ */
+export type PluginConfigState =
+  | { readonly state: "missing" }
+  | { readonly state: "loaded"; readonly values: Record<string, unknown> }
+  | { readonly state: "damaged"; readonly reason: string };
+
+export function readPluginConfigState(
+  name: string,
+  dir: string = dataDir(),
+): PluginConfigState {
+  let raw: string;
+  try {
+    raw = readFileSync(pluginConfigFile(dir, name), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { state: "missing" }
+      : { state: "damaged", reason: (error as Error).message };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return {
+      state: "damaged",
+      reason: `invalid JSON: ${(error as Error).message}`,
+    };
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? { state: "loaded", values: parsed as Record<string, unknown> }
+    : { state: "damaged", reason: "must contain a JSON object" };
+}
+
+/**
  * Значения конфига плагина `name`, как их написал владелец. Файла нет, он не читается
  * или в нём не объект — пустой конфиг.
  *
  * Тип выводится из места вызова: проверяет значения схема расширения (Standard Schema
  * у eve), и второй валидации здесь быть не должно — она разошлась бы с первой.
+ *
+ * Пустой конфиг из-за ошибки в файле выглядит точно как конфиг, которого нет, поэтому
+ * настройка владельца исчезала бесследно. Значение по-прежнему пустое (уронить ход
+ * нельзя), но теперь об этом есть строка в журнале.
  */
 export function readPluginConfig<T = Record<string, unknown>>(name: string): T {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(
-      readFileSync(pluginConfigFile(dataDir(), name), "utf8"),
+  const config = readPluginConfigState(name);
+  if (config.state === "damaged")
+    console.error(
+      `[plugin ${name}] ${pluginConfigFile(dataDir(), name)} is unusable: ${config.reason} - using an empty config`,
     );
-  } catch {
-    return {} as T;
-  }
-  return (
-    typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      ? parsed
-      : {}
-  ) as T;
+  return (config.state === "loaded" ? config.values : {}) as T;
 }
 
 /**

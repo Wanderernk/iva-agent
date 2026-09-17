@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { traceContextParts, traceTurnBound } from "./trace.ts";
 import { localStamp } from "./vault-daily.ts";
+import { resolveVaultDir } from "@iva/vault-dir";
 
 type ChatStatus = Record<string, unknown> | null;
 type GetStatus = (chatKey: string) => ChatStatus;
@@ -212,7 +213,7 @@ export async function publishTelegramTurnStarted({
   traceContextParts(
     turnId,
     sessionId,
-    process.env.ASSISTANT_VAULT_DIR || "vault",
+    resolveVaultDir(process.cwd()),
     localStamp().date,
   );
   const current = getStatusImpl(chatKey);

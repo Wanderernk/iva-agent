@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-floating-promises -- Node's test runner owns registrations. */
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -186,4 +187,20 @@ void test("the vault template ignores half-written temp files, not real cards", 
     .filter(Boolean)
     .sort();
   assert.deepEqual(staged, [".gitignore", "MOC.md", "cards/ivan.md"]);
+});
+
+// T24 v3: пустое значение — одна строка причины и код 1, без стека на импорте.
+test("пустой ASSISTANT_VAULT_DIR: одна строка и код 1 без стека", async (t) => {
+  const root = await sandbox(t);
+  makeTemplate(root);
+  const result = spawnSync(process.execPath, [INIT_VAULT], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, ASSISTANT_VAULT_DIR: "" },
+  });
+  assert.equal(result.status, 1, result.stderr);
+  const err = result.stderr.trim();
+  assert.match(err, /ASSISTANT_VAULT_DIR/);
+  assert.ok(!err.includes("    at "), `в stderr стек: ${err}`);
+  assert.ok(err.split("\n").length === 1, `строк больше одной: ${err}`);
 });

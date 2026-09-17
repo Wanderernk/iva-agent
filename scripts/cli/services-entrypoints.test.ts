@@ -3,19 +3,17 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   chmod,
-  cp,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
   rm,
-  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -36,16 +34,9 @@ async function fixture(t: TestContext): Promise<CliFixture> {
   const fakeBin = join(dir, "bin");
   const systemctlLog = join(dir, "systemctl.log");
   const journalctlLog = join(dir, "journalctl.log");
-  await mkdir(join(project, "bin"), { recursive: true });
-  await mkdir(join(project, "scripts"), { recursive: true });
   await mkdir(home, { recursive: true });
   await mkdir(fakeBin, { recursive: true });
-  await copyFile(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts/cli"), join(project, "scripts/cli"), {
-    recursive: true,
-  });
-  await symlink(join(ROOT, "scripts/lib"), join(project, "scripts/lib"), "dir");
-  await symlink(join(ROOT, "deploy"), join(project, "deploy"), "dir");
+  await plantCliTree(ROOT, project, { copy: ["scripts/cli"] });
 
   const systemctl = join(fakeBin, "systemctl");
   await writeFile(

@@ -14,11 +14,12 @@ import { join } from "node:path";
 
 import character from "./character.ts";
 import search from "./search.ts";
+import rich from "./rich.ts";
+import voice from "./voice.ts";
 // gws.ts импортируем ДИНАМИЧЕСКИ в своём тесте: он считает SECRET_PATH от homedir() при
 // загрузке, поэтому HOME переопределяем ДО импорта, чтобы не тронуть реальный ~/.config/gws.
 
-type Button = { text: string; callback_data: string };
-type View = { text: string; rows: Button[][] };
+type View = { text: string };
 type AwaitText = {
   kind: string;
   secret: boolean;
@@ -39,13 +40,11 @@ type MenuState = {
 type MenuContext = {
   deps: Record<string, unknown>;
   flows: {
-    screen: (state: MenuState, text: string, rows: Button[][]) => Promise<void>;
-    end: (state: MenuState, text: string, rows: Button[][]) => Promise<void>;
+    screen: (state: MenuState, text: string) => Promise<void>;
+    end: (state: MenuState, text: string) => Promise<void>;
   };
   tr: (english: string, russian: string) => string;
   getLang: () => string;
-  btn: (text: string, data: string) => Button;
-  backRow: (screen: string) => Button[];
   show: (state: MenuState, screen: string) => Promise<void>;
 };
 type Screen = {
@@ -69,6 +68,18 @@ type Screen = {
 
 const characterScreen = character as unknown as Screen;
 const searchScreen = search as unknown as Screen;
+const richScreen = rich as unknown as Screen;
+const voiceScreen = voice as unknown as Screen;
+
+// Кнопка — тег в markdown: подпись и data достаём из строки экрана.
+const buttonsOf = (text: string): Array<[string, string]> =>
+  [
+    ...text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
+const dataOf = (text: string): string[] =>
+  buttonsOf(text).map(([, data]) => data);
 
 // ── лёгкий стенд ctx по контракту движка (index.ts), но без самого движка ───────────────
 // flows.screen/end пишут в st._last и накапливают рендеры; ctx.show зовёт render модуля из
@@ -85,7 +96,6 @@ function makeCtx({
   const rendered: Array<{
     kind: "screen" | "end";
     text: string;
-    rows: Button[][];
   }> = [];
   const harness: {
     ctx: MenuContext;
@@ -97,15 +107,15 @@ function makeCtx({
     st: null,
   };
   const flows = {
-    screen: (st: MenuState, text: string, rows: Button[][]) => {
+    screen: (st: MenuState, text: string) => {
       st.msgId ??= 1;
-      st._last = { text, rows };
-      rendered.push({ kind: "screen", text, rows });
+      st._last = { text };
+      rendered.push({ kind: "screen", text });
       return Promise.resolve();
     },
-    end: (st: MenuState, text: string, rows: Button[][]) => {
-      st._last = { text, rows };
-      rendered.push({ kind: "end", text, rows });
+    end: (st: MenuState, text: string) => {
+      st._last = { text };
+      rendered.push({ kind: "end", text });
       return Promise.resolve();
     },
     touch: () => {},
@@ -116,19 +126,12 @@ function makeCtx({
     lang,
     tr: (en: string, ru: string) => (lang === "ru" ? ru : en),
     getLang: () => lang,
-    btn: (text: string, data: string) => ({ text, callback_data: data }),
-    backRow: (sid: string) => [
-      {
-        text: sid === "r" ? "‹ Меню" : "‹ Назад",
-        callback_data: `iva_menu:${sid}:o`,
-      },
-    ],
     show: async (st: MenuState, sid: string) => {
       st.screen = sid;
       const mod = screens[sid];
       if (mod) {
         const v = await mod.render(st, ctx);
-        if (v) await flows.screen(st, v.text, v.rows);
+        if (v) await flows.screen(st, v.text);
       }
     },
   };
@@ -159,7 +162,7 @@ test("character: 10 ответов скорятся через scoreQuiz, apply 
   // Интро (verb o) — предупреждение + [Начать].
   const intro = characterScreen.render(st, h.ctx) as View;
   assert.match(intro.text, /Характер/);
-  assert.ok(intro.rows.some((r) => r[0].callback_data === "iva_menu:chr:go"));
+  assert.ok(dataOf(intro.text).includes("iva_menu:chr:go"));
 
   // Старт квиза.
   await characterScreen.on("go", [], st, h.ctx);
@@ -177,11 +180,7 @@ test("character: 10 ответов скорятся через scoreQuiz, apply 
 
   // Последний рендер — портрет с именем архетипа и кнопками Принять/Заново.
   assert.match(st._last?.text ?? "", /Старшая сестра/);
-  assert.ok(
-    (st._last?.rows ?? []).some((r) =>
-      r.some((b) => b.callback_data === "iva_menu:chr:apply"),
-    ),
-  );
+  assert.ok(dataOf(st._last?.text ?? "").includes("iva_menu:chr:apply"));
 
   // apply пишет vault/PERSONA.md: <=800 симв., самодостаточная инструкция с кодом.
   await characterScreen.on("apply", [], st, h.ctx);
@@ -221,14 +220,14 @@ test("search: render ✓ текущий провайдер и 🔑 наличи�
   h.st = st;
 
   const view = await searchScreen.render(st, h.ctx);
-  const labelOf = (id: string) =>
-    view.rows
-      .map((r) => r[0])
-      .find((b) => b.callback_data === `iva_menu:srch:set:${id}`)?.text;
+  const buttonOf = (id: string) =>
+    buttonsOf(view.text).find(
+      ([, callback]) => callback === `iva_menu:srch:set:${id}`,
+    );
 
-  const brave = labelOf("brave");
-  const tavily = labelOf("tavily");
-  const exa = labelOf("exa");
+  const brave = buttonOf("brave")?.[0];
+  const tavily = buttonOf("tavily")?.[0];
+  const exa = buttonOf("exa")?.[0];
   assert.ok(brave?.startsWith("✓ "), `brave текущий: ${brave}`);
   assert.ok(!brave?.includes("🔑"), `у brave ключа нет: ${brave}`);
   assert.ok(tavily?.includes("🔑"), `у tavily ключ есть: ${tavily}`);
@@ -238,9 +237,7 @@ test("search: render ✓ текущий провайдер и 🔑 наличи�
     `exa без бейджей: ${exa}`,
   );
   // «Сменить ключ» указывает на текущего провайдера.
-  assert.ok(
-    view.rows.some((r) => r[0].callback_data === "iva_menu:srch:key:brave"),
-  );
+  assert.ok(dataOf(view.text).includes("iva_menu:srch:key:brave"));
   // Значения ключей нигде в тексте/кнопках.
   assert.ok(!JSON.stringify(view).includes("tvly-abc12345"));
 });
@@ -276,10 +273,10 @@ test("search: inherited property names are never accepted as providers", async (
   h.st = st;
 
   const view = await searchScreen.render(st, h.ctx);
-  const tavily = view.rows
-    .flat()
-    .find((button) => button.callback_data === "iva_menu:srch:set:tavily");
-  assert.ok(tavily?.text.startsWith("✓ "));
+  const tavily = buttonsOf(view.text).find(
+    ([, callback]) => callback === "iva_menu:srch:set:tavily",
+  );
+  assert.ok(tavily?.[0].startsWith("✓ "));
 
   await searchScreen.on("set", ["toString"], st, h.ctx);
   assert.equal(st.awaitText, null);
@@ -293,6 +290,144 @@ test("search: inherited property names are never accepted as providers", async (
   assert.equal(st.awaitText, null);
   assert.match(st._last?.text ?? "", /doesn't look like a key/);
   assert.equal(readFileSync(envPath, "utf8"), "SEARCH_PROVIDER=toString\n");
+});
+
+// ── 2b. rich: тумблер TELEGRAM_RICH_REPLIES ───────────────────────────────────────────
+test("rich: ✓ на текущем режиме, запись в .env и предложение рестарта", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iva-env-rich-"));
+  const envPath = join(dir, ".env");
+  writeFileSync(envPath, "TELEGRAM_RICH_REPLIES=never\n");
+  const restarts: Array<[string, string]> = [];
+  const h = makeCtx({
+    lang: "ru",
+    deps: {
+      envPath,
+      sc: (action: string, unit: string) => {
+        restarts.push([action, unit]);
+        return Promise.resolve(true);
+      },
+    },
+    screens: { rich: richScreen },
+  });
+  const st = newState({ screen: "rich" });
+  h.st = st;
+
+  const view = await richScreen.render(st, h.ctx);
+  const labelOf = (data: string) =>
+    buttonsOf(view.text).find(([, callback]) => callback === data)?.[0];
+  assert.ok(labelOf("iva_menu:rich:set:never")?.endsWith("✓"));
+  assert.ok(!labelOf("iva_menu:rich:set:auto")?.includes("✓"));
+
+  await richScreen.on("set", ["auto"], st, h.ctx);
+  assert.equal(readFileSync(envPath, "utf8"), "TELEGRAM_RICH_REPLIES=auto\n");
+  assert.ok(dataOf(st._last?.text ?? "").includes("iva_menu:rich:rs:now"));
+
+  await richScreen.on("rs", ["now"], st, h.ctx);
+  assert.deepEqual(restarts, [["restart", "iva.service"]]);
+  assert.match(st._last?.text ?? "", /режим ответов активен/);
+});
+
+test("rich: кривое значение .env названо на экране и ничем не помечено", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iva-env-rich-bad-"));
+  const envPath = join(dir, ".env");
+  writeFileSync(envPath, "TELEGRAM_RICH_REPLIES=maybe\n");
+  const h = makeCtx({
+    lang: "ru",
+    deps: { envPath, sc: () => Promise.resolve(true) },
+    screens: { rich: richScreen },
+  });
+  const st = newState({ screen: "rich" });
+  h.st = st;
+
+  const view = await richScreen.render(st, h.ctx);
+  assert.match(view.text, /TELEGRAM_RICH_REPLIES=maybe/);
+  assert.match(view.text, /не стартует/);
+  assert.ok(!view.text.includes("✓"), "✓ не выдуман при кривом значении");
+  // Переключатель всё равно на месте: этим экраном значение и чинится.
+  assert.deepEqual(dataOf(view.text).sort(), [
+    "iva_menu:r:o",
+    "iva_menu:rich:set:auto",
+    "iva_menu:rich:set:never",
+  ]);
+});
+
+// ── 2c. voice: ключ Deepgram и язык распознавания ─────────────────────────────────────
+test("voice: ключ принимается в личке, пишется в .env, язык переключается", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iva-env-voice-"));
+  const envPath = join(dir, ".env");
+  writeFileSync(envPath, "DEEPGRAM_LANGUAGE=ru\n");
+  const h = makeCtx({
+    lang: "ru",
+    deps: { envPath, sc: () => Promise.resolve(true) },
+    screens: { voice: voiceScreen },
+  });
+  const st = newState({ screen: "voice", chatId: 555 }); // положительный chatId = личка
+  h.st = st;
+
+  const view = await voiceScreen.render(st, h.ctx);
+  assert.match(view.text, /Ключ Deepgram: нет/);
+  assert.match(view.text, /Без ключа голосовые не распознаются/);
+  assert.match(view.text, /Язык: Русский/);
+  assert.ok(
+    buttonsOf(view.text)
+      .find(([, callback]) => callback === "iva_menu:voice:lang:ru")?.[0]
+      .endsWith("✓"),
+  );
+
+  await voiceScreen.on("key", [], st, h.ctx);
+  assert.equal(st.awaitText?.kind, "deepgramkey");
+  assert.equal(st.awaitText?.secret, true);
+
+  const key = "dg-abcdef1234567890";
+  await voiceScreen.texts?.deepgramkey(key, null, st, h.ctx);
+  assert.equal(st.awaitText, null);
+  assert.match(
+    readFileSync(envPath, "utf8"),
+    /DEEPGRAM_API_KEY=dg-abcdef1234567890/,
+  );
+  assert.ok(dataOf(st._last?.text ?? "").includes("iva_menu:voice:rs:now"));
+  assert.ok(
+    h.rendered.every(({ text }) => !text.includes(key)),
+    "значение ключа не попало ни в один экран",
+  );
+
+  await voiceScreen.on("lang", ["uz"], st, h.ctx);
+  assert.match(readFileSync(envPath, "utf8"), /DEEPGRAM_LANGUAGE=uz/);
+  await voiceScreen.on("rs", ["later"], st, h.ctx);
+  assert.match(st._last?.text ?? "", /после перезапуска/);
+});
+
+test("voice: в группе ключ не принимается, а мусор вместо ключа снимает ожидание", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iva-env-voice-bad-"));
+  const envPath = join(dir, ".env");
+  writeFileSync(envPath, "");
+  const h = makeCtx({
+    lang: "ru",
+    deps: { envPath, sc: () => Promise.resolve(true) },
+    screens: { voice: voiceScreen },
+  });
+
+  // Группа (отрицательный chatId): секрет не принимаем, ожидание не ставим.
+  const group = newState({ screen: "voice", chatId: -100500 });
+  await voiceScreen.on("key", [], group, h.ctx);
+  assert.equal(group.awaitText, null);
+  assert.match(group._last?.text ?? "", /личн/i);
+
+  // Личка: вместо ключа пришёл обычный текст — ожидание снято, .env не тронут.
+  const priv = newState({ screen: "voice", chatId: 555 });
+  await voiceScreen.on("key", [], priv, h.ctx);
+  assert.ok(priv.awaitText);
+  await voiceScreen.texts?.deepgramkey("это не ключ", null, priv, h.ctx);
+  assert.equal(priv.awaitText, null);
+  assert.match(priv._last?.text ?? "", /не приму/);
+  assert.equal(readFileSync(envPath, "utf8"), "");
+
+  // Смена языка уводит с приглашения вводить ключ: ожидание снимается, и следующий
+  // обычный текст владельца не съедается как ключ.
+  await voiceScreen.on("key", [], priv, h.ctx);
+  assert.ok(priv.awaitText);
+  await voiceScreen.on("lang", ["ru"], priv, h.ctx);
+  assert.equal(priv.awaitText, null);
 });
 
 // ── 3. gws: валидация shape client_secret.json (bad JSON / неверная форма / успех 0600) ──

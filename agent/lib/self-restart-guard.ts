@@ -28,28 +28,60 @@ function normalize(command: string): string {
   return command.replace(/\\(.)/g, "$1").replace(/["']/g, "");
 }
 
-// Разделители командных позиций: ; & | && || ( ) ` $( и перевод строки.
-const SEGMENT_SPLIT = /[;&|()`\n]+/;
+// Разделители командных позиций: ; & | && || ( ) ` $( и перевод строки. Амперсанд ПОСЛЕ
+// `>` разделителем не считается: `2>&1`, `>&2` - это дублирование файлового дескриптора,
+// часть одной команды. Разрезав их, мы оставляли хвост `2>` и читали
+// `grep … >/dev/null 2>&1` как запись в файл.
+//
+// Форма `&>file` (оба потока в файл) здесь нарочно НЕ исключена, хотя тоже одна команда:
+// её разрез вердикт не меняет ни у одного правила - второй кусок начинается с `>`,
+// читателем не бывает и путь уносит с собой. Гвард, который нельзя сломать мутацией,
+// - не гвард, а комментарий; правило вернётся вместе с правилом, которому оно нужно.
+const SEGMENT_SPLIT = /(?:(?<!>)&|[;|()`\n])+/;
 
 // Обёртки, после которых следующий токен — снова командная позиция: слово + его флаги
 // и VAR=значение; у timeout дополнительно съедается длительность. bash/sh -c и node
 // включены: после снятия кавычек `bash -c iva restart` исполняет ровно iva restart,
-// а `node bin/iva.mjs restart` — тот же CLI напрямую.
+// а `node bin/iva.mjs restart` — тот же CLI напрямую. Shell-слова ветвления и циклов
+// стоят перед командной позицией так же: без них `while :; do iva restart; done`
+// оставлял бы позиции `while :` и `do iva restart` и правило не срабатывало.
 const WRAPPER =
-  /^(?:(?:sudo|command|exec|nohup|setsid|nice|node|env|(?:ba|da|z)?sh)(?:\s+(?:-\S+|\w+=\S*))*|timeout(?:\s+-\S+)*\s+\S+)\s+/;
+  /^(?:(?:sudo|command|exec|nohup|setsid|nice|node|env|if|then|elif|else|while|until|do|(?:ba|da|z)?sh)(?:\s+(?:-\S+|\w+=\S*))*|timeout(?:\s+-\S+)*\s+\S+)\s+/;
 
-function commandPositions(command: string): string[] {
-  const out: string[] = [];
+// Голое присваивание перед командой - та же обёртка, только без слова `env`: shell
+// исполняет `TZ=UTC crontab /tmp/j` и `env TZ=UTC crontab /tmp/j` одинаково. Снимаем
+// его так же, иначе команда не попадает в командную позицию и правила её не видят.
+// Требуется пробел после: одинокое `A=1` - это присваивание, а не вызов.
+const ASSIGNMENT_PREFIX = /^[A-Za-z_]\w*=\S*\s+/;
+
+/**
+ * Одна командная позиция в двух видах. `command` - со снятыми обёртками и
+ * присваиваниями: по нему судят ИМЯ команды. `segment` - весь кусок как он написан:
+ * по нему судят то, что может лежать в значении обёртки или присваивания. Запретный
+ * путь в `S=~/.iva-scripts/x.sh bash -c '… $S'` виден только во втором.
+ */
+export type CommandPosition = {
+  readonly segment: string;
+  readonly command: string;
+};
+
+export function commandSegments(command: string): CommandPosition[] {
+  const out: CommandPosition[] = [];
   for (const raw of normalize(command).split(SEGMENT_SPLIT)) {
+    const segment = raw.trim();
     let seg = raw.trimStart();
     for (;;) {
-      const m = WRAPPER.exec(seg);
+      const m = WRAPPER.exec(seg) ?? ASSIGNMENT_PREFIX.exec(seg);
       if (!m || !m[0].trim()) break;
       seg = seg.slice(m[0].length).trimStart();
     }
-    if (seg) out.push(seg);
+    if (seg) out.push({ segment, command: seg });
   }
   return out;
+}
+
+export function commandPositions(command: string): string[] {
+  return commandSegments(command).map((at) => at.command);
 }
 
 // Сам CLI: restart|stop|reset|full-reset останавливают iva.service; update перезапускает

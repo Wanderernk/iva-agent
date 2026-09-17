@@ -11,6 +11,7 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { notificationChat } from "./notification-chat.ts";
+import { button, escapeRichText, screenPayload } from "./telegram-buttons.ts";
 import { resolveUpdateTarget, type GitResult } from "./update-channel.ts";
 
 export { notificationChat };
@@ -21,7 +22,8 @@ export type GitCommand = (
 ) => Promise<GitResult | string>;
 type UpdateOffer = {
   text: string;
-  replyMarkup: { inline_keyboard: { text: string; callback_data: string }[][] };
+  // Кнопки — последний абзац text; отдаются отдельно, чтобы вставить блок между телом и ними.
+  actions: string;
 };
 type TelegramResponse = {
   ok: boolean;
@@ -287,6 +289,32 @@ export async function inspectUpstream({
   };
 }
 
+/**
+ * Строки «кнопка — что она делает» для предложения обновления. Одна сборка на оба
+ * экрана, которые его показывают: ежедневный Alert (updateOffer) и /update в мосте.
+ * `what` — что именно поставит кнопка: «v0.4.2» или «новую сборку», когда номер тот же.
+ */
+export function updateOfferActionLines(locale: string, what: string): string {
+  const ru = locale === "ru";
+  const update = ru ? "⬆️ Обновить" : "⬆️ Update";
+  const later = ru ? "Позже" : "Later";
+  return [
+    `${button(update, "iva_update:do", "success")} — ${ru ? `поставить ${what}` : `install ${what}`}`,
+    `${button(later, "iva_update:skip")} — ${ru ? "напомню завтра" : "I'll remind you tomorrow"}`,
+  ].join("\n\n");
+}
+
+/**
+ * Что обновление действительно оставляет на месте, одной строкой на оба экрана
+ * предложения. Правки в коде Ивы оно не переносит: версия ставится из коммита
+ * (решение владельца 13.09.2026), и обещать обратное нельзя.
+ */
+export function updateKeepsLine(locale: string): string {
+  return locale === "ru"
+    ? "Настройки, память и ваши скиллы на месте. Правки в коде Ивы не переносятся."
+    : "Settings, memory and your skills stay in place. Edits to Iva's own code are not carried over.";
+}
+
 export function updateOffer(
   localVersion: string | null | undefined,
   remoteVersion: string | null | undefined,
@@ -297,26 +325,19 @@ export function updateOffer(
 ): UpdateOffer {
   const ru = locale === "ru";
   const head = ru
-    ? `⬆️ Доступна новая версия Ивы\n\nv${localVersion} → v${remoteVersion}`
-    : `⬆️ A new Iva version is available\n\nv${localVersion} → v${remoteVersion}`;
+    ? `⬆️ Доступна новая версия Ивы\n\nv${escapeRichText(String(localVersion))} → v${escapeRichText(String(remoteVersion))}`
+    : `⬆️ A new Iva version is available\n\nv${escapeRichText(String(localVersion))} → v${escapeRichText(String(remoteVersion))}`;
   const tail = updaterTooOld
     ? repairInstructions(locale)
-    : ru
-      ? "Настройки и локальные изменения будут сохранены."
-      : "Settings and local changes will be preserved.";
+    : updateKeepsLine(locale);
+  // Кнопки — строки самого сообщения: каждая рядом со своим пояснением (контракт rich).
+  const actions = updateOfferActionLines(
+    locale,
+    `v${escapeRichText(String(remoteVersion))}`,
+  );
   return {
-    text: `${head}\n${tail}`,
-    replyMarkup: {
-      inline_keyboard: [
-        [
-          {
-            text: ru ? "⬆️ Обновить" : "⬆️ Update",
-            callback_data: "iva_update:do",
-          },
-          { text: ru ? "Позже" : "Later", callback_data: "iva_update:skip" },
-        ],
-      ],
-    },
+    text: `${head}\n\n${tail}\n\n${actions}`,
+    actions,
   };
 }
 
@@ -332,16 +353,15 @@ export async function sendUpdateOffer({
   fetchImpl?: TelegramFetch;
 } = {}): Promise<unknown> {
   if (!offer) throw new Error("update offer is required");
+  // Стиль меню владельца: rich message или обычный текст с клавиатурой (classic).
+  const payload = screenPayload(offer.text);
+  const method = "rich_message" in payload ? "sendRichMessage" : "sendMessage";
   const response = await fetchImpl(
-    `https://api.telegram.org/bot${token}/sendMessage`,
+    `https://api.telegram.org/bot${token}/${method}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: offer.text,
-        reply_markup: offer.replyMarkup,
-      }),
+      body: JSON.stringify({ chat_id: chatId, ...payload }),
     },
   );
   const data: { ok?: boolean; result?: unknown; description?: string } =

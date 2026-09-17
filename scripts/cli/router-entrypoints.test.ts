@@ -36,6 +36,7 @@ void test("no arguments and every help alias preserve one exact successful respo
     "config",
     "login",
     "doctor",
+    "diagnose",
     "status",
     "restart",
     "reset",

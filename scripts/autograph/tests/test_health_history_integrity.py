@@ -61,11 +61,11 @@ class HealthHistoryIntegrityTests(unittest.TestCase):
     def assert_corrupt_unchanged(self, raw: bytes):
         self.history.write_bytes(raw)
         with self.assertRaisesRegex(RuntimeError, "health history is corrupt"):
-            graph.update_history(self.vault, self.stats)
+            graph.update_history(self.vault, self.stats, date(2026, 8, 20))
         self.assertEqual(self.history.read_bytes(), raw)
 
     def test_missing_history_is_created(self):
-        graph.update_history(self.vault, self.stats)
+        graph.update_history(self.vault, self.stats, date(2026, 8, 20))
         value = json.loads(self.history.read_text(encoding="utf-8"))
         self.assertEqual(len(value), 1)
         self.assertEqual(value[0]["health_score"], 83)
@@ -74,10 +74,35 @@ class HealthHistoryIntegrityTests(unittest.TestCase):
     def test_valid_history_is_appended(self):
         original = [{"date": "2026-08-15", "health_score": 84}]
         self.history.write_text(json.dumps(original), encoding="utf-8")
-        graph.update_history(self.vault, self.stats)
+        graph.update_history(self.vault, self.stats, date(2026, 8, 20))
         value = json.loads(self.history.read_text(encoding="utf-8"))
         self.assertEqual(value[0], original[0])
         self.assertEqual(value[1]["health_score"], 83)
+
+    def test_same_date_is_replaced_in_place(self):
+        original = [
+            {"date": "2026-08-18", "health_score": 84},
+            {"date": "2026-08-19", "health_score": 80},
+            {"date": "2026-08-19", "health_score": 81},
+            {"date": "2026-08-20", "health_score": 79},
+        ]
+        self.history.write_text(json.dumps(original), encoding="utf-8")
+        graph.update_history(self.vault, self.stats, date(2026, 8, 19))
+        value = json.loads(self.history.read_text(encoding="utf-8"))
+        self.assertEqual(
+            value,
+            [
+                {"date": "2026-08-18", "health_score": 84},
+                {"date": "2026-08-19", "health_score": 83},
+                {"date": "2026-08-20", "health_score": 79},
+            ],
+        )
+
+    def test_date_comes_from_as_of(self):
+        graph.update_history(self.vault, self.stats, date(2026, 1, 15))
+        value = json.loads(self.history.read_text(encoding="utf-8"))
+        self.assertEqual(value[-1]["date"], "2026-01-15")
+        self.assertEqual(value[-1]["health_score"], 83)
 
     def test_truncated_history_is_preserved(self):
         self.assert_corrupt_unchanged(b'[{"date":"2026-08-15"')
@@ -125,7 +150,7 @@ class HealthHistoryIntegrityTests(unittest.TestCase):
         self.history.write_bytes(raw)
         with patch.object(graph.os, "replace", side_effect=OSError("replace fault")):
             with self.assertRaisesRegex(OSError, "replace fault"):
-                graph.update_history(self.vault, self.stats)
+                graph.update_history(self.vault, self.stats, date(2026, 8, 20))
         self.assertEqual(self.history.read_bytes(), raw)
         self.assertEqual(list(self.graph_dir.glob("*.tmp")), [])
 
@@ -138,7 +163,7 @@ class HealthHistoryIntegrityTests(unittest.TestCase):
             return real_fsync(fd)
 
         with patch.object(graph.os, "fsync", side_effect=record_fsync):
-            graph.update_history(self.vault, self.stats)
+            graph.update_history(self.vault, self.stats, date(2026, 8, 20))
         self.assertEqual(len(calls), 2)
 
     def test_directory_fsync_fault_leaves_complete_json(self):
@@ -156,9 +181,65 @@ class HealthHistoryIntegrityTests(unittest.TestCase):
 
         with patch.object(graph.os, "fsync", side_effect=fail_directory_fsync):
             with self.assertRaisesRegex(OSError, "directory fsync fault"):
-                graph.update_history(self.vault, self.stats)
+                graph.update_history(self.vault, self.stats, date(2026, 8, 20))
         self.assertTrue(valid_history(self.history.read_bytes()))
         self.assertEqual(list(self.graph_dir.glob("*.tmp")), [])
+
+    def test_cli_health_writes_one_entry_per_as_of_date(self):
+        command = [
+            sys.executable,
+            str(AUTOGRAPH_DIR / "graph.py"),
+            "health",
+            str(self.vault),
+            "--as-of",
+            "2026-01-15",
+        ]
+        for _ in range(2):
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(self.history.read_text(encoding="utf-8"))
+        self.assertEqual([entry["date"] for entry in value], ["2026-01-15"])
+
+    @seed(18804)
+    @settings(max_examples=200, deadline=None)
+    @given(
+        entries=st.lists(
+            st.fixed_dictionaries(
+                {
+                    "date": st.dates().map(lambda day: day.isoformat()),
+                    "health_score": st.integers(min_value=0, max_value=100),
+                }
+            ),
+            max_size=120,
+        ),
+        as_of=st.dates(),
+    )
+    def test_one_entry_per_date_after_upsert(self, entries, as_of):
+        self.history.write_text(json.dumps(entries), encoding="utf-8")
+        graph.update_history(self.vault, self.stats, as_of)
+
+        raw = self.history.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+        expected = []
+        replaced = False
+        for entry in entries:
+            if entry["date"] == as_of.isoformat():
+                if not replaced:
+                    expected.append({"date": as_of.isoformat(), **self.stats})
+                    replaced = True
+            else:
+                expected.append(entry)
+        if not replaced:
+            expected.append({"date": as_of.isoformat(), **self.stats})
+
+        self.assertTrue(valid_history(raw))
+        self.assertLessEqual(len(value), 90)
+        self.assertEqual(
+            [entry["date"] for entry in value].count(as_of.isoformat()), 1
+        )
+        self.assertEqual(value, expected[-90:])
 
 
 if __name__ == "__main__":

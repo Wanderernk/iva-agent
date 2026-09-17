@@ -68,24 +68,14 @@ const MAX_MATCHES = 1000;
 
 export default defineTool({
   description:
-    "Regex-поиск по содержимому файлов НАПРЯМУЮ на файловой системе хоста VPS. " +
-    "path может быть файлом или директорией (по умолчанию cwd процесса); для директории " +
-    "обход рекурсивный. Опционально glob фильтрует файлы по имени пути. flags — флаги " +
-    "RegExp (напр. 'i' для регистронезависимого). Возвращает массив { file, line, text } " +
-    "(до 1000 совпадений). Бинарные/нечитаемые файлы пропускаются.",
+    "Regex-поиск по файлам хоста. path — файл или директория (по умолчанию cwd, " +
+    "рекурсивно); glob фильтрует по пути; flags — RegExp-флаги ('i', 'm'). " +
+    "Возвращает { file, line, text }, до 1000; бинарные пропускаются.",
   inputSchema: z.object({
-    pattern: z.string().min(1).describe("Регулярное выражение для поиска"),
-    path: z
-      .string()
-      .optional()
-      .describe(
-        "Файл или директория для поиска (абсолютный путь, по умолчанию cwd)",
-      ),
-    glob: z
-      .string()
-      .optional()
-      .describe("Glob-фильтр по пути файла, напр. **/*.ts"),
-    flags: z.string().optional().describe("Флаги RegExp, напр. 'i' или 'm'"),
+    pattern: z.string().min(1).describe("Регулярное выражение"),
+    path: z.string().optional().describe("Абсолютный путь, по умолчанию cwd"),
+    glob: z.string().optional().describe("Glob-фильтр, напр. **/*.ts"),
+    flags: z.string().optional().describe("Напр. 'i' или 'm'"),
   }),
   async execute({ pattern, path, glob, flags }) {
     const root = path ?? process.cwd();

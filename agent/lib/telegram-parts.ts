@@ -121,7 +121,8 @@ export function mediaFromRaw(raw: TelegramRawMessage): TelegramRawMedia | null {
       typeof photo === "object" &&
       photo !== null &&
       !Array.isArray(photo) &&
-      typeof (photo as Record<string, unknown>).file_id === "string"
+      typeof (photo as Record<string, unknown>).file_id === "string" &&
+      ((photo as Record<string, unknown>).file_id as string).length > 0
     ) {
       const photoRecord = photo as Record<string, unknown>;
       return {
@@ -143,7 +144,7 @@ export function mediaFromRaw(raw: TelegramRawMessage): TelegramRawMedia | null {
           file_name?: string;
         }
       | undefined;
-    if (item && typeof item.file_id === "string") {
+    if (item && typeof item.file_id === "string" && item.file_id.length > 0) {
       return {
         fileId: item.file_id,
         ...(typeof item.file_unique_id === "string"

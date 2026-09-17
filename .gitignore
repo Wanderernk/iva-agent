@@ -32,6 +32,9 @@ agent/skills/**/*secret*
 agent/skills/**/*credential*
 agent/skills/**/*.pem
 
+# A developer marks their own checkout with this file, and `iva update` refuses it.
+/.iva-dev
+
 # Update candidate worktree (iva update)
 /.iva-update/
 /.iva-build/
@@ -55,3 +58,4 @@ CLAUDE.md
 AGENTS.md
 docs/agents/
 .scratch/
+.worktrees/

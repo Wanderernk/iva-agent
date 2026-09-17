@@ -7,7 +7,10 @@
 // render сам решает, что показать: идёт процесс → прогресс; иначе список.
 import { join } from "node:path";
 import { readEnvValues } from "../env-file.ts";
-import { acquireUpdateLock, releaseUpdateLock } from "../update-safety.ts";
+import { updateRunning } from "../version-store.ts";
+import { button } from "./buttons.ts";
+import { menuStyle } from "../telegram-buttons.ts";
+import { writeSettings } from "#lib/settings.ts";
 import {
   LOADERS,
   currentRun,
@@ -20,15 +23,15 @@ import {
   type RunOptions,
   type ServiceRun,
 } from "./svc-run.ts";
+import { resolveVaultDir } from "../../../packages/vault-dir/index.ts";
 
 type ServiceCommand = "doc" | "cln" | "mem";
-type MenuButton = { text: string; callback_data: string };
 type ServiceStatus = "running" | "failed" | "cancelled" | "timeout" | "done";
 type CommandSpec =
   | { kind: "proc"; argv: string[]; cwd?: string; env?: NodeJS.ProcessEnv }
   | { kind: "unit"; unit: string };
 
-export type MenuServiceView = { text: string; rows: MenuButton[][] };
+export type MenuServiceView = { text: string };
 export type MenuServiceState = {
   chatId: string | number;
   userId: string;
@@ -42,7 +45,6 @@ type ServiceRunOverrides = Partial<
   >
 >;
 export type MenuServiceContext = {
-  tg: RunOptions["tg"];
   deps: {
     root: string;
     envPath: string;
@@ -53,17 +55,18 @@ export type MenuServiceContext = {
   };
   flows: {
     get: (chatId: string | number, userId: string) => MenuServiceState | null;
-    screen: (
-      state: MenuServiceState,
-      text: string,
-      rows: MenuButton[][],
-    ) => Promise<unknown>;
+    screen: (state: MenuServiceState, text: string) => Promise<unknown>;
   };
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => MenuButton;
-  backRow: (screen: string) => MenuButton[];
   show: (state: MenuServiceState, screen: string) => Promise<unknown>;
 };
+
+function backLine(ctx: MenuServiceContext): string {
+  return `${button(ctx.tr("‹ Back", "‹ Назад"), "iva_menu:svc:o")} — ${ctx.tr(
+    "back to the maintenance list.",
+    "вернуться к списку обслуживания.",
+  )}`;
+}
 
 const CMDS = new Set<ServiceCommand>(["doc", "cln", "mem"]);
 const MEM_UNIT = "iva-brain.service";
@@ -115,8 +118,7 @@ export async function commandSpec(
     };
   if (cmd === "cln") {
     const env = await readEnvValues(ctx.deps.envPath);
-    const rel = env.ASSISTANT_VAULT_DIR || "vault";
-    const vaultDir = rel.startsWith("/") ? rel : join(root, rel);
+    const vaultDir = resolveVaultDir(root, env.ASSISTANT_VAULT_DIR);
     // Скрипт живёт в репо (в vault'е его может не быть — до 0.3.3 его туда клал синк, и
     // прыжок 0.3.0 → 0.3.2 оставлял кнопку без файла: «Failed to spawn … (os error 2)»).
     // Путь абсолютный, cwd — vault: скрипты autograph берут vault первым аргументом («.»).
@@ -135,16 +137,25 @@ export async function commandSpec(
   return { kind: "unit", unit: MEM_UNIT };
 }
 
+// Шаг берём СЫРЫМ, без markdown-экранирования: текст — вывод чужого процесса, и его
+// проходит outbound-гейт (redactTelegramBody → security-gate) прямо на вызове Bot API.
+// Экранирование ломает имена ключей (`api\_key=…` больше не находка для named_secret),
+// то есть тихо сужает защиту; разметке в выводе доктора/чистки терять нечего.
 function progressView(
   run: ServiceRun,
   ctx: MenuServiceContext,
 ): MenuServiceView {
   const T = ctx.tr;
   const step = run.lastLine || T("Working…", "Работаю…");
-  return {
-    text: `${label(run.cmd, T)} — ${elapsed(run)}\n${step}`,
-    rows: [[ctx.btn(T("✖ Cancel", "✖ Отменить"), "iva_menu:svc:ab")]],
-  };
+  const text = [
+    `${LOADERS[run.cmd].alt} **${label(run.cmd, T)}** — ${elapsed(run)}`,
+    step,
+    `${button(T("✖ Cancel", "✖ Отменить"), "iva_menu:svc:ab", "danger")} — ${T(
+      "stop the command.",
+      "остановить команду.",
+    )}`,
+  ].join("\n\n");
+  return { text };
 }
 
 // Финальная сводка. Чистка: парсим «cleanup (applied): N file(s), X bytes …» → файлы и МБ.
@@ -228,29 +239,46 @@ function idleView(
 ): MenuServiceView {
   const T = ctx.tr;
   const lines = [
-    T("🛠 Maintenance", "🛠 Обслуживание"),
-    "",
+    `# ${T("🛠 Maintenance", "🛠 Обслуживание")}`,
     T(
       "Diagnostics and upkeep for this install.",
       "Диагностика и уход за инсталляцией.",
     ),
   ];
   const run = currentRun();
-  if (run && run.status !== "running") lines.push("", lastRunLine(run, ctx));
-  return {
-    text: lines.join("\n"),
-    rows: [
-      [
-        ctx.btn(label("doc", T), "iva_menu:svc:c:doc"),
-        ctx.btn(label("cln", T), "iva_menu:svc:c:cln"),
-      ],
-      [
-        ctx.btn(label("mem", T), "iva_menu:svc:c:mem"),
-        ctx.btn(T("🔄 Update", "🔄 Обновление"), "iva_menu:svc:up"),
-      ],
-      ctx.backRow("r"),
-    ],
-  };
+  if (run && run.status !== "running") lines.push(lastRunLine(run, ctx));
+  lines.push(
+    `${button(label("doc", T), "iva_menu:svc:c:doc")} — ${T(
+      "check and auto-repair the install.",
+      "проверить и починить инсталляцию.",
+    )}`,
+    `${button(label("cln", T), "iva_menu:svc:c:cln")} — ${T(
+      "strip the 0.3.0 bloat from memory cards.",
+      "убрать раздутые описания из карточек памяти.",
+    )}`,
+    `${button(label("mem", T), "iva_menu:svc:c:mem")} — ${T(
+      "run the nightly memory cycle now.",
+      "запустить ночной цикл памяти сейчас.",
+    )}`,
+    `${button(T("🔄 Update", "🔄 Обновление"), "iva_menu:svc:up")} — ${T(
+      "check for and install a new version.",
+      "проверить и поставить новую версию.",
+    )}`,
+    menuStyle() === "rich"
+      ? `${button(T("◀︎ Classic menu", "◀︎ Старое меню"), "iva_menu:svc:menu:classic")} — ${T(
+          "buttons under the message, as before 0.4.2.",
+          "кнопки под сообщением, как до 0.4.2.",
+        )}`
+      : `${button(T("✨ New menu", "✨ Новое меню"), "iva_menu:svc:menu:rich", "success")} — ${T(
+          "buttons inside the message, tables; needs a Telegram client from August 2026.",
+          "кнопки внутри сообщения, таблицы; нужен клиент Telegram от августа 2026.",
+        )}`,
+    `${button(T("‹ Menu", "‹ Меню"), "iva_menu:r:o")} — ${T(
+      "back to the settings.",
+      "вернуться в настройки.",
+    )}`,
+  );
+  return { text: lines.join("\n\n") };
 }
 
 async function startCommand(
@@ -265,32 +293,28 @@ async function startCommand(
     const v = progressView(running, ctx);
     return ctx.flows.screen(
       st,
-      T(`Already running:\n${v.text}`, `Уже идёт:\n${v.text}`),
-      v.rows,
+      [T("Already running:", "Уже идёт:"), v.text].join("\n\n"),
     );
   }
-  // Гейт 2: идёт обновление — в репо чужим процессам нельзя (probe: взяли лок — отпустили).
-  if (cmd !== "mem") {
-    const lock = acquireUpdateLock(ctx.deps.dataDir, "menu-svc");
-    if (!lock.ok) {
-      return ctx.flows.screen(
-        st,
+  // Гейт 2: идёт обновление — в репо чужим процессам нельзя.
+  if (cmd !== "mem" && updateRunning(ctx.deps.dataDir)) {
+    return ctx.flows.screen(
+      st,
+      [
         T(
           "⬆️ An update is in progress — try again after it finishes.",
           "⬆️ Идёт обновление — попробуй после его завершения.",
         ),
-        [ctx.backRow("r")],
-      );
-    }
-    releaseUpdateLock(lock);
+        backLine(ctx),
+      ].join("\n\n"),
+    );
   }
   const spec = await commandSpec(cmd, ctx);
   const over = ctx.deps.svcRun || {};
   const opts: RunOptions = {
-    tg: ctx.tg,
+    edit: (markdown) => ctx.flows.screen(st, markdown),
     chatId: st.chatId,
     messageId: st.msgId,
-    loader: LOADERS[cmd],
     attached: () =>
       ctx.flows.get(st.chatId, st.userId) === st && st.screen === "svc",
     progressView: (run) => progressView(run, ctx),
@@ -298,18 +322,10 @@ async function startCommand(
       // Итог рисуем, только если юзер всё ещё на экране svc — иначе сводка ждёт в render.
       if (!(ctx.flows.get(st.chatId, st.userId) === st && st.screen === "svc"))
         return;
-      await ctx
-        .tg("editMessageText", {
-          chat_id: run.chatId,
-          message_id: run.messageId,
-          text: summaryText(run, ctx),
-          reply_markup: {
-            inline_keyboard: [
-              [ctx.btn(ctx.tr("‹ Back", "‹ Назад"), "iva_menu:svc:o")],
-            ],
-          },
-        })
-        .catch(() => {});
+      await ctx.flows.screen(
+        st,
+        [summaryText(run, ctx), backLine(ctx)].join("\n\n"),
+      );
     },
     ...over,
   };
@@ -324,8 +340,7 @@ async function startCommand(
     const v = progressView(activeRun, ctx);
     return ctx.flows.screen(
       st,
-      T(`Already running:\n${v.text}`, `Уже идёт:\n${v.text}`),
-      v.rows,
+      [T("Already running:", "Уже идёт:"), v.text].join("\n\n"),
     );
   }
 }
@@ -351,19 +366,31 @@ const service = {
     const T = ctx.tr;
     if (verb === "c" && isServiceCommand(args[0])) {
       const cmd = args[0];
-      return ctx.flows.screen(st, `${label(cmd, T)}\n\n${describe(cmd, T)}`, [
-        [ctx.btn(T("▶ Run", "▶ Запустить"), `iva_menu:svc:go:${cmd}`)],
-        [ctx.btn(T("‹ Back", "‹ Назад"), "iva_menu:svc:o")],
-      ]);
+      return ctx.flows.screen(
+        st,
+        [
+          `# ${label(cmd, T)}`,
+          describe(cmd, T),
+          `${button(T("▶ Run", "▶ Запустить"), `iva_menu:svc:go:${cmd}`)} — ${T(
+            "start it now.",
+            "запустить сейчас.",
+          )}`,
+          backLine(ctx),
+        ].join("\n\n"),
+      );
     }
     if (verb === "go" && isServiceCommand(args[0]))
       return startCommand(args[0], st, ctx);
     if (verb === "ab") {
       if (cancelRun())
-        return ctx.flows.screen(st, T("Stopping…", "Останавливаю…"), []);
+        return ctx.flows.screen(st, T("Stopping…", "Останавливаю…"));
       return ctx.show(st, "svc"); // нечего отменять — перерисовать текущее состояние
     }
     if (verb === "up") return ctx.deps.handleUpdateCheck?.(st.chatId);
+    if (verb === "menu" && (args[0] === "rich" || args[0] === "classic")) {
+      writeSettings({ menuStyle: args[0] });
+      return ctx.show(st, "r"); // корень сразу в новом стиле
+    }
   },
 };
 

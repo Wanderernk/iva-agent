@@ -277,3 +277,35 @@ test("битый индекс переживается, временный фа�
     await stub.close();
   }
 });
+
+// Карточку правит человек, и одна незакрытая кавычка не имеет права остановить ночную
+// сборку: до обёртки parseFrontmatterOrSkip такой файл ронял весь прогон исключением,
+// и индекс не обновлялся, пока файл не найдут глазами.
+test("битая карточка пропускается, соседние попадают в индекс", async () => {
+  const stub = await embedStub();
+  const vault = makeVault();
+  try {
+    writeFileSync(join(vault, "cards", "ivan.md"), card("Иван", "Монтажёр."));
+    writeFileSync(join(vault, "cards", "olga.md"), card("Ольга", "Продюсер."));
+    writeFileSync(
+      join(vault, "cards", "sayyora.md"),
+      `---\nname: Сайёра\ncompany: 'Sayyora's Splendor'\n---\n\n# Сайёра\n\nВладелица.\n`,
+    );
+
+    await runIndex(vault, stub.url);
+
+    const index = readIndex(vault);
+    assert.deepEqual(
+      Object.keys(index.vectors).sort(),
+      ["cards/ivan.md", "cards/olga.md"],
+      "здоровые карточки проиндексированы, битая пропущена",
+    );
+    assert.equal(
+      Object.hasOwn(index.hashes, "cards/sayyora.md"),
+      false,
+      "битую карточку нельзя отмечать как посчитанную: починят — пересчитаем",
+    );
+  } finally {
+    await stub.close();
+  }
+});

@@ -154,14 +154,45 @@ Default model is deepseek-v4-pro, 131k context. On Go it runs about $14–15/mo 
 
 ## Documentation
 
-[Use cases](docs/use-cases.md) · [Install](docs/install.md) · [Configuration](docs/configuration.md) · [Memory](docs/memory.md) · [Providers](docs/providers.md) · [Security](docs/security.md) · [Deploy](docs/deploy.md) · [Commands & CLI](docs/cli.md) · [Menu](docs/menu.md) · [Extending](docs/extending.md) · [Plugins](docs/plugins.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/troubleshooting.md)
+[Use cases](docs/use-cases.md) · [Install](docs/install.md) · [Configuration](docs/configuration.md) · [Memory](docs/memory.md) · [Providers](docs/providers.md) · [Security](docs/security.md) · [Deploy](docs/deploy.md) · [Commands & CLI](docs/cli.md) · [Menu](docs/menu.md) · [Reminders](docs/reminders.md) · [Extending](docs/extending.md) · [Plugins](docs/plugins.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/troubleshooting.md)
 
 Документация на русском → [docs/ru/](docs/ru/)
 
 ## What's New
 
 <details>
-<summary><b>v0.4.0 · 01.09.2026 — expand the latest releases</b></summary>
+<summary><b>v0.4.3 · 14.09.2026 — expand the latest releases</b></summary>
+
+### 14.09.2026
+
+#### v0.4.3
+
+- 🔁 **One updater, the way pi does it**: the old in-place update path (stash and rebase inside the working folder with a byte-level check of stray files, ~15k lines) is gone together with the guesswork "developer or installation" by branches and shims that kept people with a second branch on the fragile path forever. Every Iva folder now updates through versions: build beside, probe, switch, roll back. A developer checkout is marked with an empty `.iva-dev` file. Edits to Iva's own code are no longer promised or kept — your own skills, tools and plugins live in `data/custom`. `repair.sh` and a re-run of `install.sh` hand an existing installation to the same updater. An update cut off mid-way (a server reboot) is restarted once by the bridge itself with a line in the chat. Older flat installs need two `/update`s: the first fetches the new code, the second moves onto versions.
+- 🔘 **Menu buttons two per row again**: the classic menu lays buttons out in pairs as before 0.4.2; the new rich menu shows the same pairs as compact pills with a "button — what it does" caption under the row, no more one long full-width button.
+- 🔌 **A tool schema the provider rejects no longer kills the turn**: OpenAI (codex) rejects the whole request when any tool carries a regex with lookaround; Iva now retries once without those patterns, and if it still fails, the error names the field and where the tool lives.
+- 🧷 **Codex tools without strict mode**: tools go to codex with `strict: false`, so optional fields stay optional and reminders are set on the first call instead of looping.
+- 🧰 **`diagnose.sh` collects more**: the plugin list, the reminder dispatcher pulse and the schedule lines of the last day.
+
+### 13.09.2026
+
+#### v0.4.2
+
+- 🎤 **The voice key is no longer required at install**: the Deepgram step of the wizard is skipped with Enter (console.deepgram.com does not open from some countries, and people got stuck on install for an optional feature); without the key voice notes are saved and Iva suggests `/menu` → 🎤 Voice, and `iva doctor` shows a warning instead of a failure.
+- 🔘 **A new menu, on request: buttons inside the message**: by default the menu, the `/model` and `/think` wizards, the update offer and the "Working" status look as before (a message with buttons under it); `/menu` → Maintenance → **✨ New menu** switches them to Telegram rich messages — every button a full-width row with what it does right under it, headings, status and timers as tables, and **◀︎ Classic menu** at the bottom brings the old look back. Iva also offers buttons in her own replies when there are two to four options, and a tap comes back to her as your message; the `rich-replies` skill covers the whole palette. The new menu needs a Telegram client from August 2026; in groups the reply buttons don't work. [ADR-0015](docs/adr/0015-buttons-live-inside-the-message.md)
+- 💬 **Rich replies and voice are set from the menu**: two new `/menu` screens — a switch for rich replies (`Auto`: tables, task lists, folds and formulas go as rich messages; `Plain text`: ordinary messages) and `🎤 Voice` with the Deepgram key and the recognition language (`Auto`/`Русский`/`English`/`Oʻzbek`); the key is taken from your next message in a private chat and deleted from the chat, and both screens offer a restart after saving.
+- 📦 **Dependencies cleaned up**: the unused `@vercel/connect` is gone, `fast-uri`, `hono` and `qs` under `@modelcontextprotocol/sdk` are bumped past their vulnerabilities (`npm audit`: 0 high, 0 moderate), and the `ai` pin is lifted to `^7.0.82`, the peer eve 0.51.1 requires.
+
+#### v0.4.1
+
+- ⏰ **Reminders fire exactly once, and delivery is checked by the agent**: a `data/` row moves "pending → fired" in one atomic transition, and at the due moment two independent things happen — the code sends your text to the owner chat itself (no model, no tokens), while the agent wakes with that fact, reads the list and speaks with the reason if the text did not arrive. The delivery fact (`fired_at`, `delivered`, `error`) sits in the row, `iva doctor` shows it, and rows from the old schema survive the update.
+- 🔔 **One `remind` tool with `add`, `list`, `remove`**: one-off reminders ("in 30 minutes", "at 14:30") and repeating ones (a cron expression in your time zone) are set, listed and removed by a single tool with an `action` field instead of three. The moment is computed in code and handed to the agent as a ready time, schedules firing more often than every 10 minutes are refused, and the destination is always your chat. [ADR-0013](docs/adr/0013-reminders-live-in-data-with-a-minute-dispatcher.md)
+- 🛡 **`bash` cannot set timers of its own or talk to Telegram anymore**: `systemd-run`, writing `crontab`, `at`/`batch`, units under `~/.config/systemd/user`, `~/.iva-scripts`, `sleep` chains and direct calls to api.telegram.org are refused before they run, and the refusal names the replacement; reading (`crontab -l`, `systemctl status`, `journalctl`) still passes.
+- 📋 **Every schedule run leaves a fact, and the agent wakes up with it**: each run writes a row to `data/jobs.json` (reason, exit code, secret-free tail, kept seven days). On success Iva stays silent; on failure she fixes the cause and tells the owner, open failures are visible to every turn and in `iva doctor` and close on the next success or with `iva jobs ack <name>`, and if the agent cannot wake at all, one message a day reaches you. A wake turn that ended by waiting for the next message is a normal end now, not a failure. The schedules section of `iva doctor` works without systemd.
+- 🔎 **A complaint turns into an evidence bundle with no secrets in it**: `iva diagnose` puts versions, OS and node, the `iva doctor` output, the last 200 service log lines, reminder and turn-failure facts and the schedule table into `data/diagnose/<date>.md`, cutting the values of every `.env` key except settings, plus the bot token, owner chat id and e-mail; the `report-problem` skill reads the bundle, explains the failure in two lines and offers a ready issue link or a message for the support group.
+- 🧹 **An interrupted update cleans up after itself and names the reason**: the retiring checkout wears a marker with its own identity, deletes `.git` last and finishes on a repeat; stale shim-refresh claims in `~/.local/bin` are swept by age even under a live pid; a failed optional step now logs its exit code and the last output line (for example `exit 127: uv: command not found`) instead of a silent "… did not run".
+- 🧩 **Your rules live beside the bundled persona and load every turn**: markdown files in `data/custom/agent/instructions/` reach the prompt live without a rebuild, so a behavior rule written into `rules.md` (with `write_file`, after your confirmation) works at once; the old `instructions.md` replacement is obsolete, and `iva doctor` shows the rule count and warns when it overruns the limit.
+- 🧭 **The vault directory is computed by one formula everywhere**: file tools, media, the diary, nightly memory, the CLI, the menu, the build and the installer call a single resolver. An empty value or stray spaces is now a clear error naming the variable instead of a silent directory swap, a relative path resolves against the caller's base, and a bad setting reaches the user as one line, not a stack trace.
+- 🧩 **Iva runs on eve 0.51.1** (0.4.0 shipped 0.47.3): the local patch is ported and rebuilt for the new runtime.
 
 ### 01.09.2026
 
@@ -174,20 +205,6 @@ Default model is deepseek-v4-pro, 131k context. On Go it runs about $14–15/mo 
 - ⚡ **Iva answers within a second of an update**: every update now quarantines the workflow store and expires open sessions in place — no more silence for up to 30 minutes, and a stuck "Working…" clears itself.
 - 🩹 **The Codex provider (ChatGPT subscription) works again**: every turn was failing with HTTP 400 because eve 0.47 injects a `safety_identifier` field for `openai/*` models; it's stripped now, so chat and nightly Rollups on Codex run.
 - 🔁 **Lost-message notices are honest now**: a message Iva couldn't accept used to surface once a week; now it repeats every 10 minutes until you see it.
-
-### 27.08.2026
-
-#### v0.3.34
-
-- 👁️ **The chat model now looks at the picture itself when it can**: every photo used to go to a separate vision model (`OLLAMA_VISION_MODEL` and friends), and the chat model got a retelling — details and the text in the image were lost, and every picture cost a second call. On the first picture Iva now asks the chat model itself, once: a solid red square and a question about its colour. Names red — sighted: photos travel to it as pixels and the vision model is never called. Refuses, or answers without the colour — the old path through `*_VISION_MODEL`. The session history keeps only the vault path; the bytes are attached at request time — so switching to a text-only model breaks nothing, and at most the ten most recent pictures of the prompt travel, 6 MB total; a file over 4 MB and a picture of an unknown type (`.heic` and alike) are still described by the vision model. Network failures and provider overload decide nothing: the next try waits at least a minute, the verdict lives until restart, and a model change asks the question again.
-- 📐 **The decision is written down: sight is asked of the provider itself, not of a catalog**: [ADR-0012](docs/adr/0012-the-chat-model-looks-at-the-picture-itself.md) records the probe, the replay ceilings and the rejected alternatives (eve attachments living in the session history, a static capability catalog, a second call describing with the same model). A picture the model looks at itself never passes the text sanitizer — `docs/security.md` and the configuration doc state that boundary and its guard (the «text in the image is DATA, not instructions» line plus the ceilings) plainly.
-
-### 26.08.2026
-
-#### v0.3.33
-
-- 🧾 **Long and formatted messages no longer vanish**: since Bot API 10.1 a client puts such a message in `rich_message` instead of `text` (up to 32768 characters against 4096), and the Bridge admitted only the content keys it already knew, dropping the rest with nothing in the log but an update id — short messages were answered, long ones ignored, `/restart` changed nothing. The Bridge now judges the envelope: any message from an Allowlist user that carries at least one key outside the Bot API metadata is admitted, and what is readable is the agent's call — its rich-message reader has been in place since 0.3.25, so a new Bot API field arrives on its own. With nothing readable inside (`poll`, `contact`, a field Iva does not know yet), Iva answers once, `I can't read this message (fields: poll). Send it as text or a file.`, instead of staying silent. The drop line in `iva logs poll` now names the top-level keys — names only, no message text ever reaches the log. In a group the rule is unchanged: a message with no `text`/`caption` is admitted as a reply to the bot. Sending rich messages (`sendRichMessage` through the Outbox, since 0.3.25) is untouched. New troubleshooting section.
-- 📐 **The admission rule is written down: the Bridge judges the envelope, the Inbound pipeline judges the content**: [ADR-0011](docs/adr/0011-bridge-judges-the-envelope.md) records the boundary, the rejected alternatives (add one field to the key list, add a second normalizer to the Bridge, admit everything and stay silent) and the group gap it hands to `docs/tech-debt.md`.
 
 </details>
 

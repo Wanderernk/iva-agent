@@ -136,8 +136,17 @@ export function ensureVaultGitignore(vaultPath: string): boolean {
   let current = "";
   try {
     current = readFileSync(file, "utf8");
-  } catch {
-    /* нет файла — создадим ниже */
+  } catch (error) {
+    // Только ENOENT значит «файла нет». Нечитаемый .gitignore (EACCES/EIO) не
+    // перезаписываем: иначе правила владельца исчезают молча, а ночной git add -A
+    // их уже не видит. Тот же сплит ENOENT/остальное, что в read-core.ts.
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code !== "ENOENT") {
+      console.error(
+        `[memory] vault .gitignore is unreadable (${String(code)}); left untouched`,
+      );
+      return false;
+    }
   }
   const present = new Set(current.split("\n").map((line) => line.trim()));
   const missing = TMP_IGNORE_PATTERNS.filter(

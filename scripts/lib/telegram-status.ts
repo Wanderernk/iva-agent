@@ -1,11 +1,11 @@
 import { readFile, rm } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { modelSummary } from "./model-summary.ts";
 import { redactTelegramBody } from "./notice.ts";
-import { updaterTooOldMessage } from "./update-check.ts";
-import type { RestoreReport } from "./update-safety.ts";
+import { screenPayload } from "./telegram-buttons.ts";
+import { updateKeepsLine, updaterTooOldMessage } from "./update-check.ts";
 
-type UpdatePhase = "protect" | "fetch" | "build";
+type UpdatePhase = "fetch" | "build";
 type TelegramJob = {
   chatId: string | number;
   messageId: string | number;
@@ -38,6 +38,8 @@ type Reporter = {
   busy(): Promise<void>;
   /** Refusal before the first phase — the message carries what to fix, in the job's language. */
   badProvider(value: string, accepted: string): Promise<void>;
+  /** Refusal before the first write: this tree is somebody's checkout, not an installation. */
+  devCheckout(): Promise<void>;
   /** Refusal before the first write: this CLI is older than the release it fetched. */
   updaterTooOld(version: string): Promise<void>;
   postCommitFailure(message: string): Promise<void>;
@@ -45,8 +47,6 @@ type Reporter = {
   complete(versions: {
     beforeVersion?: string;
     afterVersion: string;
-    changedLocal?: boolean;
-    restoreReport?: RestoreReport;
   }): Promise<boolean>;
   dispose(): void;
 };
@@ -65,11 +65,6 @@ export const UPDATE_LOADER = {
 
 const COPY = {
   en: {
-    protect: [
-      "Saving your changes",
-      "Changes saved",
-      "Couldn't save your changes",
-    ],
     fetch: ["Getting the update", "Update received", "Couldn't get the update"],
     build: ["Building Iva", "Iva built", "Couldn't build Iva"],
     timerFailure:
@@ -77,22 +72,13 @@ const COPY = {
     busy: "An update is already running",
     badProvider:
       "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
+    devCheckout:
+      "this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
     final: "✅ Iva updated",
-    preserved: "Local changes: preserved",
-    conflicted: (count: number) =>
-      `⚠️ ${count} local file(s) conflicted with the update. The new core is active; your versions are stored safely.`,
-    preservedInactive:
-      "⚠️ Local customizations did not build. The new core is active; your changes are stored safely.",
-    review: "Review saved changes",
     failure: (version: string) =>
-      `Iva is still running ${version}.\nYour settings and changes are preserved.\nRetry: /update`,
+      `Iva is still running ${version}.\nYour settings, memory and skills are where they were.\nRetry: /update`,
   },
   ru: {
-    protect: [
-      "Сохраняю ваши изменения",
-      "Изменения сохранены",
-      "Не удалось сохранить изменения",
-    ],
     fetch: [
       "Получаю обновление",
       "Обновление получено",
@@ -104,15 +90,11 @@ const COPY = {
     busy: "Обновление уже идёт",
     badProvider:
       "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
+    devCheckout:
+      "это чекаут разработчика (.iva-dev): обновляйся через git, собирай `npm run build`",
     final: "✅ Iva обновлена",
-    preserved: "Локальные изменения: сохранены",
-    conflicted: (count: number) =>
-      `⚠️ Конфликт локальных файлов: ${count}. Новое ядро активно; ваши версии надёжно сохранены.`,
-    preservedInactive:
-      "⚠️ Локальные доработки не собрались. Новое ядро активно; ваши изменения надёжно сохранены.",
-    review: "Посмотреть сохранённые изменения",
     failure: (version: string) =>
-      `Iva продолжает работать на ${version}.\nВаши настройки и изменения сохранены.\nПовторить: /update`,
+      `Iva продолжает работать на ${version}.\nНастройки, память и ваши скиллы на месте.\nПовторить: /update`,
   },
 };
 
@@ -247,15 +229,17 @@ export function createTelegramUpdateReporter({
    * message, whatever the reason: a message Telegram will not let this process
    * edit is indistinguishable, from here, from one it lost - and both leave the
    * chat saying an update is still running.
+   * Финал — rich message: кнопка «посмотреть конфликты» стоит в самом тексте, рядом со
+   * своим пояснением, поэтому отдельной клавиатуры у финального экрана больше нет.
    */
-  async function finish(
-    text: string,
-    replyMarkup?: Record<string, unknown>,
-  ): Promise<boolean> {
-    const body = replyMarkup ? { text, reply_markup: replyMarkup } : { text };
+  async function finish(markdown: string): Promise<boolean> {
+    const body = screenPayload(markdown);
     if ((await edit(body)).ok) return true;
     try {
-      await call("sendMessage", { chat_id: activeJob.chatId, ...body });
+      await call("rich_message" in body ? "sendRichMessage" : "sendMessage", {
+        chat_id: activeJob.chatId,
+        ...body,
+      });
       return true;
     } catch (caught) {
       const error = caught as TelegramError;
@@ -308,6 +292,13 @@ export function createTelegramUpdateReporter({
         `⚠️ ${copy.badProvider}: ${JSON.stringify(value)} (${accepted})`,
       );
     },
+    // Тап по /update в дереве, которое апдейтеру не принадлежит: сказать это в чат, а не
+    // в терминал systemd-run. Иначе мост ждёт лока, которого не будет, и последнее, что
+    // видит пользователь, — «Запускаю обновление» на шесть часов.
+    async devCheckout() {
+      currentPhase = null;
+      await finish(`⚠️ ${copy.devCheckout}`);
+    },
     // Отказ до первой записи: обновиться сама эта установка уже не может. Текст — тот же,
     // что уходит в терминал, и собирается ЗДЕСЬ, из языка того, кто нажал. Без parse_mode:
     // команда репейра обязана доехать до чата символ в символ.
@@ -325,11 +316,9 @@ export function createTelegramUpdateReporter({
     async complete({
       beforeVersion,
       afterVersion,
-      restoreReport,
     }: {
       beforeVersion?: string;
       afterVersion: string;
-      restoreReport?: RestoreReport;
     }): Promise<boolean> {
       const model = modelSummary(env);
       const lines = [
@@ -339,29 +328,11 @@ export function createTelegramUpdateReporter({
           ? `${beforeVersion} → ${afterVersion}`
           : `${lang === "ru" ? "Версия" : "Version"}: ${afterVersion}`,
         `${lang === "ru" ? "Модель" : "Model"}: ${model.line}`,
+        // Ровно та же строка, что в предложении обновиться: что остаётся на месте и что
+        // обновление не переносит. Иначе финал обещал бы сохранность правок в коде Ивы.
+        updateKeepsLine(lang),
       ];
-      lines.push(copy.preserved);
-      let replyMarkup: Record<string, unknown> | undefined;
-      if (
-        restoreReport?.status === "conflicted" ||
-        restoreReport?.status === "preserved"
-      ) {
-        lines.push(
-          "",
-          restoreReport.status === "conflicted"
-            ? copy.conflicted(restoreReport.conflicts.length)
-            : copy.preservedInactive,
-        );
-        const bundleId = basename(restoreReport.recoveryDir);
-        const callbackData = `iva_update:conflicts:${bundleId}`;
-        if (Buffer.byteLength(callbackData, "utf8") <= 64)
-          replyMarkup = {
-            inline_keyboard: [
-              [{ text: copy.review, callback_data: callbackData }],
-            ],
-          };
-      }
-      return finish(lines.join("\n"), replyMarkup);
+      return finish(lines.join("\n"));
     },
     dispose() {},
   };

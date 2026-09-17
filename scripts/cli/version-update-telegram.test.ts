@@ -72,6 +72,7 @@ type World = {
   readonly home: string;
   readonly log: string;
   readonly jobPath: string;
+  /** The command on PATH that makes this checkout an installation. */
   readonly calls: Call[];
   /** Run `iva update --telegram-job job-1`, with the job file already in place. */
   run(env?: Record<string, string>): Promise<void>;
@@ -136,11 +137,16 @@ function world(
   });
   mutableGlobal.fetch = (url, init) => {
     const method = url.split("/").at(-1) ?? "";
-    const body = JSON.parse(init.body) as { text?: string };
-    calls.push({ method, text: body.text ?? "" });
+    const body = JSON.parse(init.body) as {
+      text?: string;
+      rich_message?: { markdown?: string };
+    };
+    // Финальные экраны обновления — rich: их текст лежит в rich_message.markdown.
+    const text = body.rich_message?.markdown ?? body.text ?? "";
+    calls.push({ method, text });
     // The one line the child process also writes to: the order between an edit
     // and the build that blocks this event loop is what the fix is about.
-    appendFileSync(log, `${method} ${body.text ?? ""}\n`);
+    appendFileSync(log, `${method} ${text}\n`);
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -259,6 +265,26 @@ test("an update that is already current answers and drops its job", async (t) =>
   assert.deepEqual(readdirSync(dirname(iva.jobPath)), []);
 });
 
+test("a job that carries force rebuilds the version that already runs", async (t) => {
+  const iva = world(t);
+  await iva.run();
+  const builtOnce = iva.lines().filter((line) => /Building Iva/u.test(line));
+  rmSync(iva.jobPath, { force: true });
+  writeFileSync(
+    iva.jobPath,
+    JSON.stringify({ chatId: 1, messageId: 101, locale: "en", force: true }),
+    { mode: 0o600 },
+  );
+
+  await iva.run();
+
+  // `/update --force` from the chat: the flag is in the job, not on the command
+  // line, and the second run builds again instead of answering "current".
+  const builtTwice = iva.lines().filter((line) => /Building Iva/u.test(line));
+  assert.equal(builtOnce.length, 1, iva.lines().join("\n"));
+  assert.equal(builtTwice.length, 2, iva.lines().join("\n"));
+});
+
 test("a failed update reports the failure and drops its job", async (t) => {
   const iva = world(t);
 
@@ -292,8 +318,8 @@ test("an update that finds one already running answers and drops its job", async
   process.exitCode = 0;
 });
 
-// Боевой путь апдейта — этот: managed-layout стоит на всём, что поставлено install.sh
-// (scripts/cli/main.ts маршрутизирует туда по isManagedInstall). Префлайт, живущий только
+// Боевой путь апдейта — этот: чекаут без метки `.iva-dev` pipeline признаёт установкой.
+// Префлайт, живущий только
 // в legacy-обновлении, боевую установку не защищал: опечатка в MODEL_PROVIDER прогоняла
 // fetch → build → restart, упиралась в health-check и возвращала «Couldn't build Iva»
 // без единого слова о причине.

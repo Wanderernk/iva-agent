@@ -14,6 +14,7 @@ import random
 import shutil
 import tempfile
 import subprocess
+import unicodedata
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -332,7 +333,8 @@ def main():
             infer_type, calc_relevance, calc_tier, days_since,
             extract_wikilinks, IGNORE_DIRS, write_frontmatter, format_field,
             build_link_index, resolve_link_target, collect_duplicate_groups, is_hub_path,
-            get_conflict_fields, get_identity_config, card_recency_date, normalize_identity_value
+            get_conflict_fields, get_identity_config, card_recency_date, normalize_identity_value,
+            extract_title, normalize_title
         )
         from cleanup import clean_file
 
@@ -620,6 +622,86 @@ def main():
              resolved_unique_stem == 'misc/visa-guide' and reason_unique_stem == 'unique_stem',
              f"got: {(resolved_unique_stem, reason_unique_stem)}")
 
+        # 1.16b резолв по H1-заголовку: ссылка вида [[Заголовок]] находит единственную
+        # карточку с таким заголовком. Путь и stem всегда сильнее заголовка, а
+        # неоднозначный заголовок остаётся нерешённым вместо угадывания.
+        title_vault = tmp / 'title-vault'
+        (title_vault / 'cards/ideas').mkdir(parents=True, exist_ok=True)
+        (title_vault / 'cards/notes').mkdir(parents=True, exist_ok=True)
+        (title_vault / 'docs').mkdir(parents=True, exist_ok=True)
+        (title_vault / 'crm').mkdir(parents=True, exist_ok=True)
+        dev_title = 'Для разработки — рубрика инструментов'
+        (title_vault / 'cards/ideas/dev-tools.md').write_text(
+            f'# {dev_title}\n\n## Related\n- [[ссылка по заголовку]]\n')
+        (title_vault / 'cards/notes/a.md').write_text('См. [[ссылка по заголовку]].\n')
+        title_index = build_link_index(title_vault)
+        test("extract_title reads the first H1 of the body",
+             extract_title(f'# {dev_title}\n\n{dev_title}\n') == dev_title,
+             f"got: {extract_title(f'# {dev_title}\n\n{dev_title}\n')!r}")
+        test("extract_title ignores ## and missing H1",
+             extract_title('## Раздел\n\nтекст\n') is None
+             and extract_title('=== memory ===\ntext\n') is None,
+             f"got: {extract_title('## Раздел\n\nтекст\n')!r}")
+        test("normalize_title folds case, spaces and unicode form",
+             normalize_title('  ДЛЯ   Разработки ') == 'для разработки'
+             and normalize_title(unicodedata.normalize('NFD', 'Йога'))
+             == normalize_title(unicodedata.normalize('NFC', 'Йога'))
+             and normalize_title('   ') == '',
+             f"got: {normalize_title('  ДЛЯ   Разработки ')!r}")
+        resolved_title, reason_title = resolve_link_target(dev_title, title_index)
+        test("resolve_link_target unique H1 title",
+             resolved_title == 'cards/ideas/dev-tools' and reason_title == 'unique_title',
+             f"got: {(resolved_title, reason_title)}")
+        resolved_loose, reason_loose = resolve_link_target(
+            '  для   РАЗРАБОТКИ — рубрика   инструментов ', title_index)
+        test("unique H1 title survives case and extra spaces",
+             resolved_loose == 'cards/ideas/dev-tools' and reason_loose == 'unique_title',
+             f"got: {(resolved_loose, reason_loose)}")
+        # NFC: один и тот же текст, записанный разными формами юникода, — один ключ.
+        nfd_title = unicodedata.normalize('NFD', 'Йога — практика')
+        nfc_title = unicodedata.normalize('NFC', 'Йога — практика')
+        (title_vault / 'cards/notes/yoga.md').write_text(f'# {nfd_title}\n')
+        title_index = build_link_index(title_vault)
+        resolved_nfc, reason_nfc = resolve_link_target(nfc_title, title_index)
+        test("unique H1 title compares NFC forms",
+             resolved_nfc == 'cards/notes/yoga' and reason_nfc == 'unique_title',
+             f"got: {(resolved_nfc, reason_nfc)}")
+        # Два файла с одним заголовком (различие только в регистре) — ключ неоднозначен.
+        (title_vault / 'cards/p1.md').write_text('# Проект\n')
+        (title_vault / 'cards/p2.md').write_text('# ПРОЕКТ\n')
+        title_index = build_link_index(title_vault)
+        resolved_amb_title, reason_amb_title = resolve_link_target('проЕкт', title_index)
+        test("resolve_link_target blocks ambiguous H1 title",
+             resolved_amb_title is None and reason_amb_title == 'ambiguous_title',
+             f"got: {(resolved_amb_title, reason_amb_title)}")
+        # Заголовок одного файла совпадает со stem другого: решает stem.
+        (title_vault / 'docs/visa.md').write_text('# Visa\n')
+        (title_vault / 'crm/x.md').write_text('# visa\n')
+        title_index = build_link_index(title_vault)
+        resolved_stem_first, reason_stem_first = resolve_link_target('visa', title_index)
+        test("unique stem beats a matching H1 title",
+             resolved_stem_first == 'docs/visa' and reason_stem_first == 'unique_stem',
+             f"got: {(resolved_stem_first, reason_stem_first)}")
+        # ...и не спасает неоднозначный stem.
+        (title_vault / 'crm/visa.md').write_text('# Другое\n')
+        title_index = build_link_index(title_vault)
+        resolved_stem_block, reason_stem_block = resolve_link_target('visa', title_index)
+        test("a matching H1 title does not rescue an ambiguous stem",
+             resolved_stem_block is None and reason_stem_block == 'ambiguous_stem',
+             f"got: {(resolved_stem_block, reason_stem_block)}")
+        # Без H1 и без валидного utf-8 файл в индекс заголовков не попадает,
+        # остальные ключи остаются целыми.
+        (title_vault / 'cards/notes/no-title.md').write_text('Просто текст без заголовка.\n')
+        (title_vault / 'cards/notes/broken-utf8.md').write_bytes(b'# \xff\xfe\n')
+        title_index = build_link_index(title_vault)
+        test("title index skips cards without H1 and non-utf8 cards",
+             resolve_link_target(nfc_title, title_index)
+             == ('cards/notes/yoga', 'unique_title')
+             and all(key for key in title_index.get('unique_title', {}))
+             and all('no-title' not in path and 'broken-utf8' not in path
+                     for path in title_index.get('unique_title', {}).values()),
+             f"got: {title_index.get('unique_title')}")
+
         # 1.17 duplicate grouping only merges compatible cards
         dedup_vault = tmp / 'dedup-vault'
         (dedup_vault / 'knowledge/notes').mkdir(parents=True, exist_ok=True)
@@ -849,8 +931,10 @@ def main():
              and future_graph['stats']['broken_links'] == 0
              and future_graph['stats']['managed_orphans'] == 0,
              str(future_graph['stats']))
-        fixes, applied = fix_broken_links(rollup_vault, future_graph, apply=False)
-        test("graph fix ignores an expected future parent", fixes == [] and applied == 0)
+        fixes, applied, ambiguous, _skipped = fix_broken_links(
+            rollup_vault, future_graph, apply=False)
+        test("graph fix ignores an expected future parent",
+             fixes == [] and applied == 0 and ambiguous == [])
         legacy_graph = build_graph(
             rollup_vault,
             {"node_types": {"note": {}}, "path_type_hints": {}},
@@ -1911,7 +1995,7 @@ def main():
              f"got: {anchor_only}")
 
         # 7.11 resolve_link strips anchor (graph.py)
-        from graph import resolve_link, fix_broken_links, build_graph
+        from graph import resolve_link, fix_broken_links, build_graph, LinkRepairError
         from dedup import merge_content, append_history
         from daily import (
             build_vault_index as build_daily_index,
@@ -1938,7 +2022,8 @@ def main():
         synthetic_graph = {
             'broken_link_list': [{'source': 'notes/source', 'target': 'visa'}]
         }
-        fixes, applied = fix_broken_links(fix_vault, synthetic_graph, apply=True)
+        fixes, applied, _ambiguous, _skipped = fix_broken_links(
+            fix_vault, synthetic_graph, apply=True)
         updated_source = source_note.read_text()
         test("graph fix suggests unique stem target",
              len(fixes) == 1 and fixes[0]['new'] == 'docs/visa',
@@ -1947,6 +2032,171 @@ def main():
         test("graph fix does not mutate prefixed links",
              '[[docs/visa]]' in updated_source and '[[visa-guide]]' in updated_source and '[[docs/visa-guide]]' not in updated_source,
              f"got: {updated_source}")
+
+        # 7.12b ночной graph fix чинит ссылки по H1-заголовку: и в чужой карточке, и в
+        # карточке на саму себя. Неоднозначный заголовок остаётся как есть, и источник
+        # при этом не меняется ни на байт.
+        fix_title_vault = tmp / 'graph-fix-title-vault'
+        (fix_title_vault / 'cards/ideas').mkdir(parents=True, exist_ok=True)
+        (fix_title_vault / 'cards/notes').mkdir(parents=True, exist_ok=True)
+        fix_title = 'Для разработки — рубрика инструментов'
+        self_link_card = fix_title_vault / 'cards/ideas/dev-tools.md'
+        self_link_card.write_text(
+            f'# {fix_title}\n\n## Related\n- [[{fix_title}]]\n')
+        linking_card = fix_title_vault / 'cards/notes/a.md'
+        linking_card.write_text(
+            f'См. [[  {fix_title.lower()} ]], [[{fix_title}|инструменты]],'
+            f' [[{fix_title}#Related]].\n')
+        title_graph = build_graph(fix_title_vault, schema)
+        title_fixes, title_applied, title_ambiguous, title_skipped = fix_broken_links(
+            fix_title_vault, title_graph, apply=True)
+        repaired_a = linking_card.read_text()
+        test("graph fix applies H1-title links and reports no ambiguity",
+             title_applied == 4 and title_ambiguous == [] and len(title_fixes) == 4,
+             f"got: applied={title_applied}, fixes={title_fixes}, ambiguous={title_ambiguous}")
+        test("graph fix rewrites the self-link written by title",
+             '- [[cards/ideas/dev-tools]]' in self_link_card.read_text(),
+             self_link_card.read_text())
+        test("graph fix keeps alias and anchor of H1-title links",
+             '[[cards/ideas/dev-tools|инструменты]]' in repaired_a
+             and '[[cards/ideas/dev-tools#Related]]' in repaired_a,
+             repaired_a)
+        test("graph fix leaves no broken links after H1 repair",
+             build_graph(fix_title_vault, schema)['stats']['broken_links'] == 0,
+             str(build_graph(fix_title_vault, schema)['stats']))
+
+        ambiguous_vault = tmp / 'graph-fix-ambiguous-vault'
+        (ambiguous_vault / 'cards').mkdir(parents=True, exist_ok=True)
+        (ambiguous_vault / 'cards/p1.md').write_text('# Проект\n')
+        (ambiguous_vault / 'cards/p2.md').write_text('# Проект\n')
+        ambiguous_source = ambiguous_vault / 'cards/src.md'
+        ambiguous_source.write_text('См. [[Проект]].\n')
+        source_before = ambiguous_source.read_bytes()
+        ambiguous_graph = build_graph(ambiguous_vault, schema)
+        ambiguous_fixes, ambiguous_applied, ambiguous_list, _ambiguous_skipped = fix_broken_links(
+            ambiguous_vault, ambiguous_graph, apply=True)
+        test("graph fix leaves ambiguous H1-title links alone",
+             ambiguous_fixes == [] and ambiguous_applied == 0
+             and ambiguous_source.read_bytes() == source_before,
+             f"got: fixes={ambiguous_fixes}, applied={ambiguous_applied}, "
+             f"source={ambiguous_source.read_text()!r}")
+        test("graph fix reports ambiguous H1-title candidates",
+             ambiguous_list == [{'source': 'cards/src', 'target': 'Проект',
+                                 'candidates': ['cards/p1', 'cards/p2']}],
+             f"got: {ambiguous_list}")
+        ambiguous_code, ambiguous_out, ambiguous_err = run(
+            [sys.executable, str(SCRIPTS_DIR / 'graph.py'), 'fix',
+             str(ambiguous_vault), '--apply'])
+        test("graph.py fix prints the ambiguous block",
+             ambiguous_code == 0
+             and 'Ambiguous:    1' in ambiguous_out
+             and 'cards/src: [[Проект]] -> cards/p1, cards/p2' in ambiguous_out,
+             f"got: code={ambiguous_code}, out={ambiguous_out!r}, err={ambiguous_err!r}")
+
+        # 7.12c ночной fix --apply не трогает дословные записи: дневной транскрипт,
+        # append-only ## History и код. Такие ссылки не обещаются как Fixable, а
+        # называются отдельной строкой, а файлы остаются байт в байт.
+        protected_vault = tmp / 'graph-fix-protected-vault'
+        (protected_vault / 'cards/ideas').mkdir(parents=True, exist_ok=True)
+        (protected_vault / 'summaries/daily').mkdir(parents=True, exist_ok=True)
+        protected_title = 'Для разработки — рубрика инструментов'
+        (protected_vault / 'cards/ideas/dev-tools.md').write_text(
+            f'# {protected_title}\n\n- тело\n')
+        protected_files = {
+            'summaries/daily/2026-09-12.md':
+                f'# День\n\n- Шима сказал: «[[{protected_title}]]»\n',
+            'cards/hist.md':
+                f'# Карточка\n\n- тело\n\n## History\n\n- 2026-08-01: [[{protected_title}]]\n',
+            'cards/fence.md':
+                f'# Пример\n\n```md\n[[{protected_title}]]\n```\n\nИнлайн: `[[{protected_title}]]`.\n',
+        }
+        open_card = protected_vault / 'cards/open.md'
+        open_card.write_text(f'# Открытая\n\n- см. [[{protected_title}]]\n')
+        for rel, text in protected_files.items():
+            path = protected_vault / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        protected_before = {
+            rel: (protected_vault / rel).read_bytes() for rel in protected_files
+        }
+        protected_graph = build_graph(protected_vault, schema)
+        (protected_fixes, protected_applied, protected_ambiguous,
+         protected_skipped) = fix_broken_links(
+            protected_vault, protected_graph, apply=True)
+        test("graph fix repairs the free-text link beside protected ones",
+             protected_applied == 1 and len(protected_fixes) == 1
+             and open_card.read_text()
+             == '# Открытая\n\n- см. [[cards/ideas/dev-tools]]\n',
+             f"got: applied={protected_applied}, fixes={protected_fixes}, "
+             f"file={open_card.read_text()!r}")
+        test("graph fix leaves daily transcripts and append-only History byte for byte",
+             all((protected_vault / rel).read_bytes() == protected_before[rel]
+                 for rel in protected_files),
+             str({rel: (protected_vault / rel).read_text() for rel in protected_files}))
+        test("graph fix reports protected links instead of promising them",
+             protected_ambiguous == []
+             and sorted((item['source'], item['reason'])
+                        for item in protected_skipped) == [
+                            ('cards/fence', 'code'),
+                            ('cards/fence', 'code'),
+                            ('cards/hist', 'history'),
+                            ('summaries/daily/2026-09-12', 'summaries')],
+             f"got: {protected_skipped}")
+        protected_code, protected_out, protected_err = run(
+            [sys.executable, str(SCRIPTS_DIR / 'graph.py'), 'fix',
+             str(protected_vault), '--apply'])
+        test("graph.py fix prints the protected block",
+             protected_code == 0
+             and 'Skipped (protected): 4' in protected_out
+             and '(summaries)' in protected_out
+             and '(history)' in protected_out
+             and '(code)' in protected_out,
+             f"got: code={protected_code}, out={protected_out!r}, err={protected_err!r}")
+
+        # 7.12d формы токена, которые понимает резолвер: .md и префикс vault/ тоже
+        # чинятся, иначе Fixable обещает то, чего замена не делает.
+        suffix_vault = tmp / 'graph-fix-suffix-vault'
+        (suffix_vault / 'cards').mkdir(parents=True, exist_ok=True)
+        suffix_title = 'Рубрика инструментов'
+        (suffix_vault / 'cards/target.md').write_text(
+            f'# {suffix_title}\n\n- тело\n')
+        suffix_source = suffix_vault / 'cards/a.md'
+        suffix_source.write_text(
+            f'# A\n\n- [[{suffix_title}.md]]\n- [[vault/{suffix_title}]]\n')
+        suffix_graph = build_graph(suffix_vault, schema)
+        (suffix_fixes, suffix_applied, _suffix_ambiguous,
+         suffix_skipped) = fix_broken_links(suffix_vault, suffix_graph, apply=True)
+        test("graph fix rewrites the .md and vault/ target forms",
+             len(suffix_fixes) == 2 and suffix_applied == 2 and suffix_skipped == []
+             and suffix_source.read_text()
+             == '# A\n\n- [[cards/target]]\n- [[cards/target]]\n',
+             f"got: fixes={suffix_fixes}, applied={suffix_applied}, "
+             f"file={suffix_source.read_text()!r}")
+
+        # 7.12e обещанная и не переписанная ссылка — отказ выполнения, а не тишина:
+        # резолвер срезает и обратный слэш, а замена ищет буквальный токен байт в байт.
+        missed_vault = tmp / 'graph-fix-missed-vault'
+        (missed_vault / 'cards').mkdir(parents=True, exist_ok=True)
+        (missed_vault / 'cards/target.md').write_text(
+            f'# {suffix_title}\n\n- тело\n')
+        (missed_vault / 'cards/a.md').write_text(
+            f'# A\n\n- [[{suffix_title}\\]]\n')
+        missed_graph = build_graph(missed_vault, schema)
+        try:
+            fix_broken_links(missed_vault, missed_graph, apply=True)
+            missed_error = None
+        except LinkRepairError as error:
+            missed_error = str(error)
+        test("graph fix refuses to stay silent about a link it could not rewrite",
+             missed_error is not None and 'cards/a' in missed_error,
+             f"got: {missed_error!r}")
+        missed_code, _missed_out, missed_err = run(
+            [sys.executable, str(SCRIPTS_DIR / 'graph.py'), 'fix',
+             str(missed_vault), '--apply'])
+        test("graph.py fix exits non-zero on a link it could not rewrite",
+             missed_code != 0
+             and 'promised a fix and rewrote nothing' in missed_err,
+             f"got: code={missed_code}, err={missed_err!r}")
 
         # 7.13 nested hub notes are not orphans
         hub_vault = tmp / 'graph-hub-vault'
@@ -2578,6 +2828,76 @@ def main():
                 break
         test("property: a crashed write leaves the old card byte-for-byte",
              prop_atomic_ok, prop_atomic_detail)
+
+        # 9.4 Резолв по заголовку на случайных заголовках: уникальный H1 находится при
+        # смене регистра и лишних пробелах, второй файл с тем же заголовком делает ключ
+        # неоднозначным, а normalize_title идемпотентна. Символы, из которых собираются
+        # имена файлов ('_'), в алфавит заголовков не входят, поэтому путь и stem
+        # заголовку не мешают.
+        prop_vault = tmp / 'title-prop-vault'
+        (prop_vault / 'titles').mkdir(parents=True, exist_ok=True)
+        (prop_vault / 'dupes').mkdir(parents=True, exist_ok=True)
+        alphabet = list('абвгдеёжзиклмнопрстуфхцчшщыэюяabcmxyz0123456789 -—:,')
+        prop_title_ok = True
+        prop_title_detail = ''
+        cases = []
+        seen_keys = set()
+        # Заголовки с одинаковым ключом после нормализации сделали бы индекс
+        # неоднозначным сами по себе — такой вход проверяет не резолвер, а генератор.
+        while len(cases) < 200 and len(seen_keys) < 4000:
+            case = len(cases)
+            title = ''.join(rnd.choice(alphabet)
+                            for _ in range(rnd.randint(1, 40)))
+            key = normalize_title(title)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            (prop_vault / 'titles' / f'f_{case}.md').write_text(f'# {title}\n')
+            cases.append((case, title))
+        prop_index = build_link_index(prop_vault)
+        for case, title in cases:
+            words = normalize_title(title).split()
+            loose = ''.join(
+                (rnd.choice([' ', '  ', '   ']) if i else '') + word
+                for i, word in enumerate(words))
+            loose = ''.join(
+                ch.upper() if rnd.random() < 0.5 else ch for ch in loose)
+            loose = ' ' * rnd.randint(0, 2) + loose + ' ' * rnd.randint(0, 2)
+            resolved, strategy = resolve_link_target(loose, prop_index)
+            if (resolved, strategy) != (f'titles/f_{case}', 'unique_title'):
+                prop_title_ok = False
+                prop_title_detail = (f'case {case}, seed={SEED}: title={title!r} '
+                                     f'link={loose!r} -> {(resolved, strategy)}')
+                break
+        test("property: a unique H1 is found through case and extra spaces",
+             prop_title_ok and len(cases) == 200, prop_title_detail)
+
+        prop_ambiguous_ok = True
+        prop_ambiguous_detail = ''
+        for case, title in cases:
+            (prop_vault / 'dupes' / f'f_{case}.md').write_text(f'# {title}\n')
+        prop_index = build_link_index(prop_vault)
+        for case, title in cases:
+            resolved, strategy = resolve_link_target(title, prop_index)
+            if resolved is not None or strategy != 'ambiguous_title':
+                prop_ambiguous_ok = False
+                prop_ambiguous_detail = (f'case {case}, seed={SEED}: title={title!r} '
+                                         f'-> {(resolved, strategy)}')
+                break
+        test("property: the same H1 in two cards is ambiguous, never guessed",
+             prop_ambiguous_ok, prop_ambiguous_detail)
+
+        prop_idempotent_ok = True
+        prop_idempotent_detail = ''
+        for case, title in cases:
+            once = normalize_title(title)
+            twice = normalize_title(once)
+            if once != twice or twice != normalize_title(twice):
+                prop_idempotent_ok = False
+                prop_idempotent_detail = f'case {case}, seed={SEED}: {once!r} -> {twice!r}'
+                break
+        test("property: normalize_title is idempotent",
+             prop_idempotent_ok, prop_idempotent_detail)
 
         # ═══════════════════════════════════════════════════════
         # SUMMARY

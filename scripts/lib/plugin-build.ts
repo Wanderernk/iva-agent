@@ -24,7 +24,16 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { PluginMcpServer } from "#lib/plugin-reader.ts";
 import { tryLoadPluginCore } from "./plugin-core.ts";
-import type { Runner } from "./version-update.ts";
+/**
+ * Форма запуска внешней команды. Своя подпись, а не импорт `Runner` из
+ * `version-update.ts`: тот зовёт этот модуль как значение, и стёртый `import type` всё
+ * равно замыкал цикл (madge видит и типовые рёбра, B4b).
+ */
+type Runner = (
+  command: string,
+  args: readonly string[],
+  cwd: string,
+) => Promise<{ readonly code: number; readonly output: string }>;
 
 type Say = (message: string) => void;
 

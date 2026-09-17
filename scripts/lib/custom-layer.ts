@@ -24,7 +24,12 @@ import {
   sep,
 } from "node:path";
 import { z } from "zod";
-import { isAuthoredPath } from "./authored-paths.ts";
+import {
+  isAuthoredPath,
+  instructionSlotCollision,
+  isInstructionSlotPath,
+  isLiveInstructionPath,
+} from "./authored-paths.ts";
 
 export { isAuthoredPath };
 
@@ -33,6 +38,8 @@ const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 // Слоты, которые слой забирает из рабочего дерева и кладёт в сборку. Скиллов здесь нет:
 // их читает с диска резолвер agent/skills/custom.ts, и второй путь к тем же файлам был бы
 // задвоением (docs/extending.md). Остальные слоты — код, ему сборка нужна.
+// Слот agent/instructions/ наполняется только из data/custom: правка встроенного файла в
+// checkout остаётся обычным локальным патчем, а не заменой слота.
 const AUTHORED_PATHSPECS = [
   "agent/instructions.md",
   "agent/connections",
@@ -313,6 +320,8 @@ export function captureCustomLayer({
   for (const path of canonicalFiles(dataDir)) {
     if (manifest.entries[path]) continue;
     const base = revisionFile(root, baseRevision, path);
+    if (isInstructionSlotPath(path) && base !== null)
+      throw instructionSlotCollision(path);
     const local = readOptional(canonicalPath(dataDir, path));
     if (local === null) continue;
     manifest.entries[path] = {
@@ -438,6 +447,21 @@ export function materializeCustomLayer({
   const manifest = ManifestSchema.parse(structuredClone(current));
   const custom = customRoot(dataDir);
   mkdirSync(custom, { recursive: true, mode: 0o700 });
+  // Оборванный materialize (краш/сигнал между материализацией и commit/discard)
+  // оставляет .pending-<random> в custom/ навсегда: следующий запуск создаёт новый,
+  // а старый не метёт. Материализация на одном data-dir сериализована сборкой или
+  // обновлением, поэтому сметаем всё незакоммиченное до создания своего каталога.
+  for (const entry of readdirSync(custom, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(".pending-")) continue;
+    rmSync(join(custom, entry.name), { recursive: true, force: true });
+  }
+  // Слот не может занять имя встроенного файла, приехавшего релизом позже; проверка стоит
+  // до .pending-, чтобы отказ не оставлял мусора рядом с каноническими файлами.
+  for (const [path, entry] of Object.entries(manifest.entries)) {
+    if (!isInstructionSlotPath(path) || entry.tombstone) continue;
+    if (readOptional(safeChild(root, path)) !== null)
+      throw instructionSlotCollision(path);
+  }
   const pendingDir = mkdtempSync(join(custom, ".pending-"));
   const currentAgent = join(custom, "agent");
   const pendingAgent = join(pendingDir, "agent");
@@ -454,6 +478,18 @@ export function materializeCustomLayer({
       throw new Error(`manifest contains a non-authored path: ${path}`);
     const entry = manifest.entries[path];
     if (!entry) continue;
+    // У файла слота нет апстрим-предка: он целиком принадлежит владельцу. Убрал или
+    // переименовал - хранить нечего, запись уходит из манифеста. Иначе одноимённый файл
+    // апстрима материализовался бы как «файл владельца» и следующая сборка упала бы на
+    // коллизии, которую владелец уже разрешил.
+    if (
+      isInstructionSlotPath(path) &&
+      entry.tombstone &&
+      entry.baseBlob === null
+    ) {
+      delete manifest.entries[path];
+      continue;
+    }
     const base = entry.baseBlob
       ? readOptional(join(custom, "bases", entry.baseBlob))
       : null;
@@ -522,10 +558,14 @@ export function materializeCustomLayer({
       continue;
     }
 
-    // Скилл в дерево не кладём — его отдаёт резолвер прямо из data/custom. Исключение
-    // одно: удаление встроенного скилла. Динамика умеет перекрыть одноимённый скилл,
-    // но не убрать его, поэтому tombstone по-прежнему правит дерево.
-    if (!path.startsWith(SKILLS_PREFIX) || materialized === null)
+    // Скилл в дерево не кладём — его отдаёт резолвер прямо из data/custom. Так же
+    // markdown-правила владельца: их читает с диска agent/instructions/30-owner-rules.ts.
+    // Исключение одно: удаление встроенного скилла. Динамика умеет перекрыть одноимённый
+    // скилл, но не убрать его, поэтому tombstone по-прежнему правит дерево.
+    if (
+      (!path.startsWith(SKILLS_PREFIX) && !isLiveInstructionPath(path)) ||
+      materialized === null
+    )
       applyToTree(root, path, materialized);
     const pendingPath = safeChild(pendingDir, path);
     if (materialized === null) rmSync(pendingPath, { force: true });
@@ -661,73 +701,6 @@ export function rebaseBuildOutput({
 
 export function discardCustomLayer(result: MaterializedCustomLayer): void {
   rmSync(result.pendingDir, { recursive: true, force: true });
-}
-
-export function ensureCustomRecoveryBundle({
-  result,
-  root,
-  targetRevision,
-  reason,
-  now = new Date(),
-}: {
-  result: MaterializedCustomLayer;
-  root: string;
-  targetRevision: string;
-  reason: "custom-build-failed";
-  now?: Date;
-}): string {
-  if (result.recoveryDir) return result.recoveryDir;
-  const recoveryDir = join(
-    result.dataDir,
-    "update-conflicts",
-    `${timestamp(now)}-${reason}-${targetRevision.slice(0, 12)}`,
-  );
-  mkdirSync(recoveryDir, { recursive: true, mode: 0o700 });
-  const current = readCustomManifest(result.dataDir);
-  const paths = Object.keys(current.entries).sort();
-  const canonicalByPath = new Map<string, Buffer | null>();
-  for (const path of paths) {
-    const entry = current.entries[path];
-    if (!entry) continue;
-    const base = entry.baseBlob
-      ? readOptional(join(customRoot(result.dataDir), "bases", entry.baseBlob))
-      : null;
-    const local = readOptional(canonicalPath(result.dataDir, path));
-    canonicalByPath.set(path, local);
-    const upstream = readOptional(safeChild(root, path));
-    archiveConflictSide(recoveryDir, "base", path, base);
-    archiveConflictSide(recoveryDir, "local", path, local);
-    archiveConflictSide(recoveryDir, "upstream", path, upstream);
-  }
-  writePrivateFile(
-    join(recoveryDir, "report.json"),
-    `${JSON.stringify(
-      {
-        schema: "iva-update-conflicts/v1",
-        createdAt: now.toISOString(),
-        targetRevision,
-        reason,
-        conflicts: paths.map((path) => ({ path })),
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  for (const [path, entry] of Object.entries(result.manifest.entries)) {
-    const local = canonicalByPath.get(path) ?? null;
-    applyToTree(result.pendingDir, path, local);
-    entry.localSha256 = local === null ? null : sha256(local);
-    entry.tombstone = local === null;
-    entry.conflict = {
-      localSha256: local === null ? null : sha256(local),
-      recoveryDir,
-    };
-  }
-  writePrivateFile(
-    join(result.pendingDir, "manifest.json"),
-    `${JSON.stringify(result.manifest, null, 2)}\n`,
-  );
-  return recoveryDir;
 }
 
 export function archiveInvalidCustomLayer({

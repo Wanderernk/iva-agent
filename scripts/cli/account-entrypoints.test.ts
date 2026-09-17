@@ -3,7 +3,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   chmod,
-  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -16,6 +15,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
+import { plantCliTree } from "../fixtures/cli-tree.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -32,32 +32,16 @@ async function createAccountFixture(t: TestContext): Promise<AccountFixture> {
   const project = join(dir, "iva");
   const home = join(dir, "home");
   const fakeBin = join(dir, "bin");
-  await mkdir(join(project, "bin"), { recursive: true });
   await mkdir(home, { recursive: true });
   await mkdir(fakeBin, { recursive: true });
-  await cp(join(ROOT, "bin/iva.mjs"), join(project, "bin/iva.mjs"));
-  await cp(join(ROOT, "scripts"), join(project, "scripts"), {
-    recursive: true,
+  // Деревья CLI — общим списком (scripts/fixtures/cli-tree.ts), а не своим перечнем:
+  // списком забывают новый пакет (T20: packages/secret-redaction). scripts/lib копией —
+  // тест правит в нём codex-oauth.ts, ссылкой это правило бы тронуло сам репозиторий.
+  // cli и lib — копиями: симлинк cli увёл бы относительный `../lib` в настоящий
+  // репозиторий (Node резолвит символы ссылок), и правка codex-oauth.ts ниже не подействовала.
+  await plantCliTree(ROOT, project, {
+    copy: ["scripts/cli", "scripts/lib"],
   });
-  await cp(
-    join(ROOT, "packages/data-dir"),
-    join(project, "packages/data-dir"),
-    {
-      recursive: true,
-    },
-  );
-  await cp(
-    join(ROOT, "packages/timezone"),
-    join(project, "packages/timezone"),
-    {
-      recursive: true,
-    },
-  );
-  await cp(
-    join(ROOT, "packages/context-window"),
-    join(project, "packages/context-window"),
-    { recursive: true },
-  );
   await symlink(
     join(ROOT, "node_modules"),
     join(project, "node_modules"),

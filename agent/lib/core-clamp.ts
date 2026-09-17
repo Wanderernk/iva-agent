@@ -184,13 +184,18 @@ export function clampCore(text: string): string {
   classifySections(lines);
   enforceGoalLimit(lines);
 
-  let current = render(lines);
+  const current = render(lines);
   if (current.length <= CORE_CAP) return current;
 
+  // Длину ведём вычитанием: render() на каждую вытесняемую строку делал сжатие
+  // квадратичным (4× вход ≈ 15× времени), а clampCore зовётся на каждом ходу,
+  // пока CORE больше потолка.
+  let length = current.length;
   for (const item of preferenceEvictionOrder(lines)) {
+    if (item.line.removed) continue;
     item.line.removed = true;
-    current = render(lines);
-    if (current.length <= CORE_CAP) return current;
+    length -= item.line.content.length + item.line.ending.length;
+    if (length <= CORE_CAP) return render(lines);
   }
 
   return truncateToCap(lines);
@@ -267,31 +272,66 @@ export function setLastDayPointer(text: string, isoDate: string): string {
 export interface CoreDamage {
   /** Заголовки `## `, которые были до хода и пропали после (без самих решёток). */
   readonly lostHeadings: readonly string[];
+  /** Уцелевшие заголовки `## `, у которых непустое тело стало пустым. */
+  readonly hollowedHeadings: readonly string[];
   /** Файл был непустым и стал пустым. */
   readonly emptied: boolean;
   readonly damaged: boolean;
 }
 
-function headingsOf(text: string): string[] {
-  const found: string[] = [];
+/** Имя заголовка `## ` → текст его тела: строки до следующего `## ` или конца файла. */
+function sectionsOf(text: string): Map<string, string> {
+  const sections = new Map<string, string>();
+  let heading: string | null = null;
+  let body: string[] = [];
+  const flush = (): void => {
+    if (heading === null) return;
+    const joined = body.join("\n");
+    const previous = sections.get(heading);
+    sections.set(
+      heading,
+      previous === undefined ? joined : `${previous}\n${joined}`,
+    );
+  };
   for (const line of linesOf(text)) {
-    const heading = HEADING.exec(line.content);
-    if (heading) found.push(heading[1]);
+    const next = HEADING.exec(line.content);
+    if (next) {
+      flush();
+      heading = next[1];
+      body = [];
+    } else if (heading !== null) {
+      body.push(line.content);
+    }
   }
-  return found;
+  flush();
+  return sections;
 }
 
 /**
- * Что ночной ход снёс в CORE: сравнение файла до и после. Судим по заголовкам, а не по
- * тексту — правка строк это работа ночи, а исчезнувшая секция (в том числе
- * пользовательская, которой нет в шаблоне) это потеря данных, которую откатывает код
- * (ADR-0002).
+ * Что ночной ход снёс в CORE: сравнение файла до и после. Судим по заголовкам и телам
+ * секций, а не по строкам — правка строк это работа ночи, а исчезнувшая секция или
+ * опустевшее тело под уцелевшим заголовком (в том числе пользовательские, которых нет
+ * в шаблоне) это потеря данных, которую откатывает код (ADR-0002).
  */
 export function coreDamage(before: string, after: string): CoreDamage {
-  const kept = new Set(headingsOf(after));
-  const lostHeadings = [...new Set(headingsOf(before))].filter(
-    (heading) => !kept.has(heading),
+  const beforeSections = sectionsOf(before);
+  const afterSections = sectionsOf(after);
+  const lostHeadings = [...beforeSections.keys()].filter(
+    (heading) => !afterSections.has(heading),
   );
+  const hollowedHeadings = [...beforeSections.keys()].filter((heading) => {
+    const kept = afterSections.get(heading);
+    return (
+      (beforeSections.get(heading) as string).trim() !== "" &&
+      kept !== undefined &&
+      kept.trim() === ""
+    );
+  });
   const emptied = before.trim() !== "" && after.trim() === "";
-  return { lostHeadings, emptied, damaged: lostHeadings.length > 0 || emptied };
+  return {
+    lostHeadings,
+    hollowedHeadings,
+    emptied,
+    damaged: lostHeadings.length > 0 || hollowedHeadings.length > 0 || emptied,
+  };
 }

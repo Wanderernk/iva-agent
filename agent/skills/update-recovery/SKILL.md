@@ -1,9 +1,6 @@
 ---
 name: update-recovery
-description: >
-  Restore or merge user customizations preserved during an Iva update. Use when the owner says
-  "restore my update changes", "recover my customizations", «верни мои изменения после обновления»,
-  «восстанови мои доработки» or asks about an update conflict.
+description: "Restore or merge owner customizations after an Iva update; resolve data/update-conflicts/."
 ---
 
 # Update customization recovery

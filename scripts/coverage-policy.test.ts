@@ -1,162 +1,116 @@
 /* eslint-disable @typescript-eslint/no-floating-promises -- Node's test runner owns registrations. */
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, posix } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, posix, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-const ROOT = fileURLToPath(new URL("../", import.meta.url));
-const EXPECTED_PRODUCTION_COUNT = 234;
-const EXPECTED_INVENTORY_SHA256 =
-  "c5f5d5a21314cc1bc550c49ed71c8014d16024d3809f135f25b9d2f0e0a04eee";
+// Что проверяет: у каждого production-файла (agent/**, scripts/**, кроме тестов
+// и фикстур) есть хотя бы один *.test.ts, который его грузит: импорт, dynamic
+// import, запуск дочерним процессом, чтение исходника как текста, сверка набора
+// файлов каталога. Либо путь лежит в BLIND_SPOT с причиной одной строкой.
+// Чего не проверяет: глубину покрытия (это делает test:coverage), transitively
+// загруженные модули без прямого теста, изменения графа импортов без новых путей.
+const ROOT = resolve(fileURLToPath(new URL("../", import.meta.url)));
 
-// Node's native include globs filter loaded modules; they do not load untouched files.
-// This test pins the exact production path inventory and a separately measured 26-path
-// blind-spot snapshot. It does not determine what the current import graph loads, claim
-// that the other paths are reported, or notice import-graph changes without path changes.
-// Measured again for this inventory: the web inbound-gate round added `agent/lib/web-gate.ts`
-// and `agent/tools/web_fetch.ts`, both reported, and gave `agent/tools/web_search.ts` its
-// first loading test - so the blind spot dropped from 26 paths to 25. The subagent slots
-// `agent/subagents/planner/tools/web_fetch.ts` and `web_search.ts` came next, both reported
-// at 100% by scripts/web-surface-gate.test.ts, so the blind spot stays at 25. The per-node
-// sandbox pin `agent/subagents/planner/sandbox.ts` came after it: measured unreported, like
-// the root `agent/sandbox.ts` it re-exports - no test loads either - so the blind spot is 26.
-// The notice policy module `scripts/lib/notice-policy.ts` and the `/menu` screen that switches
-// the reports, `scripts/lib/menu/notices.ts`, came next - both loaded by their own tests and
-// reported, so the blind spot stayed at 26. The provider resolver `agent/lib/model-provider.ts`
-// came after them, reported at 100% by its own test. Its integration test also settled a
-// standing claim about `agent/hooks/usage.ts`: a spawned child inherits NODE_V8_COVERAGE, so
-// the hook it imports is measured like any other file - re-measured at 82% lines here, which
-// takes it off this list and puts the blind spot at 25. The turn-cancellation seam came next -
-// `agent/lib/eve-cancel.ts`, `agent/lib/telegram-cancel-route.ts` and
-// `agent/lib/telegram-cancel-client.ts` - all three loaded by `scripts/lib/telegram-cancel.test.ts`
-// and reported, so the blind spot stays at 25. The webhook-mode Stop handler
-// `agent/lib/telegram-stop.ts` came last, loaded by `scripts/telegram-failure-events.test.ts`
-// through the real channel and reported, so the blind spot stays at 25. The memory resolver
-// `scripts/lib/memory-mode.ts` came next, loaded and reported by its own test
-// (`scripts/lib/memory-mode.test.ts`), so the blind spot stays at 25. The Reminder CLI
-// `scripts/cli/remind.ts` followed, reported by its own test, so it stays at 25. The live skill
-// resolver came last: `agent/lib/custom-skills.ts` (99% lines) and `agent/lib/data-dir.ts` (100%)
-// are loaded and reported by their own tests, while the slot file `agent/skills/custom.ts` is
-// loaded by eve alone - measured unreported, like `agent/sandbox.ts` - so the blind spot is 26.
-// The durable Telegram bridge then added `scripts/poller/inbox.ts`,
-// `process-lock.ts`, `startup-state.ts`, and `update-callback.ts`. Scoped coverage
-// reported all four through their proof tests, so the blind spot stays at 26.
-// The recovery owner `scripts/lib/update-recovery.ts` came next. Its target-aware
-// collision and manifest modules followed. The scoped update suite reports all three
-// at 94.55%, 97.53% and 100% lines, so the blind spot stays at 26. The updater split
-// then added candidate, command, resource, applied-state, ownership, IO, object-store,
-// collision-owner, and snapshot-verifier modules. The 140-test scoped suite reports
-// every added module and totals 96.02% lines, 84.69% branches, and 95.50% functions,
-// so the blind spot stays at 26. The resource identity and owner modules followed;
-// their 19-test scoped anchor reports 89.49% and 86.76% lines, so neither is blind.
-// Wave B added `agent/lib/context-window.ts`, `agent/lib/telegram-private-chat.ts`,
-// `scripts/lib/data-dir.ts`, and `scripts/memory/read-core.ts`. Their scoped seam tests
-// report all four at 100% lines. The shared context-window package implementation also
-// reports 100% lines, so moving the resolver does not add a blind spot; the snapshot stays 26.
-// The plugin rails came next, seven paths: `agent/lib/plugin-reader.ts`,
-// `agent/lib/plugin-skills.ts`, `agent/lib/plugin-store.ts`, `scripts/cli/plugin.ts`,
-// `scripts/lib/plugin-core.ts`, `scripts/lib/plugin-install.ts` and
-// `scripts/lib/plugin-source.ts`. Their scoped suite (the reader anchors and properties,
-// the store, the source parser, the install seam, and the `iva plugin` and doctor CLI
-// tests) reports all seven, 97.61% lines together and no file under 93%, so the blind
-// spot stays 26.
-// The Marketplace came after them, one path: `scripts/lib/marketplace.ts`. Scoped
-// coverage over its own anchors and properties plus the `iva plugin` CLI suite reports
-// it at 100% lines, 96.62% branches and 100% functions, with `plugin-source.ts` at 100%
-// and `plugin-install.ts` at 97.87% beside it. Nothing new is unreported, so the blind
-// spot stays 26.
-// The plugin build (ADR-0009) added two paths: `scripts/lib/plugin-build.ts`, which reads
-// the store and generates the eve mount, and `agent/lib/plugin-config.ts`, which that mount
-// reads at load time. Scoped coverage over `scripts/lib/plugin-build.test.ts`,
-// `agent/lib/plugin-config.test.ts`, `scripts/lib/version-update.test.ts`,
-// `scripts/cli/plugin.test.ts`, `scripts/cli/doctor.test.ts` and
-// `scripts/update-finish.test.ts` reports them at 95.02% and 100% lines, so the blind spot
-// stays 26.
-// The turn journal (ADR-0010) came next: `agent/lib/trace.ts` and `agent/hooks/trace.ts`.
-// Scoped coverage over `agent/lib/trace.test.ts`, `agent/lib/trace.property.test.ts` and
-// `agent/lib/trace-hook.test.ts` reports them at 97% and 98% lines, so the blind spot
-// stays 26 - unlike `agent/hooks/transcript.ts`, this hook is loaded by its own test. That
-// test lives in `agent/lib/`, not beside the hook: eve treats every file under
-// `agent/hooks/` as a hook, and `trace.test` is not a legal hook name.
-// The rich-message reader `agent/lib/telegram-rich-message.ts` came next. Its own test
-// reports it at 99.53% lines, 92.69% branches and 100% functions, so the blind spot
-// stays 26. The rich-post CLI `scripts/cli/post.ts` came last, replacing the skill's
-// Python sender: `scripts/cli/post.test.ts` reports it at 93.14% lines, 82.64% branches
-// and 86.96% functions - the uncovered remainder is the tmpfiles.org upload and the
-// stdin reader, both injected in tests - so the blind spot stays 26.
-// The journal's second reader came next, one path: `scripts/cli/trace.ts`. Scoped coverage
-// over `scripts/cli/trace.test.ts` reports it at 98.71% lines, 90.57% branches and 96.25%
-// functions, so the blind spot stays 26.
-// The plugin units (ADR-0009) came last, one path: `scripts/lib/plugin-units.ts`. Scoped
-// coverage over `scripts/lib/plugin-units.test.ts`, `plugin-build.test.ts`,
-// `plugin-build-eve.test.ts`, `version-update.test.ts`, `scripts/cli/plugin.test.ts`,
-// `scripts/cli/doctor.test.ts`, `scripts/update-finish.test.ts` and the three
-// `agent/lib/plugin-*.test.ts` reports it at 98.32% lines, and the modules it changed
-// beside it at 96-100% (`plugin-build.ts` 96.38%, `plugin-config.ts` 100%,
-// `plugin-store.ts` 99.55%, `plugin-reader.ts` 99.17%, `scripts/cli/plugin.ts` 96.11%),
-// so the blind spot stays 26. The MCP proxy itself (`services/mcp-proxy/*.ts`) is outside
-// this inventory: the walk covers `agent/` and `scripts/` only, and the proxy is a service
-// of its own, proved end to end by `services/mcp-proxy/proxy.test.ts`.
-// The smoothing pass of the plugin wave came last, five paths and no new behaviour:
-// `scripts/cli/plugin.ts` (1758 lines) was split into `plugin-cli-context.ts`,
-// `plugin-cli-install.ts`, `plugin-cli-trust.ts` and `plugin-cli-marketplace.ts`, and the
-// lazy translator both plugin and trace commands had a copy of moved to
-// `scripts/lib/cli-translate.ts`. Scoped coverage over `scripts/cli/plugin.test.ts`,
-// `scripts/cli/doctor.test.ts`, `scripts/cli/trace.test.ts`,
-// `scripts/lib/marketplace.test.ts` and the three `agent/lib/trace*.test.ts` reports every
-// one of them - 99.11%, 95.90%, 97.29%, 96.77%, 93.29% and 85.71% lines, the last one being
-// the lazy `#lib/i18n.ts` import that a test with its own table never takes - plus
-// `marketplace.ts` at 100%, `agent/lib/trace.ts` at 97.13% and `scripts/cli/trace.ts` at
-// 99.14%. Nothing new is unreported, so the blind spot stays 26.
-// The What's New reader of the update Alert came last, one path:
-// `scripts/lib/whats-new.ts`. Scoped coverage over `scripts/whats-new.test.ts` and
-// `scripts/lib/update-check.test.ts` reports it at 100% lines, 92.16% branches and 100%
-// functions, with `scripts/check-update.ts` at 92.64% lines beside it, so the blind spot
-// stays 26.
-// The rollup stale-cursor workaround `scripts/lib/rollup-stale-cursor.ts` came next.
-// Scoped coverage over `scripts/lib/rollup-stale-cursor.test.ts` reports it, so the
-// blind spot stays 26.
-// The turn-policy menu added `scripts/lib/menu/turn-policy.ts` at 100% scoped coverage.
-// Removing the old Telegram routing helper leaves a net one-path increase, still 26 blind.
-const MEASURED_UNREPORTED_BY_CATEGORY = {
-  frameworkBoundaries: [
-    "agent/agent.ts",
-    "agent/channels/eve.ts",
-    "agent/connections/telegram-userbot.ts",
-    "agent/hooks/transcript.ts",
-    "agent/instructions/05-language.ts",
-    "agent/instructions/20-core.ts",
-    "agent/instructions/25-persona.ts",
-    "agent/instructions/now.ts",
-    "agent/sandbox.ts",
-    "agent/skills/custom.ts",
-    "agent/subagents/planner/agent.ts",
-    "agent/subagents/planner/sandbox.ts",
-  ],
-  thinAgentTools: [
-    "agent/tools/glob.ts",
-    "agent/tools/grep.ts",
-    "agent/tools/tasks.ts",
-  ],
-  standaloneOperations: [
-    "scripts/build.ts",
-    "scripts/check-bash-cwd.ts",
-    "scripts/check-reasoning-strip.ts",
-    "scripts/daily-digest.ts",
-    "scripts/memory/brain.ts",
-    "scripts/memory/embed-index.ts",
-    "scripts/memory/rollup.ts",
-    // A one-shot data migration, run out of the version that introduced it.
-    "scripts/migrations/001-iva-port.ts",
-    "scripts/replica-smoke.ts",
-    "scripts/setup/main.ts",
-    // Runs as its own process, spawned by the version being installed.
-    "scripts/update-finish.ts",
-  ],
-} as const;
+// Слепое пятно: модули без прямого теста. Причина — одна строка на путь.
+// Путь сюда попадает, только если ни один тест его не грузит (проверяется ниже);
+// у каждого пути с тестом место вне списка.
+const BLIND_SPOT: ReadonlyArray<{
+  readonly path: string;
+  readonly why: string;
+}> = [
+  // Границы фреймворка: грузит только eve, тесты гоняют швы вокруг.
+  { path: "agent/agent.ts", why: "сборка eve; тесты держат провайдер и тулзы" },
+  {
+    path: "agent/channels/eve.ts",
+    why: "адаптер канала eve; тесты идут через инбаунд",
+  },
+  {
+    path: "agent/hooks/transcript.ts",
+    why: "хук eve; рядом trace-hook покрыт, этот грузит ядро",
+  },
+  {
+    path: "agent/instructions/05-language.ts",
+    why: "динамика eve; язык проверен через ходы",
+  },
+  // Тонкие тулы: тривиальные обёртки, поведение держат тесты поверхностей.
+  {
+    path: "agent/tools/glob.ts",
+    why: "тонкая обёртка; гоняют bash/grep-тесты поверхностей",
+  },
+  {
+    path: "agent/tools/grep.ts",
+    why: "тонкая обёртка; гоняют bash/grep-тесты поверхностей",
+  },
+  // Транзитивно покрыты: свой тест грузит соседа, этот едет прицепом.
+  {
+    path: "agent/lib/embeddings.ts",
+    why: "прицеп embed-index; ключи и фолбэки в его тесте",
+  },
+  {
+    path: "agent/lib/plugin-skills.ts",
+    why: "прицеп plugin-store/reader; листинг в их тестах",
+  },
+  {
+    path: "agent/lib/telegram-allowlist.ts",
+    why: "прицеп инбаунда; allowlist гоняют его тесты",
+  },
+  {
+    path: "agent/lib/telegram-gate-notice.ts",
+    why: "прицеп гейта; тексты в тестах инбаунда",
+  },
+  {
+    path: "agent/lib/telegram-private-chat.ts",
+    why: "прицеп канала; приватный чат в тестах канала",
+  },
+  {
+    path: "agent/lib/telegram-stop.ts",
+    why: "прицеп стопа; сценарии в failure-events",
+  },
+  {
+    path: "agent/transcribe.ts",
+    why: "прицеп медиа; транскрипция замокана в тестах медиа",
+  },
+  {
+    path: "scripts/lib/cli-translate.ts",
+    why: "прицеп plugin/trace CLI; перевод в их тестах",
+  },
+  {
+    path: "scripts/lib/plugin-core.ts",
+    why: "прицеп plugin CLI; ядро в его тестах",
+  },
+  {
+    path: "scripts/cli/plugin-cli-install.ts",
+    why: "прицеп plugin CLI; install-команды в его тестах",
+  },
+  {
+    path: "scripts/cli/plugin-cli-marketplace.ts",
+    why: "прицеп plugin CLI; маркетплейс в его тестах",
+  },
+  {
+    path: "scripts/cli/plugin-cli-trust.ts",
+    why: "прицеп plugin CLI; trust-юниты в его тестах",
+  },
+  // Отдельные процессы: выполняются только на живой установке.
+  {
+    path: "scripts/check-bash-cwd.ts",
+    why: "ручная проверка разработчика, не рантайм",
+  },
+  {
+    path: "scripts/check-reasoning-strip.ts",
+    why: "ручная проверка разработчика, не рантайм",
+  },
+  {
+    path: "scripts/migrations/001-iva-port.ts",
+    why: "одноразовая миграция версии 0.3.3",
+  },
+  {
+    path: "scripts/replica-smoke.ts",
+    why: "ручной стенд; e2e идет через capture/analyze",
+  },
+];
 
 const EXPECTED_COVERAGE_COMMAND =
   'node --test --test-concurrency=4 --experimental-test-coverage --test-coverage-include="agent/**/*.ts" --test-coverage-include="scripts/**/*.ts" --test-coverage-exclude="**/*.test.ts" --test-coverage-exclude="scripts/fixtures/**/*.ts" --test-coverage-lines=75 --test-coverage-branches=77 --test-coverage-functions=71 "agent/**/*.test.ts" "scripts/**/*.test.ts"';
@@ -190,46 +144,656 @@ function productionTypeScriptFiles(): string[] {
   return files.sort();
 }
 
-function digest(paths: readonly string[]): string {
-  return createHash("sha256").update(paths.join("\n")).digest("hex");
+function testFiles(): string[] {
+  const files: string[] = [];
+
+  function visit(relativeDirectory: string): void {
+    for (const entry of readdirSync(join(ROOT, relativeDirectory), {
+      withFileTypes: true,
+    })) {
+      const relativePath = posix.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) visit(relativePath);
+      else if (entry.isFile() && entry.name.endsWith(".test.ts"))
+        files.push(relativePath);
+    }
+  }
+
+  visit("agent");
+  visit("scripts");
+  visit("services");
+  return files.sort();
 }
 
-function assertProductionPathInventory(
-  productionFiles: readonly string[],
-): void {
-  assert.equal(
-    productionFiles.length,
-    EXPECTED_PRODUCTION_COUNT,
-    "production TypeScript inventory changed; rerun scoped coverage and classify the changed files",
+function importsMap(): Array<[string, string]> {
+  const parsed: unknown = JSON.parse(
+    readFileSync(join(ROOT, "package.json"), "utf8"),
   );
-  assert.equal(
-    digest(productionFiles),
-    EXPECTED_INVENTORY_SHA256,
-    "production TypeScript paths changed; rerun scoped coverage before updating the inventory ratchet",
-  );
-
-  const measuredUnreported = Object.values(MEASURED_UNREPORTED_BY_CATEGORY)
-    .flat()
-    .sort();
-  assert.equal(measuredUnreported.length, 26);
-  assert.equal(new Set(measuredUnreported).size, measuredUnreported.length);
-  assert.deepEqual(
-    measuredUnreported.filter((path) => !productionFiles.includes(path)),
-    [],
-    "the measured coverage blind-spot snapshot contains a missing production file",
+  if (!isRecord(parsed) || !isRecord(parsed.imports)) return [];
+  return Object.entries(parsed.imports).flatMap(([pattern, mapped]) =>
+    typeof mapped === "string" ? [[pattern, mapped] as [string, string]] : [],
   );
 }
 
-test("coverage policy pins production paths and the measured blind-spot snapshot", () => {
-  const productionFiles = productionTypeScriptFiles();
-  assertProductionPathInventory(productionFiles);
+// Абсолютный путь, на который указывает specifier из файла, или null.
+// Карта импортов читается из package.json, а не из префикса: префиксу нельзя верить.
+function targetOfSpecifier(
+  specifier: string,
+  fromFile: string,
+  imports: Array<[string, string]>,
+): string | null {
+  const clean = specifier.split("?")[0];
+  if (clean.startsWith(".")) {
+    const direct = resolve(dirname(join(ROOT, fromFile)), clean);
+    if (direct.startsWith(`${ROOT}${sep}`) && existsSync(direct)) return direct;
+    // Спецификатор вида ./agent/... из теста внутри дерева: меряют от корня
+    // (рантайм-харнессы вроде runInRepo исполняют код с cwd корня).
+    const fromRoot = resolve(ROOT, clean);
+    if (fromRoot.startsWith(`${ROOT}${sep}`) && existsSync(fromRoot))
+      return fromRoot;
+    return direct.startsWith(`${ROOT}${sep}`) ? direct : null;
+  }
+  if (!clean.startsWith("#")) return null;
+  for (const [pattern, mapped] of imports) {
+    const star = pattern.indexOf("*");
+    if (star === -1) {
+      if (pattern === clean) return join(ROOT, mapped);
+      continue;
+    }
+    const head = pattern.slice(0, star);
+    const tail = pattern.slice(star + 1);
+    if (
+      clean.length >= head.length + tail.length &&
+      clean.startsWith(head) &&
+      clean.endsWith(tail)
+    ) {
+      const filled = clean.slice(head.length, clean.length - tail.length);
+      return join(ROOT, mapped.replace("*", filled));
+    }
+  }
+  return null;
+}
 
-  assert.throws(
-    () =>
-      assertProductionPathInventory(
-        [...productionFiles, "agent/lib/unclassified-production.ts"].sort(),
+function toProductionPath(absolute: string): string | null {
+  const relative = absolute.startsWith(`${ROOT}${sep}`)
+    ? absolute
+        .slice(ROOT.length + 1)
+        .split(sep)
+        .join("/")
+    : null;
+  if (
+    relative === null ||
+    !(relative.startsWith("agent/") || relative.startsWith("scripts/"))
+  )
+    return null;
+  const candidates = [relative];
+  if (relative.endsWith(".js")) candidates.push(`${relative.slice(0, -3)}.ts`);
+  if (relative.endsWith(".mjs")) candidates.push(`${relative.slice(0, -4)}.ts`);
+  if (!/\.(m?[jt]s)$/.test(relative))
+    candidates.push(`${relative}.ts`, `${relative}/index.ts`);
+  for (const candidate of candidates) {
+    if (
+      candidate.endsWith(".ts") &&
+      existsSync(join(ROOT, ...candidate.split("/")))
+    )
+      return candidate;
+  }
+  return null;
+}
+
+// Строковые эвристики вместо парсера JS: путь в комментарии или в образце кода
+// для парсера — не ссылка. Поэтому: режем комментарии (parity по кавычкам),
+// затем считаем литерал ссылкой, только если он стоит в load-позиции: импорт,
+// dynamic import, new URL, запуск процессом, чтение файла/каталога,
+// поле file: контрактов, сборка пути через join, имя каталога + имена файлов.
+// argv-массивов здесь нет сознательно: раннер-тесты подменяют spawn, и argv там —
+// инертные данные, а не тест файла (прецедент: schedule-runner.test.ts).
+function quoteParity(text: string): number {
+  const matches = text.match(/['"`]/g);
+  return matches === null ? 0 : matches.length % 2;
+}
+
+function codeLines(source: string): string[] {
+  const out: string[] = [];
+  let block = false;
+  for (const rawLine of source.split("\n")) {
+    let line = rawLine;
+    if (block) {
+      const end = line.indexOf("*/");
+      if (end === -1) continue;
+      line = line.slice(end + 2);
+      block = false;
+    }
+    for (;;) {
+      let slashSlash = -1;
+      for (let i = 0; i < line.length - 1; i += 1) {
+        if (
+          line[i] === "/" &&
+          line[i + 1] === "/" &&
+          quoteParity(line.slice(0, i)) % 2 === 0
+        ) {
+          slashSlash = i;
+          break;
+        }
+      }
+      let slashStar = -1;
+      for (let i = 0; i < line.length - 1; i += 1) {
+        if (
+          line[i] === "/" &&
+          line[i + 1] === "*" &&
+          quoteParity(line.slice(0, i)) % 2 === 0
+        ) {
+          slashStar = i;
+          break;
+        }
+      }
+      if (slashSlash !== -1 && (slashStar === -1 || slashSlash < slashStar)) {
+        line = line.slice(0, slashSlash);
+        break;
+      }
+      if (slashStar === -1) break;
+      const end = line.indexOf("*/", slashStar + 2);
+      if (end === -1) {
+        line = line.slice(0, slashStar);
+        block = true;
+        break;
+      }
+      line = `${line.slice(0, slashStar)}${line.slice(end + 2)}`;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+type Quoted = { readonly value: string; readonly index: number };
+
+function quotedOn(line: string): Quoted[] {
+  const found: Quoted[] = [];
+  const pattern = /'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(line)) !== null) {
+    const raw = match[0];
+    let value = raw.slice(1, -1);
+    if (raw[0] === "`") value = value.replace(/\$\{[^{}]*\}/g, "");
+    found.push({ value, index: match.index });
+  }
+  return found;
+}
+
+// Литерал внутри строки-образца: чужие кавычки до него на строке непарны.
+function insideForeignString(line: string, index: number): boolean {
+  return quoteParity(line.slice(0, index)) % 2 === 1;
+}
+
+const WRITE_CALLS = new Set([
+  "writeFileSync",
+  "appendFileSync",
+  "writeFile",
+  "appendFile",
+  "mkdirSync",
+  "mkdir",
+  "rmSync",
+  "rm",
+  "renameSync",
+  "rename",
+  "symlinkSync",
+  "symlink",
+  "chmodSync",
+  "chmod",
+  "truncateSync",
+  "utimesSync",
+  "mkdtempSync",
+]);
+
+const LOAD_CALLS = new Set([
+  "spawnSync",
+  "spawn",
+  "execFileSync",
+  "execFile",
+  "fork",
+  "exec",
+  "readFileSync",
+  "readFile",
+  "existsSync",
+  "readdirSync",
+  "pathToFileURL",
+  "createRequire",
+  "cpSync",
+  "copyFileSync",
+]);
+
+function callNameBefore(line: string, index: number): string | null {
+  const before = line.slice(0, index);
+  const openParen = before.lastIndexOf("(");
+  if (openParen === -1) return null;
+  const between = before.slice(openParen);
+  if (/[);]/.test(between)) return null;
+  return (
+    before.slice(0, openParen).match(/([A-Za-z_$][\w$]*)\s*$/)?.[1] ?? null
+  );
+}
+
+// Аргументы вызова с балансом скобок на одной строке.
+function callArgs(line: string, nameIndex: number): string | null {
+  const openParen = line.indexOf("(", nameIndex);
+  if (openParen === -1) return null;
+  let depth = 0;
+  let i = openParen;
+  let quote: string | null = null;
+  while (i < line.length) {
+    const char = line[i];
+    if (quote !== null) {
+      if (char === "\\") i += 1;
+      else if (char === quote) quote = null;
+    } else if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+    } else if (char === "(") {
+      depth += 1;
+    } else if (char === ")") {
+      depth -= 1;
+      if (depth === 0) return line.slice(openParen + 1, i);
+    }
+    i += 1;
+  }
+  return null;
+}
+
+function topLiterals(args: string): string[] {
+  const found: string[] = [];
+  const pattern = /'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(args)) !== null) {
+    const raw = match[0];
+    let value = raw.slice(1, -1);
+    if (raw[0] === "`") value = value.replace(/\$\{[^{}]*\}/g, "");
+    found.push(value);
+  }
+  return found;
+}
+
+function referencesOf(
+  testFile: string,
+  imports: Array<[string, string]>,
+): Set<string> {
+  const found = new Set<string>();
+  const raw = readFileSync(join(ROOT, testFile), "utf8");
+  const lines = codeLines(raw);
+  const text = lines.join("\n");
+  // Константы вида const P = "./x.ts" для позднейшего import(P): устоявшийся
+  // паттерн динамических импортов (menu/status, poller/transport).
+  const constPaths = new Map<string, string>();
+  for (const line of lines) {
+    const decl = line.match(
+      /(?:^|[^\w$])const\s+([A-Za-z_$][\w$]*)\s*=\s*(["'])(\.\.?\/[^\s"']+\.m?[jt]s)\1/,
+    );
+    if (decl !== null && !insideForeignString(line, line.indexOf(decl[0])))
+      constPaths.set(decl[1], decl[3]);
+  }
+  const testDir = posix.dirname(testFile);
+
+  const claimAbsolute = (absolute: string | null) => {
+    if (absolute === null) return;
+    const production = toProductionPath(absolute);
+    if (production !== null) {
+      found.add(production);
+    }
+  };
+
+  // Спецификатор позиции импорта: тест рядом (testdir), затем корень
+  // (./agent/... из тестов внутри дерева меряют от корня).
+  const claimSpecifier = (spec: string) => {
+    const clean = spec.split("?")[0];
+    if (clean.startsWith("#") || clean.startsWith(".")) {
+      claimAbsolute(targetOfSpecifier(clean, testFile, imports));
+    } else {
+      for (const base of [testDir, posix.dirname(testDir), "."]) {
+        claimAbsolute(
+          join(
+            ROOT,
+            ...posix
+              .normalize(base === "." ? clean : `${base}/${clean}`)
+              .split("/"),
+          ),
+        );
+      }
+    }
+  };
+
+  const claimBare = (value: string) => {
+    claimAbsolute(
+      join(ROOT, ...posix.normalize(`${testDir}/${value}`).split("/")),
+    );
+  };
+
+  const claimRooted = (value: string) => {
+    claimAbsolute(join(ROOT, ...posix.normalize(value).split("/")));
+  };
+
+  const dirEvidence = new Set<string>();
+  const baseEvidence = new Set<string>();
+  const wordEvidence = new Set<string>();
+
+  const noteDir = (value: string) => {
+    const clean = value.split("?")[0].replace(/\/$/, "");
+    for (const absolute of [
+      targetOfSpecifier(clean, testFile, imports),
+      ...[testDir, posix.dirname(testDir), "."].map((base) =>
+        join(
+          ROOT,
+          ...posix
+            .normalize(base === "." ? clean : `${base}/${clean}`)
+            .split("/"),
+        ),
       ),
-    /production TypeScript inventory changed/u,
+    ]) {
+      if (absolute === null) continue;
+      const relative = absolute.startsWith(`${ROOT}${sep}`)
+        ? absolute
+            .slice(ROOT.length + 1)
+            .split(sep)
+            .join("/")
+        : null;
+      if (
+        relative !== null &&
+        (relative.startsWith("agent/") || relative.startsWith("scripts/"))
+      ) {
+        try {
+          if (readdirSync(absolute, { withFileTypes: true }).length >= 0)
+            dirEvidence.add(relative);
+        } catch {
+          /* не каталог */
+        }
+      }
+    }
+  };
+
+  // База join: полный статик — цепочка; dirname — рядом с файлом;
+  // ALLCAPS (ROOT/REPO/PROJECT_ROOT) — рядом и корень; строчная temp — только рядом.
+  const handleJoinLiterals = (args: string) => {
+    const literals = topLiterals(args).filter(
+      (literal) => literal.length > 0 && literal.length <= 500,
+    );
+    for (const literal of literals) {
+      if (!literal.endsWith(".ts") && !literal.endsWith(".js"))
+        noteDir(literal);
+    }
+    const dotTs = literals.filter(
+      (literal) => literal.endsWith(".ts") || literal.endsWith(".js"),
+    );
+    if (dotTs.length === 0) return;
+    const firstArg = args.split(",")[0];
+    const stripped = args
+      .replace(/'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g, "")
+      .replace(/[\s,]/g, "");
+    if (stripped === "") {
+      for (const literal of dotTs) claimSpecifier(literal);
+    } else if (/dirname|import\.meta\.url|__dirname/.test(firstArg)) {
+      for (const literal of dotTs) claimBare(literal);
+    } else if (/^\s*[A-Z_][A-Z0-9_]*\s*,/.test(args)) {
+      for (const literal of dotTs) {
+        claimRooted(literal);
+        claimBare(literal);
+      }
+    } else {
+      for (const literal of dotTs) claimBare(literal);
+    }
+  };
+
+  const lineStarts: number[] = [0];
+  for (const line of lines)
+    lineStarts.push(lineStarts[lineStarts.length - 1] + line.length + 1);
+
+  const locate = (
+    absPos: number,
+  ): { readonly lineNo: number; readonly col: number } => {
+    let lineNo = 0;
+    while (lineNo + 1 < lineStarts.length && lineStarts[lineNo + 1] <= absPos)
+      lineNo += 1;
+    return { lineNo, col: absPos - lineStarts[lineNo] };
+  };
+
+  const parityAt = (absPos: number): number => {
+    const { lineNo, col } = locate(absPos);
+    return quoteParity(lines[lineNo].slice(0, col)) % 2;
+  };
+
+  // Сбалансированные аргументы вызова с абсолютной позиции имени.
+  const balancedArgs = (absName: number): string | null => {
+    const openParen = text.indexOf("(", absName);
+    if (openParen === -1) return null;
+    let depth = 0;
+    let i = openParen;
+    let quote: string | null = null;
+    while (i < text.length) {
+      const char = text[i];
+      if (quote !== null) {
+        if (char === "\\") i += 1;
+        else if (char === quote) quote = null;
+      } else if (char === "'" || char === '"' || char === "`") {
+        quote = char;
+      } else if (char === "(") {
+        depth += 1;
+      } else if (char === ")") {
+        depth -= 1;
+        if (depth === 0) return text.slice(openParen + 1, i);
+      }
+      i += 1;
+    }
+    return null;
+  };
+
+  const nameAt = (absPos: number): boolean =>
+    absPos > 0 && /[\w$]/.test(text[absPos - 1]);
+
+  // Позиция 2: load-вызовы (многострочные тоже). Вложенные join разбираются
+  // по своей базе до остатка: фикстура в temp не засчитывает настоящий файл.
+  for (const load of LOAD_CALLS) {
+    let at = -1;
+    for (;;) {
+      at = text.indexOf(load, at + 1);
+      if (at === -1) break;
+      if (nameAt(at) || parityAt(at) === 1) continue;
+      const args = balancedArgs(at);
+      if (args === null) continue;
+      const argsAbs = text.indexOf("(", at) + 1;
+      let rest = args;
+      let restAbs = argsAbs;
+      for (;;) {
+        const next = rest.indexOf("join");
+        if (next === -1) break;
+        if (next > 0 && /[\w$]/.test(rest[next - 1])) {
+          rest = `${rest.slice(0, next)} ${rest.slice(next + 4)}`;
+          continue;
+        }
+        const joinArgs = balancedArgs(restAbs + next);
+        if (joinArgs === null) break;
+        handleJoinLiterals(joinArgs);
+        const openParen = rest.indexOf("(", next);
+        if (openParen === -1) {
+          rest = `${rest.slice(0, next)} ${rest.slice(next + 4)}`;
+          continue;
+        }
+        const blanked = `${rest.slice(0, next)}    ${" ".repeat(openParen - next)}(${" ".repeat(joinArgs.length)} )${rest.slice(openParen + 1 + joinArgs.length)}`;
+        restAbs += blanked.length - rest.length;
+        rest = blanked;
+      }
+      for (const literal of topLiterals(rest)) {
+        if (literal.length === 0 || literal.length > 500) continue;
+        if (literal.endsWith(".ts") || literal.endsWith(".js")) {
+          claimSpecifier(literal);
+        } else if (!literal.includes(".") || literal.endsWith("/")) {
+          noteDir(literal.replace(/\/$/, ""));
+        } else if (!literal.includes("/")) {
+          wordEvidence.add(literal);
+        }
+      }
+    }
+  }
+
+  // Позиция 0: import(КОНСТАНТА) по constPaths, затем позиции 1-6 построчно.
+  const constImport = /import\(\s*([A-Za-z_$][\w$]*)\s*\)/g;
+  let constUse: RegExpExecArray | null;
+  while ((constUse = constImport.exec(text)) !== null) {
+    const target = constPaths.get(constUse[1]);
+    if (target !== undefined) claimBare(target);
+  }
+
+  for (let lineNo = 0; lineNo < lines.length; lineNo += 1) {
+    const line = lines[lineNo];
+    // Позиция 1: спецификаторы импорта, new URL и продолжения `} from`.
+    const specPattern =
+      /(?:^|[^\w$])(?:import\s+(?:[^'";]*?\s+from\s+)?|export\s+(?:[^'";]*?\s+from\s+)?|require\s*\(|import\s*\(|new\s+URL\s*\()\s*(['"`])((?:(?!\1)[^\\\n]|\\.)*)\1/g;
+    let spec: RegExpExecArray | null;
+    while ((spec = specPattern.exec(line)) !== null) {
+      // Parity — до открывающей кавычки: образец кода внутри строки
+      // ('import "./x"') иначе сошёл бы за настоящий импорт.
+      const quotePos = spec.index + spec[0].indexOf(spec[1]);
+      if (quoteParity(line.slice(0, quotePos)) % 2 === 1) continue;
+      let value = spec[2];
+      if (spec[1] === "`") value = value.replace(/\$\{[^{}]*\}/g, "");
+      claimSpecifier(value);
+    }
+    // Продолжение многострочного импорта: строка вида `} from "./x";`.
+    const cont = line.match(
+      /^\s*}?\s*from\s*(['"`])((?:(?!\1)[^\\\n]|\\.)*)\1\s*;?\s*$/,
+    );
+    if (
+      cont !== null &&
+      quoteParity(line.slice(0, line.indexOf(cont[1]))) % 2 === 0
+    ) {
+      let value = cont[2];
+      if (cont[1] === "`") value = value.replace(/\$\{[^{}]*\}/g, "");
+      claimSpecifier(value);
+    }
+
+    // Позиция 3: поле file: контрактов, runInRepo-программы.
+    const codeLike =
+      /(?:^|[^\w$])file\s*:/.test(line) ||
+      line.includes("runInRepo(") ||
+      (line.includes("--eval") && line.includes("spawn"));
+    if (codeLike) {
+      for (const { value, index } of quotedOn(line)) {
+        if (insideForeignString(line, index)) continue;
+        if (value.length === 0 || value.length > 500) continue;
+        if (value.includes("import") || value.includes("require(")) {
+          const inner = value.match(
+            /(?:import\s*\(|require\s*\()\s*["']([^"']+)["']/g,
+          );
+          for (const hit of inner ?? []) {
+            const innerSpec = hit.match(/["']([^"']+)["']/)?.[1] ?? "";
+            if (innerSpec.startsWith("./")) claimRooted(innerSpec.slice(2));
+            else claimSpecifier(innerSpec);
+          }
+        }
+        claimSpecifier(value);
+      }
+    }
+
+    // Позиция 4: join() вне вызовов (запись фикстур молчит, load разобран выше).
+    let joinAt = -1;
+    while ((joinAt = line.indexOf("join", joinAt + 1)) !== -1) {
+      if (joinAt > 0 && /[\w$]/.test(line[joinAt - 1])) continue;
+      if (insideForeignString(line, joinAt)) continue;
+      const caller = callNameBefore(line, joinAt);
+      if (caller !== null && WRITE_CALLS.has(caller)) continue;
+      if (caller !== null && LOAD_CALLS.has(caller)) continue;
+      const args = callArgs(line, joinAt);
+      if (args === null) continue;
+      handleJoinLiterals(args);
+    }
+
+    // Позиция 5: голые пути рядом с файлом: basename x.ts и ./x.ts (константа
+    // для позднейшего dynamic import). Только рядом: иначе фикстура чужого
+    // каталога засчитала бы настоящий файл.
+    for (const { value, index } of quotedOn(line)) {
+      if (insideForeignString(line, index)) continue;
+      if (/^[A-Za-z0-9_.-]+\.ts$/.test(value)) {
+        claimBare(value);
+        continue;
+      }
+      if (/^\.\.?\/[^\s]+\.m?[jt]s$/.test(value)) claimBare(value);
+    }
+
+    // Позиция 6: улики слов для правила dir+basename. Слова — только элементы
+    // массивов (константы имён вроде WEB_TOOL_NAMES): слово из join() фикстуры
+    // совпадёт с чем угодно.
+    for (const { value, index } of quotedOn(line)) {
+      if (insideForeignString(line, index)) continue;
+      const caller = callNameBefore(line, index);
+      if (caller !== null && WRITE_CALLS.has(caller)) continue;
+      if (/^[A-Za-z0-9_.-]+\.ts$/.test(value)) baseEvidence.add(value);
+      else if (
+        /^[A-Za-z0-9_@-]+$/.test(value) &&
+        /\[[^[\](){};]*$/.test(line.slice(0, index))
+      )
+        wordEvidence.add(value);
+    }
+  }
+
+  // Правило dir+basename: тест, пинующий набор файлов каталога, грузит каждый файл.
+  for (const dir of dirEvidence) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(ROOT, ...dir.split("/")));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
+      if (baseEvidence.has(entry)) found.add(`${dir}/${entry}`);
+      const stem = entry.slice(0, -3);
+      if (wordEvidence.has(stem)) found.add(`${dir}/${entry}`);
+    }
+  }
+  return found;
+}
+
+test("every production path has a test or a blind-spot reason", () => {
+  const production = productionTypeScriptFiles();
+  assert.ok(production.length > 100, "инвентарь обойдён пустотой");
+  const imports = importsMap();
+  assert.ok(imports.length > 0, "карта импортов не прочитана");
+
+  const referenced = new Map<string, string[]>();
+  for (const testFile of testFiles()) {
+    if (testFile === "scripts/coverage-policy.test.ts") continue;
+    for (const path of referencesOf(testFile, imports)) {
+      const list = referenced.get(path) ?? [];
+      list.push(testFile);
+      referenced.set(path, list);
+    }
+  }
+
+  const blind = new Map(BLIND_SPOT.map((entry) => [entry.path, entry.why]));
+  assert.equal(
+    blind.size,
+    BLIND_SPOT.length,
+    "BLIND_SPOT содержит дублирующиеся пути",
+  );
+  const blindWithTests = [...blind.keys()].filter((path) =>
+    referenced.has(path),
+  );
+  assert.deepEqual(
+    blindWithTests,
+    [],
+    "BLIND_SPOT держит пути с тестами — убери: " +
+      blindWithTests
+        .map((path) => `${path} (${referenced.get(path)?.join(", ")})`)
+        .join("; "),
+  );
+  for (const path of blind.keys()) {
+    assert.ok(
+      production.includes(path),
+      `BLIND_SPOT ссылается мимо инвентаря: ${path}`,
+    );
+  }
+
+  const orphaned = production.filter(
+    (path) => !referenced.has(path) && !blind.has(path),
+  );
+  assert.deepEqual(
+    orphaned,
+    [],
+    `production-пути без теста и без причины: ${orphaned.join(", ")}`,
   );
 });
 
