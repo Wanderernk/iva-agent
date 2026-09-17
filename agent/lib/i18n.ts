@@ -121,6 +121,13 @@ export const COMMANDS: ReadonlyArray<Command> = [
     args: { en: "<text>", ru: "<текст>" },
   },
   { command: "tasks", en: "show tasks", ru: "показать задачи" },
+  {
+    command: "remind",
+    en: "set a reminder",
+    ru: "поставить напоминание",
+    args: { en: "<what and when>", ru: "<что и когда>" },
+  },
+  { command: "contacts", en: "show contacts", ru: "показать контакты" },
   { command: "digest", en: "morning digest", ru: "утренний дайджест" },
 ];
 
