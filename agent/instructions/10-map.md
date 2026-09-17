@@ -61,7 +61,7 @@ Creating a fact card (contact/project/decision/idea/note) — write it with the
 - Messages and your replies are auto-written to `daily/<today>.md` (the
   transcript hook).
 - Voice, video and audio are transcribed into the daily file before you see
-  them (Deepgram).
+  them (Deepgram or local server).
 - At night eve schedules run the rollup daily→weekly→monthly→yearly; a
   separate systemd watchdog runs the Brain pass. They turn the raw day into
   cards and summaries and update `CORE.md`. Do not run them by hand.
